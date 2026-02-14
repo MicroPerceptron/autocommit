@@ -130,6 +130,8 @@ version = "0.1.0"
 dependencies = [
  "autocommit-core",
  "llama-sys",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

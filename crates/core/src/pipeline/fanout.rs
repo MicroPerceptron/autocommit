@@ -8,6 +8,10 @@ pub fn analyze_chunks(
     engine: &dyn LlmEngine,
     chunks: &[DiffChunk],
 ) -> Result<Vec<PartialReport>, CoreError> {
+    if let Some(result) = engine.analyze_chunks_batched(chunks) {
+        return result;
+    }
+
     if chunks.len() <= 1 {
         return chunks
             .iter()

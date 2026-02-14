@@ -5,6 +5,7 @@ use std::fmt::{Display, Formatter};
 pub enum RuntimeError {
     Init(String),
     State(String),
+    Inference(String),
     Embed(String),
 }
 
@@ -13,6 +14,7 @@ impl Display for RuntimeError {
         match self {
             Self::Init(msg) => write!(f, "runtime init error: {msg}"),
             Self::State(msg) => write!(f, "runtime state error: {msg}"),
+            Self::Inference(msg) => write!(f, "inference error: {msg}"),
             Self::Embed(msg) => write!(f, "embedding error: {msg}"),
         }
     }

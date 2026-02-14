@@ -16,7 +16,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             Ok(())
         }
         Some("commit") => {
-            let output = cmd::commit::run(&args[1..]);
+            let output = cmd::commit::run(&args[1..])?;
             print!("{output}");
             Ok(())
         }

@@ -6,3 +6,5 @@ edition = "2024"
 [dependencies]
 autocommit-core = { path = "../core" }
 llama-sys = { path = "../llama-sys" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

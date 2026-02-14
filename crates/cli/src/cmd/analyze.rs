@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 
 use autocommit_core::llm::traits::LlmEngine;
 use autocommit_core::{AnalyzeOptions, CoreError, run as core_run};
@@ -15,6 +16,9 @@ use autocommit_core::types::{
 pub fn run(args: &[String]) -> Result<String, String> {
     let mut json = false;
     let mut diff_file: Option<String> = None;
+    let mut model_path: Option<String> = None;
+    #[cfg(feature = "llama-native")]
+    let mut runtime_profile = "auto".to_string();
 
     let mut i = 0;
     while i < args.len() {
@@ -27,16 +31,44 @@ pub fn run(args: &[String]) -> Result<String, String> {
                 diff_file = Some(path.clone());
                 i += 1;
             }
+            "--model-path" => {
+                let path = args
+                    .get(i + 1)
+                    .ok_or_else(|| "--model-path requires a path".to_string())?;
+                model_path = Some(path.clone());
+                i += 1;
+            }
+            "--profile" => {
+                let profile = args
+                    .get(i + 1)
+                    .ok_or_else(|| "--profile requires a value".to_string())?;
+                #[cfg(feature = "llama-native")]
+                {
+                    runtime_profile = profile.clone();
+                }
+                #[cfg(not(feature = "llama-native"))]
+                {
+                    let _ = profile;
+                }
+                i += 1;
+            }
             flag => return Err(format!("unknown analyze option: {flag}")),
         }
         i += 1;
+    }
+
+    if let Some(path) = model_path {
+        // SAFETY: this CLI is single-threaded for command setup and sets env before runtime init.
+        unsafe {
+            std::env::set_var("AUTOCOMMIT_EMBED_MODEL", path);
+        }
     }
 
     let diff_text = load_diff(diff_file.as_deref()).map_err(|err| err.to_string())?;
 
     #[cfg(feature = "llama-native")]
     let engine: Box<dyn LlmEngine> = Box::new(
-        llama_runtime::Engine::new("default")
+        llama_runtime::Engine::new(&runtime_profile)
             .map_err(|err| format!("runtime init failed: {err}"))?,
     );
 
@@ -58,7 +90,49 @@ fn load_diff(diff_file: Option<&str>) -> Result<String, CoreError> {
         return Ok(fs::read_to_string(Path::new(path))?);
     }
 
-    Ok("diff --git a/src/lib.rs b/src/lib.rs\n@@ -1,1 +1,2 @@\n-pub fn old() {}\n+pub fn new() {}\n+pub fn newer() {}\n".to_string())
+    read_git_diff()
+}
+
+fn read_git_diff() -> Result<String, CoreError> {
+    let staged = run_git(&["diff", "--cached"])?;
+    let unstaged = run_git(&["diff"])?;
+    let mut combined = String::new();
+
+    if !staged.trim().is_empty() {
+        combined.push_str(&staged);
+        if !combined.ends_with('\n') {
+            combined.push('\n');
+        }
+    }
+
+    if !unstaged.trim().is_empty() {
+        combined.push_str(&unstaged);
+    }
+
+    if combined.trim().is_empty() {
+        return Err(CoreError::InvalidDiff(
+            "no working tree or staged diff to analyze".to_string(),
+        ));
+    }
+
+    Ok(combined)
+}
+
+fn run_git(args: &[&str]) -> Result<String, CoreError> {
+    let output = Command::new("git")
+        .args(args)
+        .output()
+        .map_err(|err| CoreError::Io(format!("failed to run git {}: {err}", args.join(" "))))?;
+
+    if !output.status.success() {
+        return Err(CoreError::Io(format!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 #[cfg(not(feature = "llama-native"))]

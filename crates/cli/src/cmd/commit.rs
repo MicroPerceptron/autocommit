@@ -1,3 +1,234 @@
-pub fn run(_args: &[String]) -> String {
-    "commit command scaffolded; wiring to git apply is pending.\n".to_string()
+use std::process::Command;
+
+use autocommit_core::llm::traits::LlmEngine;
+use autocommit_core::{AnalyzeOptions, CoreError, run as core_run};
+
+use crate::output;
+
+#[cfg(not(feature = "llama-native"))]
+use autocommit_core::types::{
+    AnalysisReport, ChangeBucket, ChangeItem, DiffChunk, DiffStats, DispatchDecision, FileRef,
+    FileStatus, PartialReport, RiskReport, TypeTag,
+};
+
+pub fn run(args: &[String]) -> Result<String, String> {
+    let mut staged_only = false;
+    let mut push = false;
+    let mut dry_run = false;
+    let mut json = false;
+    let mut no_verify = false;
+    let mut model_path: Option<String> = None;
+    #[cfg(feature = "llama-native")]
+    let mut runtime_profile = "auto".to_string();
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--staged" | "-s" => staged_only = true,
+            "--push" | "-p" => push = true,
+            "--dry-run" => dry_run = true,
+            "--json" => json = true,
+            "--no-verify" => no_verify = true,
+            "--model-path" => {
+                let path = args
+                    .get(i + 1)
+                    .ok_or_else(|| "--model-path requires a path".to_string())?;
+                model_path = Some(path.clone());
+                i += 1;
+            }
+            "--profile" => {
+                let profile = args
+                    .get(i + 1)
+                    .ok_or_else(|| "--profile requires a value".to_string())?;
+                #[cfg(feature = "llama-native")]
+                {
+                    runtime_profile = profile.clone();
+                }
+                #[cfg(not(feature = "llama-native"))]
+                {
+                    let _ = profile;
+                }
+                i += 1;
+            }
+            flag => return Err(format!("unknown commit option: {flag}")),
+        }
+        i += 1;
+    }
+
+    if let Some(path) = model_path {
+        // SAFETY: this CLI is single-threaded for command setup and sets env before runtime init.
+        unsafe {
+            std::env::set_var("AUTOCOMMIT_EMBED_MODEL", path);
+        }
+    }
+
+    let diff_text = prepare_diff(staged_only, dry_run).map_err(|err| err.to_string())?;
+
+    #[cfg(feature = "llama-native")]
+    let engine: Box<dyn LlmEngine> = Box::new(
+        llama_runtime::Engine::new(&runtime_profile)
+            .map_err(|err| format!("runtime init failed: {err}"))?,
+    );
+
+    #[cfg(not(feature = "llama-native"))]
+    let engine: Box<dyn LlmEngine> = Box::new(MockEngine);
+
+    let report = core_run(engine.as_ref(), &diff_text, &AnalyzeOptions::default())
+        .map_err(|err| format!("analysis failed: {err}"))?;
+
+    if dry_run {
+        if json {
+            return output::json::to_pretty_json(&report).map_err(|err| err.to_string());
+        }
+
+        let mut out = String::new();
+        out.push_str("dry-run: commit was not created\n");
+        out.push_str(&format!("message:\n{}\n", report.commit_message));
+        out.push_str(&output::text::render_report(&report));
+        return Ok(out);
+    }
+
+    commit_with_message(&report.commit_message, no_verify).map_err(|err| err.to_string())?;
+
+    if push {
+        run_git(&["push"]).map_err(|err| err.to_string())?;
+    }
+
+    if json {
+        output::json::to_pretty_json(&report).map_err(|err| err.to_string())
+    } else {
+        Ok(format!(
+            "created commit with message:\n{}\n",
+            report.commit_message
+        ))
+    }
+}
+
+fn prepare_diff(staged_only: bool, dry_run: bool) -> Result<String, CoreError> {
+    if staged_only {
+        let staged = run_git(&["diff", "--cached"])?;
+        if staged.trim().is_empty() {
+            return Err(CoreError::InvalidDiff(
+                "no staged changes to commit".to_string(),
+            ));
+        }
+        return Ok(staged);
+    }
+
+    if dry_run {
+        let staged = run_git(&["diff", "--cached"])?;
+        let unstaged = run_git(&["diff"])?;
+        let combined = concat_diffs(&staged, &unstaged);
+        if combined.trim().is_empty() {
+            return Err(CoreError::InvalidDiff(
+                "no changes in working tree".to_string(),
+            ));
+        }
+        return Ok(combined);
+    }
+
+    run_git(&["add", "-A"])?;
+    let staged = run_git(&["diff", "--cached"])?;
+    if staged.trim().is_empty() {
+        return Err(CoreError::InvalidDiff(
+            "no changes staged after git add -A".to_string(),
+        ));
+    }
+
+    Ok(staged)
+}
+
+fn concat_diffs(staged: &str, unstaged: &str) -> String {
+    let mut combined = String::new();
+    if !staged.trim().is_empty() {
+        combined.push_str(staged);
+        if !combined.ends_with('\n') {
+            combined.push('\n');
+        }
+    }
+    if !unstaged.trim().is_empty() {
+        combined.push_str(unstaged);
+    }
+    combined
+}
+
+fn commit_with_message(message: &str, no_verify: bool) -> Result<(), CoreError> {
+    let mut args = vec!["commit", "-m", message];
+    if no_verify {
+        args.push("--no-verify");
+    }
+    run_git(&args)?;
+    Ok(())
+}
+
+fn run_git(args: &[&str]) -> Result<String, CoreError> {
+    let output = Command::new("git")
+        .args(args)
+        .output()
+        .map_err(|err| CoreError::Io(format!("failed to run git {}: {err}", args.join(" "))))?;
+
+    if !output.status.success() {
+        return Err(CoreError::Io(format!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+#[cfg(not(feature = "llama-native"))]
+struct MockEngine;
+
+#[cfg(not(feature = "llama-native"))]
+impl LlmEngine for MockEngine {
+    fn analyze_chunk(&self, chunk: &DiffChunk) -> Result<PartialReport, CoreError> {
+        Ok(PartialReport {
+            summary: format!("Analyzed {}", chunk.path),
+            items: vec![ChangeItem {
+                id: format!("item-{}", chunk.path.replace('/', "_")),
+                bucket: ChangeBucket::Patch,
+                type_tag: TypeTag::Fix,
+                title: format!("Update {}", chunk.path),
+                intent: "Apply diff chunk updates".to_string(),
+                files: vec![FileRef {
+                    path: chunk.path.clone(),
+                    status: FileStatus::Modified,
+                    ranges: chunk.ranges.clone(),
+                }],
+                confidence: 0.8,
+            }],
+        })
+    }
+
+    fn reduce_report(
+        &self,
+        partials: &[PartialReport],
+        decision: &DispatchDecision,
+        stats: &DiffStats,
+    ) -> Result<AnalysisReport, CoreError> {
+        let mut items = Vec::new();
+        for partial in partials {
+            items.extend(partial.items.clone());
+        }
+
+        Ok(AnalysisReport {
+            schema_version: "1.0".to_string(),
+            commit_message: "fix(core): synthesize structured analysis".to_string(),
+            summary: format!("{} partial analyses reduced", partials.len()),
+            items,
+            risk: RiskReport {
+                level: "low".to_string(),
+                notes: vec!["mock engine".to_string()],
+            },
+            stats: stats.clone(),
+            dispatch: decision.clone(),
+        })
+    }
+
+    fn embed(&self, text: &str) -> Result<Vec<f32>, CoreError> {
+        let len = text.len() as f32;
+        Ok(vec![(len % 97.0) / 97.0, (len % 53.0) / 53.0])
+    }
 }

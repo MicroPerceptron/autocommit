@@ -13,6 +13,11 @@ pub fn validate(report: &AnalysisReport) -> Result<(), CoreError> {
     if report.commit_message.trim().is_empty() {
         return Err(CoreError::Validation("empty commit message".to_string()));
     }
+    if !is_conventional_commit(report.commit_message.as_str()) {
+        return Err(CoreError::Validation(
+            "commit message must follow conventional commit format".to_string(),
+        ));
+    }
 
     let mut ids = HashSet::new();
     for item in &report.items {
@@ -28,6 +33,49 @@ pub fn validate(report: &AnalysisReport) -> Result<(), CoreError> {
     }
 
     Ok(())
+}
+
+fn is_conventional_commit(message: &str) -> bool {
+    let header = message.lines().next().unwrap_or("").trim();
+    if header.is_empty() {
+        return false;
+    }
+
+    let (head, desc) = match header.split_once(':') {
+        Some(parts) => parts,
+        None => return false,
+    };
+
+    if desc.trim().is_empty() {
+        return false;
+    }
+
+    let mut head = head.trim();
+    if head.ends_with('!') {
+        head = &head[..head.len().saturating_sub(1)];
+    }
+
+    let (kind, scope) = if let Some(open) = head.find('(') {
+        if !head.ends_with(')') || open == 0 {
+            return false;
+        }
+        let kind = &head[..open];
+        let scope = head[open + 1..head.len() - 1].trim();
+        (kind, Some(scope))
+    } else {
+        (head, None)
+    };
+
+    if let Some(scope) = scope {
+        if scope.is_empty() || scope.contains(char::is_whitespace) {
+            return false;
+        }
+    }
+
+    matches!(
+        kind.trim(),
+        "feat" | "fix" | "refactor" | "docs" | "test" | "chore" | "perf" | "style"
+    )
 }
 
 #[cfg(test)]
@@ -59,6 +107,50 @@ mod tests {
         };
 
         assert!(validate(&report).is_err());
+    }
+
+    #[test]
+    fn rejects_non_conventional_commit_header() {
+        let report = AnalysisReport {
+            schema_version: "1.0".to_string(),
+            commit_message: "Refactor: freeform header".to_string(),
+            summary: "x".to_string(),
+            items: vec![item("id-1")],
+            risk: RiskReport {
+                level: "low".to_string(),
+                notes: vec![],
+            },
+            stats: DiffStats::default(),
+            dispatch: DispatchDecision {
+                route: DispatchRoute::DraftOnly,
+                reason_codes: vec!["test".to_string()],
+                estimated_cost_tokens: 0,
+            },
+        };
+
+        assert!(validate(&report).is_err());
+    }
+
+    #[test]
+    fn accepts_valid_conventional_commit_header() {
+        let report = AnalysisReport {
+            schema_version: "1.0".to_string(),
+            commit_message: "feat(core): add reducer normalization".to_string(),
+            summary: "x".to_string(),
+            items: vec![item("id-1")],
+            risk: RiskReport {
+                level: "low".to_string(),
+                notes: vec![],
+            },
+            stats: DiffStats::default(),
+            dispatch: DispatchDecision {
+                route: DispatchRoute::DraftOnly,
+                reason_codes: vec!["test".to_string()],
+                estimated_cost_tokens: 0,
+            },
+        };
+
+        assert!(validate(&report).is_ok());
     }
 
     fn item(id: &str) -> ChangeItem {

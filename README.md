@@ -1,6 +1,6 @@
 # autocommit
 
-Rust workspace scaffold for evolving `autocommit` from shell script to a modular CLI.
+Rust workspace scaffold for evolving `tmp/autocommit.sh` from shell script to a modular CLI.
 
 ## Workspace layout
 

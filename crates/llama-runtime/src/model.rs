@@ -1,5 +1,4 @@
 use std::path::{Path, PathBuf};
-use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -126,23 +125,12 @@ impl LoadedRuntime {
             return Ok(Vec::new());
         }
 
-        let model_budget = if self.model.has_gpu_devices() {
-            chunks.len().min(24)
-        } else {
-            0
-        };
-        let model_indices: HashSet<usize> = sampled_indices(chunks.len(), model_budget).into_iter().collect();
-
         let model = Arc::clone(&self.model);
         let prompts = chunks
             .iter()
-            .enumerate()
-            .map(|(idx, chunk)| {
-                if !model_indices.contains(&idx) {
-                    return None;
-                }
+            .map(|chunk| {
                 let prompt = build_analyze_prompt_capped(chunk);
-                Some(model
+                model
                     .apply_chat_template(Some(prompts::SYSTEM_PROMPT), &prompt)
                     .unwrap_or_else(|| {
                         format!(
@@ -150,27 +138,120 @@ impl LoadedRuntime {
                             prompts::SYSTEM_PROMPT,
                             prompt
                         )
-                    }))
+                    })
             })
+            .collect::<Vec<_>>();
+        let budgets = chunks
+            .iter()
+            .map(analyze_token_budget)
             .collect::<Vec<_>>();
 
         let generation_ctx = self.generation_ctx()?;
-        let mut out = Vec::with_capacity(chunks.len());
+        let mut out: Vec<PartialReport> = chunks
+            .iter()
+            .enumerate()
+            .map(|(ordinal, chunk)| partial_from_chunk(runtime_context, ordinal, chunk))
+            .collect();
 
-        for (ordinal, chunk) in chunks.iter().enumerate() {
-            let partial = if let Some(prompt) = prompts[ordinal].as_ref() {
-                let parsed =
-                    generate_analyze_output(generation_ctx, prompt, analyze_token_budget(chunk));
-                match parsed {
-                    Ok(model_output) => {
-                        partial_from_model_chunk(runtime_context, ordinal, chunk, model_output)
+        let window = generation_ctx.max_sequences().max(1);
+        let mut start = 0usize;
+        while start < prompts.len() {
+            let end = (start + window).min(prompts.len());
+            let batch_prompts = &prompts[start..end];
+            let batch_budgets = &budgets[start..end];
+
+            let batch_outputs = generation_ctx
+                .generate_texts_with_budgets(batch_prompts, Some(grammar::ANALYZE_GBNF), batch_budgets);
+
+            match batch_outputs {
+                Ok(outputs) => {
+                    for (idx, raw_result) in outputs.into_iter().enumerate() {
+                        let ordinal = start + idx;
+                        let chunk = &chunks[ordinal];
+                        out[ordinal] = match raw_result {
+                            Ok(raw) => match parse_analyze_output(&raw) {
+                                Ok(model_output) => partial_from_model_chunk(
+                                    runtime_context,
+                                    ordinal,
+                                    chunk,
+                                    model_output,
+                                ),
+                                Err(parse_err) => {
+                                    let retry = generate_analyze_output(
+                                        generation_ctx,
+                                        &prompts[ordinal],
+                                        budgets[ordinal],
+                                    );
+                                    match retry {
+                                        Ok(model_output) => partial_from_model_chunk(
+                                            runtime_context,
+                                            ordinal,
+                                            chunk,
+                                            model_output,
+                                        ),
+                                        Err(retry_err) => {
+                                            let combined = RuntimeError::Inference(format!(
+                                                "batched parse failed ({parse_err}); retry failed ({retry_err})"
+                                            ));
+                                            partial_from_chunk_with_error(
+                                                runtime_context,
+                                                ordinal,
+                                                chunk,
+                                                &combined,
+                                            )
+                                        }
+                                    }
+                                }
+                            },
+                            Err(batch_err) => {
+                                let retry = generate_analyze_output(
+                                    generation_ctx,
+                                    &prompts[ordinal],
+                                    budgets[ordinal],
+                                );
+                                match retry {
+                                    Ok(model_output) => partial_from_model_chunk(
+                                        runtime_context,
+                                        ordinal,
+                                        chunk,
+                                        model_output,
+                                    ),
+                                    Err(retry_err) => {
+                                        let combined = RuntimeError::Inference(format!(
+                                            "batched generation failed ({batch_err}); retry failed ({retry_err})"
+                                        ));
+                                        partial_from_chunk_with_error(
+                                            runtime_context,
+                                            ordinal,
+                                            chunk,
+                                            &combined,
+                                        )
+                                    }
+                                }
+                            }
+                        };
                     }
-                    Err(err) => partial_from_chunk_with_error(runtime_context, ordinal, chunk, &err),
                 }
-            } else {
-                partial_from_chunk(runtime_context, ordinal, chunk)
-            };
-            out.push(partial);
+                Err(batch_err) => {
+                    for idx in start..end {
+                        let chunk = &chunks[idx];
+                        let parsed = generate_analyze_output(generation_ctx, &prompts[idx], budgets[idx]);
+                        out[idx] = match parsed {
+                            Ok(model_output) => {
+                                partial_from_model_chunk(runtime_context, idx, chunk, model_output)
+                            }
+                            Err(err) => {
+                                let combined = RuntimeError::Inference(format!(
+                                    "batched analyze failed ({batch_err}); fallback failed ({err})"
+                                ));
+                                partial_from_chunk_with_error(runtime_context, idx, chunk, &combined)
+                            }
+                        };
+                    }
+                }
+            }
+
+            start = end;
         }
 
         Ok(out)
@@ -298,15 +379,7 @@ impl Engine {
         &self,
         plan: &ReducePromptPlan,
     ) -> Result<ReduceModelOutput, RuntimeError> {
-        self.with_runtime(|runtime| {
-            if !runtime.model.has_gpu_devices() {
-                return Err(RuntimeError::Inference(
-                    "skipping model reducer because no usable GPU backend was detected"
-                        .to_string(),
-                ));
-            }
-            runtime.generate_reduce_json(&plan.prompt, plan.max_tokens)
-        })
+        self.with_runtime(|runtime| runtime.generate_reduce_json(&plan.prompt, plan.max_tokens))
     }
 }
 
@@ -391,6 +464,15 @@ impl LlmEngine for Engine {
                 }
                 notes
             });
+        let analyze_fallbacks = partials
+            .iter()
+            .filter(|p| p.summary.contains("fallback heuristic due to analyze_error:"))
+            .count();
+        if analyze_fallbacks > 0 {
+            risk_notes.push(format!("analyze_fallback:{}/{}", analyze_fallbacks, partials.len()));
+        } else {
+            risk_notes.push(format!("analyze_model:{}", partials.len()));
+        }
         if reduce_plan.sampled < reduce_plan.total {
             risk_notes.push(format!(
                 "reduce_sampling:{}/{}",
@@ -702,11 +784,11 @@ fn compact_error_note(raw: &str) -> String {
 
 fn analyze_token_budget(chunk: &DiffChunk) -> usize {
     if chunk.estimated_tokens > 3_000 {
-        80
+        128
     } else if chunk.estimated_tokens > 1_500 {
-        96
+        160
     } else {
-        112
+        192
     }
 }
 

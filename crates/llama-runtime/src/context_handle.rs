@@ -379,14 +379,11 @@ impl ContextHandle {
             }
 
             let piece = self.token_to_piece(token)?;
-            if grammar.is_some() && piece.is_empty() {
-                // Guard against llama grammar stack exceptions on empty-piece control tokens.
-                break;
-            }
-
             sampler.accept(token);
 
-            generated.push_str(&piece);
+            if !piece.is_empty() {
+                generated.push_str(&piece);
+            }
             if grammar.is_some() && is_complete_json_object(&generated) {
                 break;
             }
@@ -398,6 +395,249 @@ impl ContextHandle {
         }
 
         Ok(generated)
+    }
+
+    pub(crate) fn generate_texts_with_budgets(
+        &mut self,
+        prompts: &[String],
+        grammar: Option<&str>,
+        requested_max_tokens: &[usize],
+    ) -> Result<Vec<Result<String, RuntimeError>>, RuntimeError> {
+        if self.mode != ContextMode::Generation {
+            return Err(RuntimeError::Inference(
+                "generate_texts_with_budgets called on non-generation context".to_string(),
+            ));
+        }
+
+        if prompts.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        if prompts.len() != requested_max_tokens.len() {
+            return Err(RuntimeError::Inference(format!(
+                "prompt/budget length mismatch: prompts={}, budgets={}",
+                prompts.len(),
+                requested_max_tokens.len()
+            )));
+        }
+
+        if prompts.len() > self.seq_capacity {
+            return Err(RuntimeError::Inference(format!(
+                "requested {} sequences exceeds generation capacity {}",
+                prompts.len(),
+                self.seq_capacity
+            )));
+        }
+
+        let n_ctx_seq = unsafe {
+            // SAFETY: pure context metadata query.
+            ffi::llama_n_ctx_seq(self.ptr)
+        } as usize;
+        let max_batch_tokens = unsafe {
+            // SAFETY: pure context metadata query.
+            ffi::llama_n_batch(self.ptr)
+        } as usize;
+        if max_batch_tokens == 0 {
+            return Err(RuntimeError::Inference(
+                "llama context reports n_batch=0".to_string(),
+            ));
+        }
+
+        let max_prompt_tokens = n_ctx_seq.saturating_sub(64).clamp(256, 1536);
+        let mut tokenized = Vec::with_capacity(prompts.len());
+        let mut per_seq_budget = Vec::with_capacity(prompts.len());
+
+        for (prompt, requested) in prompts.iter().zip(requested_max_tokens.iter().copied()) {
+            let mut tokens = self.tokenize(prompt)?;
+            if tokens.is_empty() {
+                return Err(RuntimeError::Inference(
+                    "prompt tokenization produced no tokens".to_string(),
+                ));
+            }
+            if tokens.len() > max_prompt_tokens {
+                tokens.truncate(max_prompt_tokens);
+            }
+
+            let remaining_slots = n_ctx_seq.saturating_sub(tokens.len()).saturating_sub(1);
+            let budget = requested.min(remaining_slots);
+            tokenized.push(tokens);
+            per_seq_budget.push(budget);
+        }
+
+        unsafe {
+            // SAFETY: ptr is valid while ContextHandle is alive.
+            let mem = ffi::llama_get_memory(self.ptr);
+            ffi::llama_memory_clear(mem, true);
+        }
+
+        self.decode_prompt_tokens_multi(&tokenized, max_batch_tokens)?;
+
+        let mut samplers = Vec::with_capacity(prompts.len());
+        let mut outputs = vec![String::new(); prompts.len()];
+        let mut generated = vec![0usize; prompts.len()];
+        let mut last_output_idx: Vec<usize> = (0..prompts.len()).collect();
+        let mut next_pos = tokenized
+            .iter()
+            .map(|tokens| {
+                i32::try_from(tokens.len()).map_err(|_| {
+                    RuntimeError::Inference("prompt token count exceeds i32".to_string())
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut errors: Vec<Option<RuntimeError>> = (0..prompts.len()).map(|_| None).collect();
+        let mut active = vec![false; prompts.len()];
+
+        for idx in 0..prompts.len() {
+            if per_seq_budget[idx] == 0 {
+                samplers.push(None);
+                continue;
+            }
+            match SamplerChain::new(self.model.vocab(), grammar) {
+                Ok(s) => {
+                    active[idx] = true;
+                    samplers.push(Some(s));
+                }
+                Err(err) => {
+                    errors[idx] = Some(err);
+                    samplers.push(None);
+                }
+            }
+        }
+
+        while active.iter().any(|flag| *flag) {
+            let mut pending_decode: Vec<(usize, ffi::llama_token)> = Vec::new();
+
+            for seq_idx in 0..prompts.len() {
+                if !active[seq_idx] {
+                    continue;
+                }
+                if generated[seq_idx] >= per_seq_budget[seq_idx] {
+                    active[seq_idx] = false;
+                    continue;
+                }
+                if (next_pos[seq_idx] as usize) >= n_ctx_seq.saturating_sub(1) {
+                    active[seq_idx] = false;
+                    continue;
+                }
+
+                let Some(sampler) = samplers[seq_idx].as_mut() else {
+                    active[seq_idx] = false;
+                    continue;
+                };
+
+                let token = match sampler.sample(self.ptr, last_output_idx[seq_idx] as i32) {
+                    Ok(t) => t,
+                    Err(err) => {
+                        errors[seq_idx] = Some(err);
+                        active[seq_idx] = false;
+                        continue;
+                    }
+                };
+
+                if token == ffi::LLAMA_TOKEN_NULL
+                    || unsafe { ffi::llama_vocab_is_eog(self.model.vocab(), token) }
+                {
+                    active[seq_idx] = false;
+                    continue;
+                }
+
+                let piece = match self.token_to_piece(token) {
+                    Ok(p) => p,
+                    Err(err) => {
+                        errors[seq_idx] = Some(err);
+                        active[seq_idx] = false;
+                        continue;
+                    }
+                };
+
+                sampler.accept(token);
+                if !piece.is_empty() {
+                    outputs[seq_idx].push_str(&piece);
+                }
+                generated[seq_idx] = generated[seq_idx].saturating_add(1);
+
+                if grammar.is_some() && is_complete_json_object(&outputs[seq_idx]) {
+                    active[seq_idx] = false;
+                    continue;
+                }
+                if generated[seq_idx] >= per_seq_budget[seq_idx] {
+                    active[seq_idx] = false;
+                    continue;
+                }
+
+                pending_decode.push((seq_idx, token));
+            }
+
+            if pending_decode.is_empty() {
+                continue;
+            }
+
+            if pending_decode.len() > max_batch_tokens {
+                return Err(RuntimeError::Inference(format!(
+                    "active generation sequences {} exceed n_batch {}",
+                    pending_decode.len(),
+                    max_batch_tokens
+                )));
+            }
+
+            let mut batch_handle = BatchHandle::new(pending_decode.len())?;
+            let batch = batch_handle.as_mut();
+
+            unsafe {
+                // SAFETY: batch buffers are allocated by llama_batch_init and writable.
+                for (idx, (seq_idx, token)) in pending_decode.iter().copied().enumerate() {
+                    *batch.token.add(idx) = token;
+                    *batch.pos.add(idx) = next_pos[seq_idx];
+                    *batch.n_seq_id.add(idx) = 1;
+
+                    let seq_slot = *batch.seq_id.add(idx);
+                    if seq_slot.is_null() {
+                        return Err(RuntimeError::Inference(
+                            "batch sequence slot allocation failed".to_string(),
+                        ));
+                    }
+
+                    *seq_slot = i32::try_from(seq_idx)
+                        .map_err(|_| RuntimeError::Inference("sequence id exceeds i32".to_string()))?;
+                    *batch.logits.add(idx) = 1;
+                }
+
+                batch.n_tokens = i32::try_from(pending_decode.len()).map_err(|_| {
+                    RuntimeError::Inference("batch token count exceeds i32".to_string())
+                })?;
+            }
+
+            let status = unsafe {
+                // SAFETY: context and batch are initialized and valid.
+                ffi::llama_decode(self.ptr, *batch)
+            };
+
+            if status != 0 {
+                for (seq_idx, _) in pending_decode.iter().copied() {
+                    errors[seq_idx] = Some(RuntimeError::Inference(format!(
+                        "llama multi-sequence token decode failed with status {status}"
+                    )));
+                    active[seq_idx] = false;
+                }
+                continue;
+            }
+
+            for (out_idx, (seq_idx, _)) in pending_decode.iter().copied().enumerate() {
+                next_pos[seq_idx] = next_pos[seq_idx].saturating_add(1);
+                last_output_idx[seq_idx] = out_idx;
+            }
+        }
+
+        let mut results = Vec::with_capacity(prompts.len());
+        for idx in 0..prompts.len() {
+            if let Some(err) = errors[idx].take() {
+                results.push(Err(err));
+            } else {
+                results.push(Ok(std::mem::take(&mut outputs[idx])));
+            }
+        }
+
+        Ok(results)
     }
 
     pub(crate) fn embed(&mut self, text: &str) -> Result<Vec<f32>, RuntimeError> {
@@ -546,6 +786,150 @@ impl ContextHandle {
             }
 
             start = end;
+        }
+
+        Ok(())
+    }
+
+    fn decode_prompt_tokens_multi(
+        &mut self,
+        tokenized: &[Vec<ffi::llama_token>],
+        max_batch_tokens: usize,
+    ) -> Result<(), RuntimeError> {
+        if tokenized.len() > max_batch_tokens {
+            return Err(RuntimeError::Inference(format!(
+                "sequence count {} exceeds n_batch {}",
+                tokenized.len(),
+                max_batch_tokens
+            )));
+        }
+
+        // Prefill all but the last token per sequence without logits.
+        let mut offsets = vec![0usize; tokenized.len()];
+        let prefix_total: usize = tokenized
+            .iter()
+            .map(|tokens| tokens.len().saturating_sub(1))
+            .sum();
+        let mut remaining = prefix_total;
+        let mut next_seq = 0usize;
+
+        while remaining > 0 {
+            let mut packed: Vec<(usize, ffi::llama_token, i32)> = Vec::new();
+
+            while packed.len() < max_batch_tokens && remaining > 0 {
+                let mut progressed = false;
+                for _ in 0..tokenized.len() {
+                    let seq_idx = next_seq;
+                    next_seq = (next_seq + 1) % tokenized.len();
+
+                    let prefix_end = tokenized[seq_idx].len().saturating_sub(1);
+                    if offsets[seq_idx] >= prefix_end {
+                        continue;
+                    }
+
+                    let pos = i32::try_from(offsets[seq_idx]).map_err(|_| {
+                        RuntimeError::Inference("prompt token position exceeds i32".to_string())
+                    })?;
+                    let token = tokenized[seq_idx][offsets[seq_idx]];
+                    offsets[seq_idx] = offsets[seq_idx].saturating_add(1);
+                    remaining = remaining.saturating_sub(1);
+                    packed.push((seq_idx, token, pos));
+                    progressed = true;
+
+                    if packed.len() >= max_batch_tokens || remaining == 0 {
+                        break;
+                    }
+                }
+
+                if !progressed {
+                    break;
+                }
+            }
+
+            if packed.is_empty() {
+                break;
+            }
+
+            let mut batch_handle = BatchHandle::new(packed.len())?;
+            let batch = batch_handle.as_mut();
+
+            unsafe {
+                // SAFETY: batch buffers are allocated by llama_batch_init and writable.
+                for (idx, (seq_idx, token, pos)) in packed.iter().copied().enumerate() {
+                    *batch.token.add(idx) = token;
+                    *batch.pos.add(idx) = pos;
+                    *batch.n_seq_id.add(idx) = 1;
+
+                    let seq_slot = *batch.seq_id.add(idx);
+                    if seq_slot.is_null() {
+                        return Err(RuntimeError::Inference(
+                            "batch sequence slot allocation failed".to_string(),
+                        ));
+                    }
+
+                    *seq_slot = i32::try_from(seq_idx)
+                        .map_err(|_| RuntimeError::Inference("sequence id exceeds i32".to_string()))?;
+                    *batch.logits.add(idx) = 0;
+                }
+
+                batch.n_tokens = i32::try_from(packed.len()).map_err(|_| {
+                    RuntimeError::Inference("batch token count exceeds i32".to_string())
+                })?;
+            }
+
+            let status = unsafe {
+                // SAFETY: context and batch are initialized and valid.
+                ffi::llama_decode(self.ptr, *batch)
+            };
+
+            if status != 0 {
+                return Err(RuntimeError::Inference(format!(
+                    "llama multi-sequence prompt decode failed with status {status}"
+                )));
+            }
+        }
+
+        // Decode the final prompt token for each sequence in one pass so sampling can address
+        // a stable output index for every active sequence.
+        let mut batch_handle = BatchHandle::new(tokenized.len())?;
+        let batch = batch_handle.as_mut();
+
+        unsafe {
+            // SAFETY: batch buffers are allocated by llama_batch_init and writable.
+            for (idx, tokens) in tokenized.iter().enumerate() {
+                let last_pos = tokens.len().saturating_sub(1);
+                let token = tokens[last_pos];
+
+                *batch.token.add(idx) = token;
+                *batch.pos.add(idx) = i32::try_from(last_pos).map_err(|_| {
+                    RuntimeError::Inference("prompt token position exceeds i32".to_string())
+                })?;
+                *batch.n_seq_id.add(idx) = 1;
+
+                let seq_slot = *batch.seq_id.add(idx);
+                if seq_slot.is_null() {
+                    return Err(RuntimeError::Inference(
+                        "batch sequence slot allocation failed".to_string(),
+                    ));
+                }
+                *seq_slot = i32::try_from(idx)
+                    .map_err(|_| RuntimeError::Inference("sequence id exceeds i32".to_string()))?;
+                *batch.logits.add(idx) = 1;
+            }
+
+            batch.n_tokens = i32::try_from(tokenized.len()).map_err(|_| {
+                RuntimeError::Inference("batch token count exceeds i32".to_string())
+            })?;
+        }
+
+        let status = unsafe {
+            // SAFETY: context and batch are initialized and valid.
+            ffi::llama_decode(self.ptr, *batch)
+        };
+        if status != 0 {
+            return Err(RuntimeError::Inference(format!(
+                "llama multi-sequence prompt tail decode failed with status {status}"
+            )));
         }
 
         Ok(())
@@ -724,15 +1108,23 @@ fn tune_runtime(model: &ModelHandle, mode: ContextMode, cpu_only: bool) -> Runti
 
     match mode {
         ContextMode::Generation => {
-            // Current generation flow is single-sequence; keeping this at 1 avoids shrinking
-            // n_ctx_seq and prevents long-prompt stalls.
-            let seq_capacity = 1usize;
+            let seq_capacity = if has_gpu {
+                if gpu_mem_mib >= 12 * 1024 {
+                    8
+                } else if gpu_mem_mib >= 8 * 1024 {
+                    6
+                } else {
+                    4
+                }
+            } else {
+                2
+            };
 
             let target_seq_ctx = if has_gpu {
                 if gpu_mem_mib >= 12 * 1024 {
-                    2048
-                } else if gpu_mem_mib >= 8 * 1024 {
                     1536
+                } else if gpu_mem_mib >= 8 * 1024 {
+                    1280
                 } else {
                     1024
                 }
@@ -741,11 +1133,17 @@ fn tune_runtime(model: &ModelHandle, mode: ContextMode, cpu_only: bool) -> Runti
             };
 
             let max_seq_ctx = (n_ctx_train / seq_capacity).max(256);
-            let n_ctx_seq = align_down_to_multiple(max_seq_ctx.min(target_seq_ctx), 256).max(256);
+            let min_seq_ctx = if has_gpu { 512 } else { 384 };
+            let n_ctx_seq =
+                align_down_to_multiple(max_seq_ctx.min(target_seq_ctx), 256).max(min_seq_ctx);
             let n_ctx = u32::try_from(n_ctx_seq.saturating_mul(seq_capacity)).unwrap_or(4096);
 
             let n_batch_target = if has_gpu {
-                if gpu_mem_mib >= 12 * 1024 { 4096 } else { 3072 }
+                if gpu_mem_mib >= 12 * 1024 {
+                    3072
+                } else {
+                    2048
+                }
             } else {
                 1024
             };
@@ -912,6 +1310,7 @@ impl Drop for ContextHandle {
 
 #[derive(Debug)]
 struct SamplerChain {
+    vocab: *const ffi::llama_vocab,
     chain_ptr: *mut ffi::llama_sampler,
     grammar_ptr: Option<*mut ffi::llama_sampler>,
 }
@@ -956,14 +1355,13 @@ impl SamplerChain {
         };
 
         let mut chain = Self {
+            vocab,
             chain_ptr,
             grammar_ptr,
         };
 
-        if grammar.is_none() {
-            chain.add_to_chain(unsafe { ffi::llama_sampler_init_top_k(40) })?;
-            chain.add_to_chain(unsafe { ffi::llama_sampler_init_top_p(0.9, 1) })?;
-        }
+        chain.add_to_chain(unsafe { ffi::llama_sampler_init_top_k(40) })?;
+        chain.add_to_chain(unsafe { ffi::llama_sampler_init_top_p(0.9, 1) })?;
         chain.add_to_chain(unsafe { ffi::llama_sampler_init_temp(0.2) })?;
 
         let seed = SystemTime::now()
@@ -994,27 +1392,86 @@ impl SamplerChain {
         ctx: *mut ffi::llama_context,
         idx: i32,
     ) -> Result<ffi::llama_token, RuntimeError> {
-        if let Some(grammar_ptr) = self.grammar_ptr {
-            for _ in 0..64 {
-                let token = unsafe {
-                    // SAFETY: sampler/context are valid and logits for idx are available.
-                    ffi::llama_sampler_sample(self.chain_ptr, ctx, idx)
-                };
-                if token == ffi::LLAMA_TOKEN_NULL || self.grammar_accepts_token(grammar_ptr, token)
-                {
-                    return Ok(token);
-                }
-            }
-            Err(RuntimeError::Inference(
-                "grammar rejected all sampled candidates".to_string(),
-            ))
-        } else {
-            let token = unsafe {
-                // SAFETY: sampler/context are valid and logits for idx are available.
-                ffi::llama_sampler_sample(self.chain_ptr, ctx, idx)
-            };
-            Ok(token)
+        let n_vocab = unsafe {
+            // SAFETY: vocab pointer is valid for sampler chain lifetime.
+            ffi::llama_vocab_n_tokens(self.vocab)
+        };
+        if n_vocab <= 0 {
+            return Err(RuntimeError::Inference("vocab size is invalid".to_string()));
         }
+
+        let logits = unsafe {
+            // SAFETY: context pointer is valid during generation.
+            ffi::llama_get_logits_ith(ctx, idx)
+        };
+        if logits.is_null() {
+            return Err(RuntimeError::Inference(format!(
+                "missing logits for output index {idx}"
+            )));
+        }
+
+        let mut cur = logits_to_candidates(logits, n_vocab as usize);
+        let mut cur_p = ffi::llama_token_data_array {
+            data: cur.as_mut_ptr(),
+            size: cur.len(),
+            selected: -1,
+            sorted: false,
+        };
+
+        unsafe {
+            // SAFETY: sampler and candidate array are valid.
+            ffi::llama_sampler_apply(self.chain_ptr, &mut cur_p);
+        }
+        let mut token = selected_token(&cur_p)?;
+
+        if let Some(grammar_ptr) = self.grammar_ptr {
+            // Check if sampled token satisfies grammar; if not, resample grammar-first.
+            let mut single = ffi::llama_token_data {
+                id: token,
+                logit: 1.0,
+                p: 0.0,
+            };
+            let mut single_arr = ffi::llama_token_data_array {
+                data: std::ptr::addr_of_mut!(single),
+                size: 1,
+                selected: -1,
+                sorted: false,
+            };
+
+            unsafe {
+                // SAFETY: grammar sampler and token array are valid.
+                ffi::llama_sampler_apply(grammar_ptr, &mut single_arr);
+            }
+
+            if single.logit == f32::NEG_INFINITY {
+                let logits_retry = unsafe {
+                    // SAFETY: context pointer is valid during generation.
+                    ffi::llama_get_logits_ith(ctx, idx)
+                };
+                if logits_retry.is_null() {
+                    return Err(RuntimeError::Inference(format!(
+                        "missing logits for output index {idx} on grammar retry"
+                    )));
+                }
+
+                let mut cur_retry = logits_to_candidates(logits_retry, n_vocab as usize);
+                let mut cur_p_retry = ffi::llama_token_data_array {
+                    data: cur_retry.as_mut_ptr(),
+                    size: cur_retry.len(),
+                    selected: -1,
+                    sorted: false,
+                };
+
+                unsafe {
+                    // SAFETY: samplers and candidate array are valid.
+                    ffi::llama_sampler_apply(grammar_ptr, &mut cur_p_retry);
+                    ffi::llama_sampler_apply(self.chain_ptr, &mut cur_p_retry);
+                }
+                token = selected_token(&cur_p_retry)?;
+            }
+        }
+
+        Ok(token)
     }
 
     fn accept(&mut self, token: ffi::llama_token) {
@@ -1025,31 +1482,6 @@ impl SamplerChain {
             }
             ffi::llama_sampler_accept(self.chain_ptr, token);
         }
-    }
-
-    fn grammar_accepts_token(
-        &self,
-        grammar_ptr: *mut ffi::llama_sampler,
-        token: ffi::llama_token,
-    ) -> bool {
-        let mut data = ffi::llama_token_data {
-            id: token,
-            logit: 1.0,
-            p: 0.0,
-        };
-        let mut arr = ffi::llama_token_data_array {
-            data: std::ptr::addr_of_mut!(data),
-            size: 1,
-            selected: -1,
-            sorted: false,
-        };
-
-        unsafe {
-            // SAFETY: grammar sampler and token array are valid.
-            ffi::llama_sampler_apply(grammar_ptr, &mut arr);
-        }
-
-        data.logit != f32::NEG_INFINITY
     }
 }
 
@@ -1071,6 +1503,35 @@ impl Drop for SamplerChain {
 #[derive(Debug)]
 struct BatchHandle {
     batch: ffi::llama_batch,
+}
+
+fn logits_to_candidates(logits: *const f32, n_vocab: usize) -> Vec<ffi::llama_token_data> {
+    let logits = unsafe {
+        // SAFETY: caller guarantees `logits` points to `n_vocab` float values.
+        slice::from_raw_parts(logits, n_vocab)
+    };
+    let mut out = Vec::with_capacity(n_vocab);
+    for (id, &logit) in logits.iter().enumerate() {
+        out.push(ffi::llama_token_data {
+            id: id as ffi::llama_token,
+            logit,
+            p: 0.0,
+        });
+    }
+    out
+}
+
+fn selected_token(cur_p: &ffi::llama_token_data_array) -> Result<ffi::llama_token, RuntimeError> {
+    if cur_p.selected < 0 || (cur_p.selected as usize) >= cur_p.size {
+        return Err(RuntimeError::Inference(
+            "no selected token during sampling".to_string(),
+        ));
+    }
+    let token = unsafe {
+        // SAFETY: selected index was bounds-checked above.
+        (*cur_p.data.add(cur_p.selected as usize)).id
+    };
+    Ok(token)
 }
 
 impl BatchHandle {

@@ -1,0 +1,11 @@
+[package]
+name = "autocommit-core"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+llama-native = ["dep:llama-sys"]
+
+[dependencies]
+llama-sys = { path = "../llama-sys", optional = true }

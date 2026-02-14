@@ -1,0 +1,11 @@
+[package]
+name = "autocommit-cli"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+llama-native = ["autocommit-core/llama-native"]
+
+[dependencies]
+autocommit-core = { path = "../core" }

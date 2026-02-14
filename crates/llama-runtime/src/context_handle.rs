@@ -1,4 +1,6 @@
 use std::ffi::{CStr, CString};
+use std::fs;
+use std::path::Path;
 use std::slice;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -26,16 +28,6 @@ pub(crate) struct ContextHandle {
     seq_capacity: usize,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct RuntimeTune {
-    seq_capacity: usize,
-    n_ctx: u32,
-    n_batch: u32,
-    n_ubatch: u32,
-    n_threads: i32,
-    n_threads_batch: i32,
-}
-
 // SAFETY: ContextHandle is never accessed concurrently in this crate; Engine wraps it in Mutex
 // and only hands out mutable access for FFI calls.
 unsafe impl Send for ContextHandle {}
@@ -60,18 +52,7 @@ impl ContextHandle {
         mode: ContextMode,
         cpu_only: bool,
     ) -> Result<Self, RuntimeError> {
-        let tune = tune_runtime(model.as_ref(), mode, cpu_only);
-        let seq_capacity = tune.seq_capacity;
-        if std::env::var("AUTOCOMMIT_LLAMA_LOG")
-            .ok()
-            .as_deref()
-            .map(|v| matches!(v, "1" | "true" | "TRUE" | "yes" | "YES"))
-            .unwrap_or(false)
-        {
-            eprintln!("autocommit runtime tune ({mode:?}): {tune:?}");
-        }
-
-        let ptr = Self::init_context(&model, mode, cpu_only, tune);
+        let ptr = Self::init_context(&model, mode, cpu_only);
 
         if ptr.is_null() {
             let (regs, devs) = unsafe {
@@ -86,6 +67,22 @@ impl ContextHandle {
             return Err(RuntimeError::Inference(format!(
                 "failed to initialize {mode_label} context (cpu_only={cpu_only}, ggml_backends={regs}, ggml_devices={devs}, inventory={inventory})"
             )));
+        }
+
+        let seq_capacity = unsafe {
+            // SAFETY: ptr is a valid context returned by llama_init_from_model.
+            let raw = ffi::llama_n_seq_max(ptr);
+            if raw > 0 { raw as usize } else { 1 }
+        };
+        if std::env::var("AUTOCOMMIT_LLAMA_LOG")
+            .ok()
+            .as_deref()
+            .map(|v| matches!(v, "1" | "true" | "TRUE" | "yes" | "YES"))
+            .unwrap_or(false)
+        {
+            eprintln!(
+                "autocommit context initialized ({mode:?}): seq_capacity={seq_capacity}, cpu_only={cpu_only}"
+            );
         }
 
         if mode == ContextMode::Embedding && model.has_encoder() && model.has_decoder() {
@@ -117,17 +114,10 @@ impl ContextHandle {
         model: &ModelHandle,
         mode: ContextMode,
         cpu_only: bool,
-        tune: RuntimeTune,
     ) -> *mut ffi::llama_context {
         unsafe {
-            // SAFETY: context params are initialized from llama defaults and configured by mode.
-            let mut cparams = ffi::llama_context_default_params();
-            cparams.n_seq_max = tune.seq_capacity as u32;
-            cparams.n_ctx = tune.n_ctx;
-            cparams.n_batch = tune.n_batch;
-            cparams.n_ubatch = tune.n_ubatch;
-            cparams.n_threads = tune.n_threads;
-            cparams.n_threads_batch = tune.n_threads_batch;
+            // SAFETY: context params copied from fitted model defaults and adjusted by mode.
+            let mut cparams = model.context_params();
             if cpu_only {
                 cparams.offload_kqv = false;
                 cparams.op_offload = false;
@@ -156,6 +146,158 @@ impl ContextHandle {
     #[allow(dead_code)]
     pub(crate) fn max_sequences(&self) -> usize {
         self.seq_capacity
+    }
+
+    pub(crate) fn load_state_file(
+        &mut self,
+        path: &Path,
+    ) -> Result<Vec<ffi::llama_token>, RuntimeError> {
+        if self.mode != ContextMode::Generation {
+            return Err(RuntimeError::State(
+                "state loading is only supported for generation contexts".to_string(),
+            ));
+        }
+
+        let path_c = CString::new(path.to_string_lossy().as_bytes()).map_err(|_| {
+            RuntimeError::State(format!(
+                "state path contains interior NUL byte: {}",
+                path.display()
+            ))
+        })?;
+
+        let n_ctx_seq = unsafe {
+            // SAFETY: pure context metadata query.
+            ffi::llama_n_ctx_seq(self.ptr)
+        } as usize;
+        let capacity = n_ctx_seq.max(1);
+        let mut tokens = vec![0 as ffi::llama_token; capacity];
+        let mut token_count: usize = 0;
+
+        let ok = unsafe {
+            // SAFETY: context pointer and output buffers are valid for this call.
+            ffi::llama_state_load_file(
+                self.ptr,
+                path_c.as_ptr(),
+                tokens.as_mut_ptr(),
+                tokens.len(),
+                &mut token_count,
+            )
+        };
+
+        if !ok {
+            return Err(RuntimeError::State(format!(
+                "failed to load state file: {}",
+                path.display()
+            )));
+        }
+
+        if token_count > tokens.len() {
+            return Err(RuntimeError::State(format!(
+                "loaded token count {} exceeds capacity {} for {}",
+                token_count,
+                tokens.len(),
+                path.display()
+            )));
+        }
+
+        tokens.truncate(token_count);
+        Ok(tokens)
+    }
+
+    pub(crate) fn save_state_file(
+        &mut self,
+        path: &Path,
+        tokens: &[ffi::llama_token],
+    ) -> Result<(), RuntimeError> {
+        if self.mode != ContextMode::Generation {
+            return Err(RuntimeError::State(
+                "state saving is only supported for generation contexts".to_string(),
+            ));
+        }
+
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|err| {
+                RuntimeError::State(format!(
+                    "failed to create state directory {}: {err}",
+                    parent.display()
+                ))
+            })?;
+        }
+
+        let path_c = CString::new(path.to_string_lossy().as_bytes()).map_err(|_| {
+            RuntimeError::State(format!(
+                "state path contains interior NUL byte: {}",
+                path.display()
+            ))
+        })?;
+
+        let token_ptr = if tokens.is_empty() {
+            std::ptr::null()
+        } else {
+            tokens.as_ptr()
+        };
+
+        let ok = unsafe {
+            // SAFETY: context pointer, path, and optional token buffer are valid for this call.
+            ffi::llama_state_save_file(self.ptr, path_c.as_ptr(), token_ptr, tokens.len())
+        };
+
+        if !ok {
+            return Err(RuntimeError::State(format!(
+                "failed to save state file: {}",
+                path.display()
+            )));
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn warmup(&mut self) -> Result<(), RuntimeError> {
+        if self.mode != ContextMode::Generation {
+            return Err(RuntimeError::Inference(
+                "warmup is only supported for generation contexts".to_string(),
+            ));
+        }
+
+        unsafe {
+            // SAFETY: context pointer is valid while handle is alive.
+            ffi::llama_set_warmup(self.ptr, true);
+        }
+
+        let result = (|| {
+            let mut tokens = Vec::with_capacity(2);
+            let bos = unsafe {
+                // SAFETY: model vocabulary pointer is valid for the context lifetime.
+                ffi::llama_vocab_bos(self.model.vocab())
+            };
+            let eos = unsafe {
+                // SAFETY: model vocabulary pointer is valid for the context lifetime.
+                ffi::llama_vocab_eos(self.model.vocab())
+            };
+
+            if bos != ffi::LLAMA_TOKEN_NULL {
+                tokens.push(bos);
+            }
+            if eos != ffi::LLAMA_TOKEN_NULL {
+                tokens.push(eos);
+            }
+            if tokens.is_empty() {
+                tokens.push(0);
+            }
+
+            self.decode_prompt_tokens(&tokens, 0)
+        })();
+
+        unsafe {
+            // SAFETY: context pointer is valid while handle is alive.
+            let mem = ffi::llama_get_memory(self.ptr);
+            ffi::llama_memory_clear(mem, true);
+            ffi::llama_synchronize(self.ptr);
+            ffi::llama_perf_context_reset(self.ptr);
+            ffi::llama_set_warmup(self.ptr, false);
+        }
+
+        result
     }
 
     #[allow(dead_code)]
@@ -597,8 +739,9 @@ impl ContextHandle {
                         ));
                     }
 
-                    *seq_slot = i32::try_from(seq_idx)
-                        .map_err(|_| RuntimeError::Inference("sequence id exceeds i32".to_string()))?;
+                    *seq_slot = i32::try_from(seq_idx).map_err(|_| {
+                        RuntimeError::Inference("sequence id exceeds i32".to_string())
+                    })?;
                     *batch.logits.add(idx) = 1;
                 }
 
@@ -867,8 +1010,9 @@ impl ContextHandle {
                         ));
                     }
 
-                    *seq_slot = i32::try_from(seq_idx)
-                        .map_err(|_| RuntimeError::Inference("sequence id exceeds i32".to_string()))?;
+                    *seq_slot = i32::try_from(seq_idx).map_err(|_| {
+                        RuntimeError::Inference("sequence id exceeds i32".to_string())
+                    })?;
                     *batch.logits.add(idx) = 0;
                 }
 
@@ -1096,110 +1240,6 @@ impl ContextHandle {
         tokens.truncate(n_tokens as usize);
         Ok(tokens)
     }
-}
-
-fn tune_runtime(model: &ModelHandle, mode: ContextMode, cpu_only: bool) -> RuntimeTune {
-    let host_threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
-    let has_gpu = !cpu_only && model.has_gpu_devices();
-    let gpu_mem_mib = model.max_gpu_mem_mib();
-    let n_ctx_train = model.n_ctx_train().max(1024);
-
-    match mode {
-        ContextMode::Generation => {
-            let seq_capacity = if has_gpu {
-                if gpu_mem_mib >= 12 * 1024 {
-                    8
-                } else if gpu_mem_mib >= 8 * 1024 {
-                    6
-                } else {
-                    4
-                }
-            } else {
-                2
-            };
-
-            let target_seq_ctx = if has_gpu {
-                if gpu_mem_mib >= 12 * 1024 {
-                    1536
-                } else if gpu_mem_mib >= 8 * 1024 {
-                    1280
-                } else {
-                    1024
-                }
-            } else {
-                768
-            };
-
-            let max_seq_ctx = (n_ctx_train / seq_capacity).max(256);
-            let min_seq_ctx = if has_gpu { 512 } else { 384 };
-            let n_ctx_seq =
-                align_down_to_multiple(max_seq_ctx.min(target_seq_ctx), 256).max(min_seq_ctx);
-            let n_ctx = u32::try_from(n_ctx_seq.saturating_mul(seq_capacity)).unwrap_or(4096);
-
-            let n_batch_target = if has_gpu {
-                if gpu_mem_mib >= 12 * 1024 {
-                    3072
-                } else {
-                    2048
-                }
-            } else {
-                1024
-            };
-            let n_batch = n_ctx.min(n_batch_target.max(512) as u32);
-            let n_ubatch_target = if has_gpu { 1024 } else { 512 };
-            let n_ubatch = n_batch.min(n_ubatch_target);
-
-            let n_threads = if has_gpu {
-                ((host_threads / 2).clamp(2, 8)) as i32
-            } else {
-                host_threads.clamp(2, 16) as i32
-            };
-            let n_threads_batch = if has_gpu {
-                host_threads.clamp(n_threads as usize, 16) as i32
-            } else {
-                n_threads
-            };
-
-            RuntimeTune {
-                seq_capacity,
-                n_ctx,
-                n_batch,
-                n_ubatch,
-                n_threads,
-                n_threads_batch,
-            }
-        }
-        ContextMode::Embedding => {
-            let n_ctx_target = if has_gpu { 4096 } else { 2048 };
-            let n_ctx = u32::try_from(n_ctx_train.min(n_ctx_target).max(1024)).unwrap_or(2048);
-            let n_batch = n_ctx.min(if has_gpu { 2048 } else { 1024 });
-            let n_ubatch = n_batch.min(512);
-
-            let n_threads = if has_gpu {
-                (host_threads / 2).clamp(2, 8) as i32
-            } else {
-                host_threads.clamp(2, 16) as i32
-            };
-
-            RuntimeTune {
-                seq_capacity: 1,
-                n_ctx,
-                n_batch,
-                n_ubatch,
-                n_threads,
-                n_threads_batch: n_threads,
-            }
-        }
-    }
-}
-
-fn align_down_to_multiple(value: usize, multiple: usize) -> usize {
-    if multiple == 0 {
-        return value;
-    }
-    (value / multiple) * multiple
 }
 
 fn backend_inventory_summary(limit: usize) -> String {

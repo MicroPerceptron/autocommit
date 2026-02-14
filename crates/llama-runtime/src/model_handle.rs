@@ -19,9 +19,7 @@ pub(crate) struct ModelHandle {
     ptr: *mut ffi::llama_model,
     vocab: *const ffi::llama_vocab,
     n_embd: usize,
-    n_ctx_train: usize,
-    has_gpu_devices: bool,
-    max_gpu_mem_mib: usize,
+    base_context_params: ffi::llama_context_params,
     has_encoder: bool,
     has_decoder: bool,
 }
@@ -48,34 +46,86 @@ impl ModelHandle {
             ))
         })?;
 
-        let mut selected_devices = select_model_devices(cpu_only);
-        let (using_gpu_devices, max_gpu_mem_mib) = detect_gpu_devices(cpu_only);
-        if llama_logs_enabled() {
-            eprintln!("autocommit device inventory: {}", device_inventory_summary());
-            if let Some(devs) = selected_devices.as_ref() {
-                eprintln!("autocommit selected devices: {}", devs.len().saturating_sub(1));
-            } else {
-                eprintln!("autocommit selected devices: auto");
-            }
-            if !cpu_only && !using_gpu_devices {
-                eprintln!(
-                    "autocommit note: no usable GPU device metadata found; forcing CPU model placement"
-                );
-            }
+        let mut mparams = unsafe {
+            // SAFETY: pure default parameter initialization.
+            ffi::llama_model_default_params()
+        };
+        let mut cparams = unsafe {
+            // SAFETY: pure default parameter initialization.
+            ffi::llama_context_default_params()
+        };
+
+        // Match llama.cpp common_params defaults for model/context setup.
+        mparams.n_gpu_layers = -1;
+        cparams.n_ctx = 0;
+        cparams.n_seq_max = 1;
+        cparams.n_batch = 2048;
+        cparams.n_ubatch = 512;
+
+        if cpu_only {
+            mparams.n_gpu_layers = 0;
+            mparams.split_mode = ffi::llama_split_mode_LLAMA_SPLIT_MODE_NONE;
+            mparams.main_gpu = -1;
+            cparams.offload_kqv = false;
+            cparams.op_offload = false;
+            cparams.flash_attn_type = ffi::llama_flash_attn_type_LLAMA_FLASH_ATTN_TYPE_DISABLED;
+        }
+        let mut requested_devices =
+            resolve_requested_devices().map_err(|err| RuntimeError::Embed(err.to_string()))?;
+        if let Some(devices) = requested_devices.as_mut() {
+            mparams.devices = devices.as_mut_ptr();
+        }
+
+        let max_devices = unsafe {
+            // SAFETY: pure metadata query.
+            ffi::llama_max_devices()
+        };
+        let mut tensor_split = vec![0f32; max_devices.max(1)];
+        let mut margins = vec![1024usize * 1024 * 1024; max_devices.max(1)];
+        let max_overrides = unsafe {
+            // SAFETY: pure metadata query.
+            ffi::llama_max_tensor_buft_overrides()
+        };
+        let mut tensor_buft_overrides = vec![
+            ffi::llama_model_tensor_buft_override {
+                pattern: std::ptr::null(),
+                buft: std::ptr::null_mut(),
+            };
+            max_overrides.max(1)
+        ];
+
+        mparams.tensor_split = tensor_split.as_ptr();
+        mparams.tensor_buft_overrides = tensor_buft_overrides.as_ptr();
+
+        let fit_status = unsafe {
+            // SAFETY: pointers refer to valid writable buffers for the duration of this call.
+            ffi::llama_params_fit(
+                path_cstr.as_ptr(),
+                &mut mparams,
+                &mut cparams,
+                tensor_split.as_mut_ptr(),
+                tensor_buft_overrides.as_mut_ptr(),
+                margins.as_mut_ptr(),
+                4096,
+                ffi::ggml_log_level_GGML_LOG_LEVEL_ERROR,
+            )
+        };
+        if fit_status != ffi::llama_params_fit_status_LLAMA_PARAMS_FIT_STATUS_SUCCESS
+            && std::env::var("AUTOCOMMIT_LLAMA_LOG")
+                .ok()
+                .as_deref()
+                .map(|v| matches!(v, "1" | "true" | "TRUE" | "yes" | "YES"))
+                .unwrap_or(false)
+        {
+            eprintln!(
+                "autocommit warning: llama_params_fit returned status={} for {}",
+                fit_status,
+                model_path.display()
+            );
         }
 
         let ptr = unsafe {
-            // SAFETY: FFI call with default params and a valid NUL-terminated path.
-            let mut mparams = ffi::llama_model_default_params();
-            if let Some(devices) = selected_devices.as_mut() {
-                mparams.devices = devices.as_mut_ptr();
-            }
-            if cpu_only || !using_gpu_devices {
-                mparams.n_gpu_layers = 0;
-                mparams.split_mode = ffi::llama_split_mode_LLAMA_SPLIT_MODE_NONE;
-                mparams.main_gpu = -1;
-                mparams.use_extra_bufts = false;
-            }
+            // SAFETY: FFI call with fitted params and a valid NUL-terminated path.
             ffi::llama_model_load_from_file(path_cstr.as_ptr(), mparams)
         };
 
@@ -121,16 +171,6 @@ impl ModelHandle {
             ));
         }
 
-        let n_ctx_train = unsafe {
-            // SAFETY: model pointer is valid while ModelHandle owns it.
-            ffi::llama_model_n_ctx_train(ptr)
-        };
-        let n_ctx_train = if n_ctx_train > 0 {
-            n_ctx_train as usize
-        } else {
-            4096
-        };
-
         let (has_encoder, has_decoder) = unsafe {
             // SAFETY: model pointer is valid while ModelHandle owns it.
             (
@@ -143,9 +183,7 @@ impl ModelHandle {
             ptr,
             vocab,
             n_embd,
-            n_ctx_train,
-            has_gpu_devices: using_gpu_devices,
-            max_gpu_mem_mib,
+            base_context_params: cparams,
             has_encoder,
             has_decoder,
         })
@@ -163,24 +201,16 @@ impl ModelHandle {
         self.n_embd
     }
 
-    pub(crate) fn n_ctx_train(&self) -> usize {
-        self.n_ctx_train
-    }
-
-    pub(crate) fn has_gpu_devices(&self) -> bool {
-        self.has_gpu_devices
-    }
-
-    pub(crate) fn max_gpu_mem_mib(&self) -> usize {
-        self.max_gpu_mem_mib
-    }
-
     pub(crate) fn has_encoder(&self) -> bool {
         self.has_encoder
     }
 
     pub(crate) fn has_decoder(&self) -> bool {
         self.has_decoder
+    }
+
+    pub(crate) fn context_params(&self) -> ffi::llama_context_params {
+        self.base_context_params
     }
 
     pub(crate) fn apply_chat_template(
@@ -265,139 +295,6 @@ impl ModelHandle {
     }
 }
 
-fn llama_logs_enabled() -> bool {
-    std::env::var("AUTOCOMMIT_LLAMA_LOG")
-        .ok()
-        .as_deref()
-        .map(|v| matches!(v, "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(false)
-}
-
-fn select_model_devices(cpu_only: bool) -> Option<Vec<ffi::ggml_backend_dev_t>> {
-    if cpu_only {
-        return Some(vec![std::ptr::null_mut()]);
-    }
-
-    // Keep auto backend selection behavior aligned with llama-cli.
-    None
-}
-
-fn detect_gpu_devices(cpu_only: bool) -> (bool, usize) {
-    if cpu_only {
-        return (false, 0);
-    }
-
-    let count = unsafe {
-        // SAFETY: pure backend metadata query.
-        ffi::ggml_backend_dev_count()
-    };
-
-    let mut has_gpu = false;
-    let mut max_gpu_mem_mib = 0usize;
-
-    for idx in 0..count {
-        let dev = unsafe {
-            // SAFETY: index is bounded by device count.
-            ffi::ggml_backend_dev_get(idx)
-        };
-        if dev.is_null() {
-            continue;
-        }
-
-        let dev_type = unsafe {
-            // SAFETY: device pointer comes from ggml registry.
-            ffi::ggml_backend_dev_type(dev)
-        };
-        let is_gpu = dev_type == ffi::ggml_backend_dev_type_GGML_BACKEND_DEVICE_TYPE_GPU
-            || dev_type == ffi::ggml_backend_dev_type_GGML_BACKEND_DEVICE_TYPE_IGPU;
-        if !is_gpu {
-            continue;
-        }
-
-        let (name, desc) = device_name_desc(dev);
-
-        let mut free = 0usize;
-        let mut total = 0usize;
-        unsafe {
-            // SAFETY: device pointer is valid and output pointers are writable.
-            ffi::ggml_backend_dev_memory(dev, &mut free, &mut total);
-        }
-        let usable = !name.trim().is_empty() || !desc.trim().is_empty() || total > 0 || free > 0;
-        if !usable {
-            continue;
-        }
-
-        has_gpu = true;
-        max_gpu_mem_mib = max_gpu_mem_mib.max(total / (1024 * 1024));
-    }
-
-    (has_gpu, max_gpu_mem_mib)
-}
-
-fn device_name_desc(dev: ffi::ggml_backend_dev_t) -> (String, String) {
-    let name = unsafe {
-        // SAFETY: backend returns a NUL-terminated string; null ptr is handled.
-        let ptr = ffi::ggml_backend_dev_name(dev);
-        if ptr.is_null() {
-            String::new()
-        } else {
-            CStr::from_ptr(ptr).to_string_lossy().into_owned()
-        }
-    };
-
-    let desc = unsafe {
-        // SAFETY: backend returns a NUL-terminated string; null ptr is handled.
-        let ptr = ffi::ggml_backend_dev_description(dev);
-        if ptr.is_null() {
-            String::new()
-        } else {
-            CStr::from_ptr(ptr).to_string_lossy().into_owned()
-        }
-    };
-
-    (name, desc)
-}
-
-fn device_inventory_summary() -> String {
-    let mut items = Vec::new();
-    let count = unsafe {
-        // SAFETY: pure backend metadata query.
-        ffi::ggml_backend_dev_count()
-    };
-    for idx in 0..count {
-        let dev = unsafe {
-            // SAFETY: index is bounded by device count.
-            ffi::ggml_backend_dev_get(idx)
-        };
-        if dev.is_null() {
-            continue;
-        }
-
-        let dev_type = unsafe {
-            // SAFETY: device pointer comes from ggml registry.
-            ffi::ggml_backend_dev_type(dev)
-        };
-        let (name, desc) = device_name_desc(dev);
-        let mut free = 0usize;
-        let mut total = 0usize;
-        unsafe {
-            // SAFETY: device pointer is valid and output pointers are writable.
-            ffi::ggml_backend_dev_memory(dev, &mut free, &mut total);
-        }
-        items.push(format!(
-            "#{idx}:type={dev_type},name={name},desc={desc},free_mib={},total_mib={}",
-            free / (1024 * 1024),
-            total / (1024 * 1024)
-        ));
-    }
-
-    if items.is_empty() {
-        "none".to_string()
-    } else {
-        items.join(" | ")
-    }
-}
-
 impl Drop for ModelHandle {
     fn drop(&mut self) {
         unsafe {
@@ -408,4 +305,83 @@ impl Drop for ModelHandle {
             }
         }
     }
+}
+
+fn resolve_requested_devices() -> Result<Option<Vec<ffi::ggml_backend_dev_t>>, RuntimeError> {
+    let requested = std::env::var("LLAMA_ARG_DEVICE")
+        .ok()
+        .or_else(|| std::env::var("AUTOCOMMIT_LLAMA_DEVICE").ok());
+    let Some(raw) = requested else {
+        return Ok(None);
+    };
+
+    let entries = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .collect::<Vec<_>>();
+    if entries.is_empty() {
+        return Err(RuntimeError::Embed(
+            "LLAMA_ARG_DEVICE/AUTOCOMMIT_LLAMA_DEVICE is empty".to_string(),
+        ));
+    }
+
+    if entries.len() == 1 && entries[0].eq_ignore_ascii_case("none") {
+        return Ok(Some(vec![std::ptr::null_mut()]));
+    }
+
+    let mut available = Vec::new();
+    let count = unsafe {
+        // SAFETY: pure backend metadata query.
+        ffi::ggml_backend_dev_count()
+    };
+    for idx in 0..count {
+        let dev = unsafe {
+            // SAFETY: idx is bounded by ggml_backend_dev_count.
+            ffi::ggml_backend_dev_get(idx)
+        };
+        if dev.is_null() {
+            continue;
+        }
+        let name = unsafe {
+            // SAFETY: ggml provides static NUL-terminated strings.
+            CStr::from_ptr(ffi::ggml_backend_dev_name(dev))
+                .to_string_lossy()
+                .into_owned()
+        };
+        let desc = unsafe {
+            // SAFETY: ggml provides static NUL-terminated strings.
+            CStr::from_ptr(ffi::ggml_backend_dev_description(dev))
+                .to_string_lossy()
+                .into_owned()
+        };
+        available.push((name, desc, dev));
+    }
+
+    let mut out = Vec::with_capacity(entries.len() + 1);
+    for target in entries {
+        let matched = available.iter().find(|(name, desc, _)| {
+            name.eq_ignore_ascii_case(target) || desc.eq_ignore_ascii_case(target)
+        });
+        let Some((_, _, dev)) = matched else {
+            let choices = available
+                .iter()
+                .map(|(name, _, _)| {
+                    if name.is_empty() {
+                        "<unnamed>".to_string()
+                    } else {
+                        name.clone()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            return Err(RuntimeError::Embed(format!(
+                "invalid device '{target}' in LLAMA_ARG_DEVICE/AUTOCOMMIT_LLAMA_DEVICE (available: {choices})"
+            )));
+        };
+        out.push(*dev);
+    }
+    out.push(std::ptr::null_mut());
+
+    Ok(Some(out))
 }

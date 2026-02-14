@@ -25,8 +25,13 @@ fn run(args: Vec<String>) -> Result<(), String> {
             print!("{output}");
             Ok(())
         }
+        Some("init") => {
+            let output = cmd::init::run(&args[1..])?;
+            print!("{output}");
+            Ok(())
+        }
         Some("--help") | Some("-h") | None => {
-            println!("autocommit-cli <analyze|commit|explain-dispatch> [options]");
+            println!("autocommit-cli <analyze|commit|explain-dispatch|init> [options]");
             Ok(())
         }
         Some(other) => Err(format!("unknown command: {other}")),

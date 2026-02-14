@@ -25,5 +25,9 @@ Rust workspace scaffold for evolving `tmp/autocommit.sh` from shell script to a 
 - Runtime inference in `crates/llama-runtime` now uses multi-sequence batching for chunk analysis on a shared `llama_model` + dedicated contexts.
 - Runtime embedding extraction uses `llama_tokenize` + `llama_encode`/`llama_decode` + `llama_get_embeddings*`.
 - To enable runtime analysis/embedding, set `AUTOCOMMIT_EMBED_MODEL=/absolute/path/to/model.gguf` (or fallback `LLAMA_MODEL_PATH`).
+- Per-repo KV persistence:
+  - Run `autocommit-cli init --profile auto` once inside a git repo to initialize `.git/autocommit/kv/`.
+  - `init` warms the generation context and writes `generation.session` + `metadata.json`.
+  - Subsequent `autocommit-cli analyze` / `autocommit-cli commit` runs auto-attempt state load from that repo cache.
 - Override source path with:
   - `LLAMA_CPP_DIR=/absolute/path/to/llama.cpp`

@@ -5,6 +5,8 @@ use std::process::Command;
 use autocommit_core::llm::traits::LlmEngine;
 use autocommit_core::{AnalyzeOptions, CoreError, run as core_run};
 
+#[cfg(feature = "llama-native")]
+use crate::cmd::repo_cache;
 use crate::output;
 
 #[cfg(not(feature = "llama-native"))]
@@ -19,6 +21,8 @@ pub fn run(args: &[String]) -> Result<String, String> {
     let mut model_path: Option<String> = None;
     #[cfg(feature = "llama-native")]
     let mut runtime_profile = "auto".to_string();
+    #[cfg(feature = "llama-native")]
+    let mut runtime_profile_overridden = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -45,6 +49,7 @@ pub fn run(args: &[String]) -> Result<String, String> {
                 #[cfg(feature = "llama-native")]
                 {
                     runtime_profile = profile.clone();
+                    runtime_profile_overridden = true;
                 }
                 #[cfg(not(feature = "llama-native"))]
                 {
@@ -57,6 +62,21 @@ pub fn run(args: &[String]) -> Result<String, String> {
         i += 1;
     }
 
+    #[cfg(feature = "llama-native")]
+    let repo_paths = repo_cache::maybe_discover_repo_kv_paths();
+
+    #[cfg(feature = "llama-native")]
+    if model_path.is_none() || !runtime_profile_overridden {
+        if let Some(metadata) = repo_paths.as_ref().and_then(repo_cache::read_metadata) {
+            if model_path.is_none() {
+                model_path = metadata.model_path;
+            }
+            if !runtime_profile_overridden && !metadata.profile.trim().is_empty() {
+                runtime_profile = metadata.profile;
+            }
+        }
+    }
+
     if let Some(path) = model_path {
         // SAFETY: this CLI is single-threaded for command setup and sets env before runtime init.
         unsafe {
@@ -67,8 +87,11 @@ pub fn run(args: &[String]) -> Result<String, String> {
     let diff_text = load_diff(diff_file.as_deref()).map_err(|err| err.to_string())?;
 
     #[cfg(feature = "llama-native")]
+    let generation_state = repo_paths.map(|paths| paths.generation_state);
+
+    #[cfg(feature = "llama-native")]
     let engine: Box<dyn LlmEngine> = Box::new(
-        llama_runtime::Engine::new(&runtime_profile)
+        llama_runtime::Engine::new_with_generation_cache(&runtime_profile, generation_state)
             .map_err(|err| format!("runtime init failed: {err}"))?,
     );
 

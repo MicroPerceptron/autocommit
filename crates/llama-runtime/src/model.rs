@@ -73,10 +73,15 @@ struct LoadedRuntime {
     embedding_ctx: Option<ContextHandle>,
     model: Arc<ModelHandle>,
     cpu_only: bool,
+    generation_state_path: Option<PathBuf>,
 }
 
 impl LoadedRuntime {
-    fn load(model_path: &Path, profile: &str) -> Result<Self, RuntimeError> {
+    fn load(
+        model_path: &Path,
+        profile: &str,
+        generation_state_path: Option<PathBuf>,
+    ) -> Result<Self, RuntimeError> {
         let cpu_only = profile.eq_ignore_ascii_case("cpu");
         let model = Arc::new(ModelHandle::load(model_path, cpu_only)?);
 
@@ -85,21 +90,44 @@ impl LoadedRuntime {
             embedding_ctx: None,
             model,
             cpu_only,
+            generation_state_path,
         })
     }
 
     fn generation_ctx(&mut self) -> Result<&mut ContextHandle, RuntimeError> {
         if self.generation_ctx.is_none() {
-            self.generation_ctx = Some(ContextHandle::new_generation(
-                Arc::clone(&self.model),
-                self.cpu_only,
-            )?);
+            let mut ctx = ContextHandle::new_generation(Arc::clone(&self.model), self.cpu_only)?;
+
+            if let Some(state_path) = self.generation_state_path.as_deref() {
+                if state_path.is_file() {
+                    if let Err(err) = ctx.load_state_file(state_path) {
+                        if llama_logs_enabled() {
+                            eprintln!(
+                                "autocommit warning: failed to load generation state from {}: {err}",
+                                state_path.display()
+                            );
+                        }
+                    }
+                }
+            }
+
+            self.generation_ctx = Some(ctx);
         }
 
         Ok(self
             .generation_ctx
             .as_mut()
             .expect("generation context just initialized"))
+    }
+
+    fn warmup_generation_cache(&mut self) -> Result<(), RuntimeError> {
+        let state_path = self.generation_state_path.clone().ok_or_else(|| {
+            RuntimeError::State("generation cache path is not configured for warmup".to_string())
+        })?;
+
+        let generation_ctx = self.generation_ctx()?;
+        generation_ctx.warmup()?;
+        generation_ctx.save_state_file(&state_path, &[])
     }
 
     fn embed(&mut self, text: &str) -> Result<Vec<f32>, RuntimeError> {
@@ -141,10 +169,7 @@ impl LoadedRuntime {
                     })
             })
             .collect::<Vec<_>>();
-        let budgets = chunks
-            .iter()
-            .map(analyze_token_budget)
-            .collect::<Vec<_>>();
+        let budgets = chunks.iter().map(analyze_token_budget).collect::<Vec<_>>();
 
         let generation_ctx = self.generation_ctx()?;
         let mut out: Vec<PartialReport> = chunks
@@ -160,8 +185,11 @@ impl LoadedRuntime {
             let batch_prompts = &prompts[start..end];
             let batch_budgets = &budgets[start..end];
 
-            let batch_outputs = generation_ctx
-                .generate_texts_with_budgets(batch_prompts, Some(grammar::ANALYZE_GBNF), batch_budgets);
+            let batch_outputs = generation_ctx.generate_texts_with_budgets(
+                batch_prompts,
+                Some(grammar::ANALYZE_GBNF),
+                batch_budgets,
+            );
 
             match batch_outputs {
                 Ok(outputs) => {
@@ -235,7 +263,8 @@ impl LoadedRuntime {
                 Err(batch_err) => {
                     for idx in start..end {
                         let chunk = &chunks[idx];
-                        let parsed = generate_analyze_output(generation_ctx, &prompts[idx], budgets[idx]);
+                        let parsed =
+                            generate_analyze_output(generation_ctx, &prompts[idx], budgets[idx]);
                         out[idx] = match parsed {
                             Ok(model_output) => {
                                 partial_from_model_chunk(runtime_context, idx, chunk, model_output)
@@ -244,7 +273,12 @@ impl LoadedRuntime {
                                 let combined = RuntimeError::Inference(format!(
                                     "batched analyze failed ({batch_err}); fallback failed ({err})"
                                 ));
-                                partial_from_chunk_with_error(runtime_context, idx, chunk, &combined)
+                                partial_from_chunk_with_error(
+                                    runtime_context,
+                                    idx,
+                                    chunk,
+                                    &combined,
+                                )
                             }
                         };
                     }
@@ -319,16 +353,25 @@ pub struct Engine {
     _backend: Arc<BackendGuard>,
     context: RuntimeContext,
     runtime_model_path: Option<PathBuf>,
+    generation_state_path: Option<PathBuf>,
     runtime: Mutex<Option<LoadedRuntime>>,
 }
 
 impl Engine {
     pub fn new(profile: &str) -> Result<Self, RuntimeError> {
+        Self::new_with_generation_cache(profile, None)
+    }
+
+    pub fn new_with_generation_cache(
+        profile: &str,
+        generation_state_path: Option<PathBuf>,
+    ) -> Result<Self, RuntimeError> {
         let backend = Arc::new(BackendGuard::acquire());
         Ok(Self {
             _backend: backend,
             context: RuntimeContext::new(profile),
             runtime_model_path: resolve_embedding_model_path(),
+            generation_state_path,
             runtime: Mutex::new(None),
         })
     }
@@ -340,6 +383,14 @@ impl Engine {
 
     pub fn backend_refcount() -> usize {
         BACKEND_REFCOUNT.load(Ordering::SeqCst)
+    }
+
+    pub fn configured_model_path(&self) -> Option<&Path> {
+        self.runtime_model_path.as_deref()
+    }
+
+    pub fn warmup_generation_cache(&self) -> Result<(), RuntimeError> {
+        self.with_runtime(|runtime| runtime.warmup_generation_cache())
     }
 
     fn with_runtime<T>(
@@ -358,7 +409,11 @@ impl Engine {
             .map_err(|_| RuntimeError::Inference("runtime lock poisoned".to_string()))?;
 
         if guard.is_none() {
-            *guard = Some(LoadedRuntime::load(model_path, &self.context.profile)?);
+            *guard = Some(LoadedRuntime::load(
+                model_path,
+                &self.context.profile,
+                self.generation_state_path.clone(),
+            )?);
         }
 
         f(guard.as_mut().expect("runtime just initialized"))
@@ -460,16 +515,26 @@ impl LlmEngine for Engine {
             .unwrap_or_else(|| {
                 let mut notes = vec!["fallback_reduce_generation".to_string()];
                 if let Err(err) = &generated_result {
-                    notes.push(format!("reduce_error:{}", compact_error_note(&err.to_string())));
+                    notes.push(format!(
+                        "reduce_error:{}",
+                        compact_error_note(&err.to_string())
+                    ));
                 }
                 notes
             });
         let analyze_fallbacks = partials
             .iter()
-            .filter(|p| p.summary.contains("fallback heuristic due to analyze_error:"))
+            .filter(|p| {
+                p.summary
+                    .contains("fallback heuristic due to analyze_error:")
+            })
             .count();
         if analyze_fallbacks > 0 {
-            risk_notes.push(format!("analyze_fallback:{}/{}", analyze_fallbacks, partials.len()));
+            risk_notes.push(format!(
+                "analyze_fallback:{}/{}",
+                analyze_fallbacks,
+                partials.len()
+            ));
         } else {
             risk_notes.push(format!("analyze_model:{}", partials.len()));
         }
@@ -581,11 +646,11 @@ fn build_reduce_prompt_plan(
 
 fn reduce_token_budget(stats: &DiffStats, total: usize) -> usize {
     if stats.lines_changed > 1_500 || total > 24 {
-        128
+        224
     } else if stats.lines_changed > 900 || total > 12 {
-        160
+        256
     } else {
-        192
+        320
     }
 }
 
@@ -643,6 +708,7 @@ fn sampled_indices(total: usize, max_items: usize) -> Vec<usize> {
 }
 
 fn format_partial_for_reduce(partial: &PartialReport) -> String {
+    let summary = compact_reduce_text(&partial.summary, 220);
     if let Some(item) = partial.items.first() {
         let file_paths = item
             .files
@@ -651,13 +717,30 @@ fn format_partial_for_reduce(partial: &PartialReport) -> String {
             .map(|f| f.path.as_str())
             .collect::<Vec<_>>()
             .join("|");
+        let title = compact_reduce_text(&item.title, 120);
         format!(
             "bucket={:?} type={:?} title={} files={} confidence={:.2} summary={}",
-            item.bucket, item.type_tag, item.title, file_paths, item.confidence, partial.summary
+            item.bucket, item.type_tag, title, file_paths, item.confidence, summary
         )
     } else {
-        partial.summary.clone()
+        summary
     }
+}
+
+fn compact_reduce_text(value: &str, max_chars: usize) -> String {
+    let mut normalized = sanitize_sentence(value);
+    if normalized.contains("fallback heuristic due to analyze_error:") {
+        normalized = "fallback heuristic used due to analyze error".to_string();
+    }
+    if normalized.chars().count() <= max_chars {
+        return normalized;
+    }
+    let mut out = String::with_capacity(max_chars + 1);
+    for ch in normalized.chars().take(max_chars) {
+        out.push(ch);
+    }
+    out.push('…');
+    out
 }
 
 fn parse_reduce_output(raw: &str) -> Result<ReduceModelOutput, RuntimeError> {
@@ -713,7 +796,18 @@ fn generate_analyze_output(
 ) -> Result<AnalyzeModelOutput, RuntimeError> {
     let raw = generation_ctx.generate_text(prompt, Some(grammar::ANALYZE_GBNF), max_tokens);
     match raw {
-        Ok(raw) => parse_analyze_output(&raw),
+        Ok(raw) => match parse_analyze_output(&raw) {
+            Ok(parsed) => Ok(parsed),
+            Err(parse_err) => {
+                let retry_raw =
+                    generation_ctx.generate_text(prompt, None, max_tokens.saturating_add(64))?;
+                parse_analyze_output(&retry_raw).map_err(|retry_err| {
+                    RuntimeError::Inference(format!(
+                        "analyze parse failed with and without grammar: primary={parse_err}; retry={retry_err}"
+                    ))
+                })
+            }
+        },
         Err(err) => {
             if err
                 .to_string()
@@ -748,6 +842,10 @@ fn parse_analyze_output(raw: &str) -> Result<AnalyzeModelOutput, RuntimeError> {
         }
     }
 
+    if last.is_none() {
+        last = salvage_analyze_output(raw).or_else(|| analyze_from_freeform_text(raw));
+    }
+
     let mut output = last.ok_or_else(|| {
         RuntimeError::Inference(format!(
             "failed to parse analyze JSON output from model: {}",
@@ -758,18 +856,252 @@ fn parse_analyze_output(raw: &str) -> Result<AnalyzeModelOutput, RuntimeError> {
     output.summary = output.summary.trim().to_string();
     output.title = output.title.trim().to_string();
     output.intent = output.intent.trim().to_string();
-    if output.summary.is_empty() || output.title.is_empty() || output.intent.is_empty() {
-        return Err(RuntimeError::Inference(
-            "analyze output has empty required field".to_string(),
-        ));
+    if output.summary.is_empty() {
+        output.summary = "chunk analysis".to_string();
+    }
+    if output.title.is_empty() {
+        output.title = output.summary.clone();
+    }
+    if output.intent.is_empty() {
+        output.intent = output.title.clone();
     }
 
     Ok(output)
 }
 
+fn salvage_analyze_output(raw: &str) -> Option<AnalyzeModelOutput> {
+    let summary_raw = extract_json_like_field(raw, "summary");
+    let title_raw = extract_json_like_field(raw, "title");
+    let intent_raw = extract_json_like_field(raw, "intent");
+
+    if summary_raw.is_none() && title_raw.is_none() && intent_raw.is_none() {
+        return None;
+    }
+
+    let summary = summary_raw
+        .clone()
+        .or_else(|| title_raw.clone())
+        .or_else(|| intent_raw.clone())
+        .unwrap_or_else(|| "chunk analysis".to_string());
+    let title = title_raw
+        .clone()
+        .or_else(|| summary_raw.clone())
+        .or_else(|| intent_raw.clone())
+        .unwrap_or_else(|| "update chunk".to_string());
+    let intent = intent_raw
+        .clone()
+        .or_else(|| title_raw.clone())
+        .or_else(|| summary_raw.clone())
+        .unwrap_or_else(|| "summarize chunk intent".to_string());
+
+    let bucket = extract_json_like_field(raw, "bucket")
+        .and_then(|v| parse_bucket_label(&v))
+        .unwrap_or(ChangeBucket::Patch);
+    let type_tag = extract_json_like_field(raw, "type_tag")
+        .or_else(|| extract_json_like_field(raw, "type"))
+        .and_then(|v| parse_type_tag_label(&v))
+        .unwrap_or(TypeTag::Mixed);
+
+    Some(AnalyzeModelOutput {
+        summary,
+        bucket,
+        type_tag,
+        title,
+        intent,
+    })
+}
+
+fn analyze_from_freeform_text(raw: &str) -> Option<AnalyzeModelOutput> {
+    let cleaned = sanitize_sentence(raw);
+    if cleaned.is_empty() {
+        return None;
+    }
+
+    let summary = truncate_chars(&cleaned, 220);
+    let title = truncate_chars(&cleaned, 120);
+    let intent = truncate_chars(&cleaned, 160);
+    let lowercase = cleaned.to_ascii_lowercase();
+
+    Some(AnalyzeModelOutput {
+        summary,
+        bucket: infer_bucket_from_text(&lowercase),
+        type_tag: infer_type_tag_from_text(&lowercase),
+        title,
+        intent,
+    })
+}
+
+fn infer_bucket_from_text(raw: &str) -> ChangeBucket {
+    if raw.contains("feature")
+        || raw.contains("add ")
+        || raw.contains("added ")
+        || raw.contains("introduc")
+        || raw.contains("new ")
+    {
+        ChangeBucket::Feature
+    } else if raw.contains("doc") || raw.contains("readme") {
+        ChangeBucket::Addition
+    } else if raw.contains("fix")
+        || raw.contains("patch")
+        || raw.contains("update")
+        || raw.contains("refactor")
+    {
+        ChangeBucket::Patch
+    } else {
+        ChangeBucket::Other
+    }
+}
+
+fn infer_type_tag_from_text(raw: &str) -> TypeTag {
+    if raw.contains("refactor") || raw.contains("cleanup") {
+        TypeTag::Refactor
+    } else if raw.contains("fix") || raw.contains("bug") {
+        TypeTag::Fix
+    } else if raw.contains("test") {
+        TypeTag::Test
+    } else if raw.contains("doc") || raw.contains("readme") {
+        TypeTag::Docs
+    } else if raw.contains("perf") || raw.contains("optim") {
+        TypeTag::Perf
+    } else if raw.contains("style") || raw.contains("format") {
+        TypeTag::Style
+    } else if raw.contains("feat")
+        || raw.contains("feature")
+        || raw.contains("add ")
+        || raw.contains("introduc")
+    {
+        TypeTag::Feat
+    } else {
+        TypeTag::Mixed
+    }
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+
+    let mut out = String::with_capacity(max_chars + 3);
+    for ch in value.chars().take(max_chars) {
+        out.push(ch);
+    }
+    out.push_str("...");
+    out
+}
+
+fn parse_bucket_label(value: &str) -> Option<ChangeBucket> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "feature" => Some(ChangeBucket::Feature),
+        "patch" => Some(ChangeBucket::Patch),
+        "addition" => Some(ChangeBucket::Addition),
+        "other" => Some(ChangeBucket::Other),
+        _ => None,
+    }
+}
+
+fn parse_type_tag_label(value: &str) -> Option<TypeTag> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "feat" => Some(TypeTag::Feat),
+        "fix" => Some(TypeTag::Fix),
+        "refactor" => Some(TypeTag::Refactor),
+        "docs" => Some(TypeTag::Docs),
+        "test" => Some(TypeTag::Test),
+        "chore" => Some(TypeTag::Chore),
+        "perf" => Some(TypeTag::Perf),
+        "style" => Some(TypeTag::Style),
+        "mixed" => Some(TypeTag::Mixed),
+        _ => None,
+    }
+}
+
+fn extract_json_like_field(raw: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\"");
+    let bytes = raw.as_bytes();
+    let mut start = 0usize;
+
+    while let Some(rel) = raw.get(start..)?.find(&needle) {
+        let mut i = start + rel + needle.len();
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] != b':' {
+            start = i.min(bytes.len());
+            continue;
+        }
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            return None;
+        }
+
+        if bytes[i] == b'"' {
+            if let Some(end) = find_string_end(bytes, i + 1) {
+                if let Some(slice) = raw.get(i..=end) {
+                    if let Ok(parsed) = serde_json::from_str::<String>(slice) {
+                        return Some(parsed.trim().to_string());
+                    }
+                }
+                if let Some(fallback) = raw.get((i + 1)..end) {
+                    return Some(fallback.trim().to_string());
+                }
+                return None;
+            }
+
+            // Truncated quote: recover until next delimiter.
+            let end = find_unquoted_value_end(bytes, i + 1);
+            if let Some(fallback) = raw.get((i + 1)..end) {
+                return Some(fallback.trim().to_string());
+            }
+            return None;
+        }
+
+        let end = find_unquoted_value_end(bytes, i);
+        if let Some(slice) = raw.get(i..end) {
+            let cleaned = slice.trim().trim_matches('"').trim().to_string();
+            if !cleaned.is_empty() {
+                return Some(cleaned);
+            }
+        }
+
+        start = end.min(bytes.len());
+    }
+
+    None
+}
+
+fn find_string_end(bytes: &[u8], mut idx: usize) -> Option<usize> {
+    while idx < bytes.len() {
+        if bytes[idx] == b'"' {
+            let mut slash_count = 0usize;
+            let mut back = idx;
+            while back > 0 && bytes[back - 1] == b'\\' {
+                slash_count += 1;
+                back -= 1;
+            }
+            if slash_count % 2 == 0 {
+                return Some(idx);
+            }
+        }
+        idx += 1;
+    }
+    None
+}
+
+fn find_unquoted_value_end(bytes: &[u8], mut idx: usize) -> usize {
+    while idx < bytes.len() {
+        match bytes[idx] {
+            b',' | b'}' | b'\n' | b'\r' => break,
+            _ => idx += 1,
+        }
+    }
+    idx
+}
+
 fn compact_error_note(raw: &str) -> String {
     let squashed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
-    let max_chars = 1000usize;
+    let max_chars = 240usize;
     if squashed.chars().count() <= max_chars {
         return squashed;
     }
@@ -784,11 +1116,11 @@ fn compact_error_note(raw: &str) -> String {
 
 fn analyze_token_budget(chunk: &DiffChunk) -> usize {
     if chunk.estimated_tokens > 3_000 {
-        128
-    } else if chunk.estimated_tokens > 1_500 {
-        160
-    } else {
         192
+    } else if chunk.estimated_tokens > 1_500 {
+        224
+    } else {
+        256
     }
 }
 
@@ -1123,5 +1455,39 @@ fn canonical_commit_type(value: &str) -> Option<&'static str> {
         "perf" => Some("perf"),
         "style" => Some("style"),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_analyze_output_recovers_from_truncated_json() {
+        let raw = r#"{"summary":"Add state loading and saving","bucket":"Feature","type_tag":"Feat","title":"Add state loading","intent":"Add"#;
+        let parsed = parse_analyze_output(raw).expect("parse should recover");
+        assert_eq!(parsed.bucket, ChangeBucket::Feature);
+        assert_eq!(parsed.type_tag, TypeTag::Feat);
+        assert!(!parsed.summary.is_empty());
+        assert!(!parsed.title.is_empty());
+        assert!(!parsed.intent.is_empty());
+    }
+
+    #[test]
+    fn parse_analyze_output_recovers_from_freeform_text() {
+        let raw = "Refactor model_handle.rs to remove manual device selection and rely on llama defaults.";
+        let parsed = parse_analyze_output(raw).expect("parse should recover");
+        assert_eq!(parsed.type_tag, TypeTag::Refactor);
+        assert_eq!(parsed.bucket, ChangeBucket::Patch);
+        assert!(parsed.summary.contains("Refactor"));
+    }
+
+    #[test]
+    fn parse_analyze_output_still_rejects_empty_text() {
+        let err = parse_analyze_output("   ").expect_err("empty output should fail");
+        assert!(
+            err.to_string()
+                .contains("failed to parse analyze JSON output")
+        );
     }
 }

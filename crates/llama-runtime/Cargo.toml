@@ -1,0 +1,8 @@
+[package]
+name = "llama-runtime"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+autocommit-core = { path = "../core" }
+llama-sys = { path = "../llama-sys" }

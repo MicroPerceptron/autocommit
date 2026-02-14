@@ -50,6 +50,8 @@ fn main() {
     fs::create_dir_all(&build_dir).expect("failed to create cmake build dir");
     fs::create_dir_all(&install_dir).expect("failed to create cmake install dir");
 
+    generate_bindings(&source_dir, &out_dir);
+
     let profile = profile_name();
 
     let mut configure = Command::new("cmake");
@@ -105,6 +107,46 @@ fn main() {
     );
 }
 
+fn generate_bindings(source_dir: &Path, out_dir: &Path) {
+    let header = source_dir.join("include").join("llama.h");
+    let ggml_include = source_dir.join("ggml").join("include");
+
+    assert!(
+        header.is_file(),
+        "llama header not found at {}",
+        header.display()
+    );
+    assert!(
+        ggml_include.is_dir(),
+        "ggml headers not found at {}",
+        ggml_include.display()
+    );
+
+    let bindings = bindgen::Builder::default()
+        .header(header.to_string_lossy().into_owned())
+        .clang_arg(format!(
+            "-I{}",
+            source_dir.join("include").to_string_lossy()
+        ))
+        .clang_arg(format!("-I{}", ggml_include.to_string_lossy()))
+        .allowlist_function("^llama_.*")
+        .allowlist_type("^llama_.*")
+        .allowlist_var("^LLAMA_.*")
+        .allowlist_type("^ggml_.*")
+        .allowlist_var("^GGML_.*")
+        .blocklist_type("^FILE$")
+        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
+        .layout_tests(false)
+        .generate_comments(false)
+        .generate()
+        .unwrap_or_else(|err| panic!("bindgen failed for {}: {err}", header.display()));
+
+    let out_file = out_dir.join("bindings.rs");
+    bindings
+        .write_to_file(&out_file)
+        .unwrap_or_else(|err| panic!("failed to write {}: {err}", out_file.display()));
+}
+
 fn emit_link_search_paths(install_dir: &Path) {
     let candidates = [
         install_dir.join("lib"),
@@ -115,6 +157,38 @@ fn emit_link_search_paths(install_dir: &Path) {
     for path in candidates {
         if path.exists() {
             println!("cargo:rustc-link-search=native={}", path.to_string_lossy());
+            emit_link_libs_from_dir(&path);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        println!("cargo:rustc-link-lib=dylib=c++");
+        println!("cargo:rustc-link-lib=framework=Accelerate");
+        println!("cargo:rustc-link-lib=framework=Foundation");
+        println!("cargo:rustc-link-lib=framework=Metal");
+        println!("cargo:rustc-link-lib=framework=QuartzCore");
+    }
+}
+
+fn emit_link_libs_from_dir(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+
+        if !name.starts_with("lib") || !name.ends_with(".a") {
+            continue;
+        }
+
+        let lib_name = &name[3..name.len() - 2];
+        if !lib_name.is_empty() {
+            println!("cargo:rustc-link-lib=static={lib_name}");
         }
     }
 }

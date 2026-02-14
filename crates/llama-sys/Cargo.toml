@@ -6,3 +6,6 @@ build = "build.rs"
 links = "llama"
 
 [dependencies]
+
+[build-dependencies]
+bindgen = "0.71"

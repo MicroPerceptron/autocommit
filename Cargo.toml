@@ -1,4 +1,4 @@
 [workspace]
-members = ["crates/core", "crates/cli", "crates/llama-sys"]
+members = ["crates/core", "crates/cli", "crates/llama-sys", "crates/llama-runtime"]
 default-members = ["crates/core", "crates/cli"]
 resolver = "2"

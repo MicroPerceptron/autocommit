@@ -1,11 +1,9 @@
 use std::ffi::{CStr, CString};
-use std::fs;
 use std::path::Path;
-use std::slice;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{fs, slice};
 
-use llama_sys::ffi;
+use llama_sys::{bridge, ffi};
 
 use crate::error::RuntimeError;
 use crate::model_handle::ModelHandle;
@@ -601,7 +599,7 @@ impl ContextHandle {
         self.decode_prompt_tokens_from(&prompt_tokens, n_match, 0, false)?;
         self.session_tokens = prompt_tokens.clone();
 
-        let mut sampler = SamplerChain::new(self.model.vocab(), grammar)?;
+        let mut sampler = CommonSampler::new(self.model.as_ref(), grammar)?;
         let mut generated = String::new();
         let mut next_pos = i32::try_from(prompt_tokens.len())
             .map_err(|_| RuntimeError::Inference("prompt token count exceeds i32".to_string()))?;
@@ -757,7 +755,7 @@ impl ContextHandle {
                 samplers.push(None);
                 continue;
             }
-            match SamplerChain::new(self.model.vocab(), grammar) {
+            match CommonSampler::new(self.model.as_ref(), grammar) {
                 Ok(s) => {
                     active[idx] = true;
                     samplers.push(Some(s));
@@ -1576,82 +1574,36 @@ impl Drop for ContextHandle {
 }
 
 #[derive(Debug)]
-struct SamplerChain {
-    vocab: *const ffi::llama_vocab,
-    chain_ptr: *mut ffi::llama_sampler,
-    grammar_ptr: Option<*mut ffi::llama_sampler>,
+struct CommonSampler {
+    ptr: *mut std::ffi::c_void,
 }
 
-impl SamplerChain {
-    fn new(vocab: *const ffi::llama_vocab, grammar: Option<&str>) -> Result<Self, RuntimeError> {
-        let chain_ptr = unsafe {
-            // SAFETY: default params are POD values from llama.
-            let mut params = ffi::llama_sampler_chain_default_params();
-            params.no_perf = true;
-            ffi::llama_sampler_chain_init(params)
-        };
+impl CommonSampler {
+    fn new(model: &ModelHandle, grammar: Option<&str>) -> Result<Self, RuntimeError> {
+        let grammar_c = grammar
+            .map(CString::new)
+            .transpose()
+            .map_err(|_| RuntimeError::Inference("grammar contains interior NUL".to_string()))?;
+        let grammar_ptr = grammar_c
+            .as_ref()
+            .map(|c| c.as_ptr())
+            .unwrap_or(std::ptr::null());
 
-        if chain_ptr.is_null() {
+        let ptr = unsafe {
+            // SAFETY: model and config pointers are valid and grammar is NUL-terminated.
+            bridge::autocommit_common_sampler_new(
+                model.common_config_ptr(),
+                model.as_ptr(),
+                grammar_ptr,
+                0,
+            )
+        };
+        if ptr.is_null() {
             return Err(RuntimeError::Inference(
-                "failed to initialize sampler chain".to_string(),
+                "failed to initialize common sampler".to_string(),
             ));
         }
-
-        let grammar_ptr = if let Some(grammar_src) = grammar {
-            let grammar_c = CString::new(grammar_src).map_err(|_| {
-                RuntimeError::Inference("grammar contains interior NUL".to_string())
-            })?;
-            let root_c = CString::new("root")
-                .map_err(|_| RuntimeError::Inference("invalid grammar root".to_string()))?;
-            let ptr = unsafe {
-                // SAFETY: vocab and C strings are valid.
-                ffi::llama_sampler_init_grammar(vocab, grammar_c.as_ptr(), root_c.as_ptr())
-            };
-            if ptr.is_null() {
-                unsafe {
-                    // SAFETY: chain pointer is owned by this constructor path.
-                    ffi::llama_sampler_free(chain_ptr);
-                }
-                return Err(RuntimeError::Inference(
-                    "failed to initialize grammar sampler".to_string(),
-                ));
-            }
-            Some(ptr)
-        } else {
-            None
-        };
-
-        let mut chain = Self {
-            vocab,
-            chain_ptr,
-            grammar_ptr,
-        };
-
-        chain.add_to_chain(unsafe { ffi::llama_sampler_init_top_k(40) })?;
-        chain.add_to_chain(unsafe { ffi::llama_sampler_init_top_p(0.9, 1) })?;
-        chain.add_to_chain(unsafe { ffi::llama_sampler_init_temp(0.2) })?;
-
-        let seed = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u32)
-            .unwrap_or(42);
-        chain.add_to_chain(unsafe { ffi::llama_sampler_init_dist(seed) })?;
-
-        Ok(chain)
-    }
-
-    fn add_to_chain(&mut self, sampler: *mut ffi::llama_sampler) -> Result<(), RuntimeError> {
-        if sampler.is_null() {
-            return Err(RuntimeError::Inference(
-                "failed to initialize sampler component".to_string(),
-            ));
-        }
-
-        unsafe {
-            // SAFETY: chain and sampler pointers are valid and chain takes ownership.
-            ffi::llama_sampler_chain_add(self.chain_ptr, sampler);
-        }
-        Ok(())
+        Ok(Self { ptr })
     }
 
     fn sample(
@@ -1659,109 +1611,28 @@ impl SamplerChain {
         ctx: *mut ffi::llama_context,
         idx: i32,
     ) -> Result<ffi::llama_token, RuntimeError> {
-        let n_vocab = unsafe {
-            // SAFETY: vocab pointer is valid for sampler chain lifetime.
-            ffi::llama_vocab_n_tokens(self.vocab)
+        let token = unsafe {
+            // SAFETY: sampler and context pointers are valid.
+            bridge::autocommit_common_sampler_sample(self.ptr, ctx, idx, 0)
         };
-        if n_vocab <= 0 {
-            return Err(RuntimeError::Inference("vocab size is invalid".to_string()));
-        }
-
-        let logits = unsafe {
-            // SAFETY: context pointer is valid during generation.
-            ffi::llama_get_logits_ith(ctx, idx)
-        };
-        if logits.is_null() {
-            return Err(RuntimeError::Inference(format!(
-                "missing logits for output index {idx}"
-            )));
-        }
-
-        let mut cur = logits_to_candidates(logits, n_vocab as usize);
-        let mut cur_p = ffi::llama_token_data_array {
-            data: cur.as_mut_ptr(),
-            size: cur.len(),
-            selected: -1,
-            sorted: false,
-        };
-
-        unsafe {
-            // SAFETY: sampler and candidate array are valid.
-            ffi::llama_sampler_apply(self.chain_ptr, &mut cur_p);
-        }
-        let mut token = selected_token(&cur_p)?;
-
-        if let Some(grammar_ptr) = self.grammar_ptr {
-            // Check if sampled token satisfies grammar; if not, resample grammar-first.
-            let mut single = ffi::llama_token_data {
-                id: token,
-                logit: 1.0,
-                p: 0.0,
-            };
-            let mut single_arr = ffi::llama_token_data_array {
-                data: std::ptr::addr_of_mut!(single),
-                size: 1,
-                selected: -1,
-                sorted: false,
-            };
-
-            unsafe {
-                // SAFETY: grammar sampler and token array are valid.
-                ffi::llama_sampler_apply(grammar_ptr, &mut single_arr);
-            }
-
-            if single.logit == f32::NEG_INFINITY {
-                let logits_retry = unsafe {
-                    // SAFETY: context pointer is valid during generation.
-                    ffi::llama_get_logits_ith(ctx, idx)
-                };
-                if logits_retry.is_null() {
-                    return Err(RuntimeError::Inference(format!(
-                        "missing logits for output index {idx} on grammar retry"
-                    )));
-                }
-
-                let mut cur_retry = logits_to_candidates(logits_retry, n_vocab as usize);
-                let mut cur_p_retry = ffi::llama_token_data_array {
-                    data: cur_retry.as_mut_ptr(),
-                    size: cur_retry.len(),
-                    selected: -1,
-                    sorted: false,
-                };
-
-                unsafe {
-                    // SAFETY: samplers and candidate array are valid.
-                    ffi::llama_sampler_apply(grammar_ptr, &mut cur_p_retry);
-                    ffi::llama_sampler_apply(self.chain_ptr, &mut cur_p_retry);
-                }
-                token = selected_token(&cur_p_retry)?;
-            }
-        }
-
         Ok(token)
     }
 
     fn accept(&mut self, token: ffi::llama_token) {
         unsafe {
-            // SAFETY: sampler pointers are valid for the chain lifetime.
-            if let Some(grammar_ptr) = self.grammar_ptr {
-                ffi::llama_sampler_accept(grammar_ptr, token);
-            }
-            ffi::llama_sampler_accept(self.chain_ptr, token);
+            // SAFETY: sampler pointer is valid.
+            bridge::autocommit_common_sampler_accept(self.ptr, token, 1);
         }
     }
 }
 
-impl Drop for SamplerChain {
+impl Drop for CommonSampler {
     fn drop(&mut self) {
         unsafe {
-            // SAFETY: chain pointer is owned by this handle and dropped once.
-            if let Some(grammar_ptr) = self.grammar_ptr.take() {
-                ffi::llama_sampler_free(grammar_ptr);
-            }
-            if !self.chain_ptr.is_null() {
-                ffi::llama_sampler_free(self.chain_ptr);
-                self.chain_ptr = std::ptr::null_mut();
+            // SAFETY: pointer is owned by this wrapper and freed exactly once.
+            if !self.ptr.is_null() {
+                bridge::autocommit_common_sampler_free(self.ptr);
+                self.ptr = std::ptr::null_mut();
             }
         }
     }
@@ -1770,35 +1641,6 @@ impl Drop for SamplerChain {
 #[derive(Debug)]
 struct BatchHandle {
     batch: ffi::llama_batch,
-}
-
-fn logits_to_candidates(logits: *const f32, n_vocab: usize) -> Vec<ffi::llama_token_data> {
-    let logits = unsafe {
-        // SAFETY: caller guarantees `logits` points to `n_vocab` float values.
-        slice::from_raw_parts(logits, n_vocab)
-    };
-    let mut out = Vec::with_capacity(n_vocab);
-    for (id, &logit) in logits.iter().enumerate() {
-        out.push(ffi::llama_token_data {
-            id: id as ffi::llama_token,
-            logit,
-            p: 0.0,
-        });
-    }
-    out
-}
-
-fn selected_token(cur_p: &ffi::llama_token_data_array) -> Result<ffi::llama_token, RuntimeError> {
-    if cur_p.selected < 0 || (cur_p.selected as usize) >= cur_p.size {
-        return Err(RuntimeError::Inference(
-            "no selected token during sampling".to_string(),
-        ));
-    }
-    let token = unsafe {
-        // SAFETY: selected index was bounds-checked above.
-        (*cur_p.data.add(cur_p.selected as usize)).id
-    };
-    Ok(token)
 }
 
 impl BatchHandle {

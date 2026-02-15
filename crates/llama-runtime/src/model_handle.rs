@@ -24,6 +24,7 @@ pub(crate) struct ModelHandle {
     has_decoder: bool,
     context_shift_enabled: bool,
     context_shift_n_keep: i32,
+    common: CommonParamsBridge,
 }
 
 // SAFETY: ModelHandle wraps an immutable llama_model after construction. All mutations happen
@@ -181,6 +182,7 @@ impl ModelHandle {
             has_decoder,
             context_shift_enabled: common.context_shift_enabled(),
             context_shift_n_keep: legacy_keep_tokens_override(common.context_shift_n_keep()),
+            common,
         })
     }
 
@@ -307,6 +309,10 @@ impl ModelHandle {
 
         None
     }
+
+    pub(crate) fn common_config_ptr(&self) -> *const std::ffi::c_void {
+        self.common.as_ptr()
+    }
 }
 
 impl Drop for ModelHandle {
@@ -338,6 +344,10 @@ impl CommonParamsBridge {
             ));
         }
         Ok(Self { ptr })
+    }
+
+    fn as_ptr(&self) -> *const std::ffi::c_void {
+        self.ptr
     }
 
     fn set_model_path(&mut self, model_path: &Path) -> Result<(), RuntimeError> {

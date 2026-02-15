@@ -103,6 +103,16 @@ pub fn run(args: &[String]) -> Result<String, String> {
         git::Repo::discover,
     )
     .map_err(|err| err.to_string())?;
+    // Best-effort partial cache for large diffs.
+    if let Some(cache_dir) = repo
+        .common_git_dir()
+        .join("autocommit/kv/partials")
+        .to_str()
+    {
+        unsafe {
+            std::env::set_var("AUTOCOMMIT_PARTIAL_CACHE_DIR", cache_dir);
+        }
+    }
 
     let diff_text = run_step(rich_interactive, "Collecting staged/worktree diff", || {
         prepare_diff(&repo, staged_only, dry_run)

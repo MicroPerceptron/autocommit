@@ -10,6 +10,7 @@
 
 #include "arg.h"
 #include "common.h"
+#include "sampling.h"
 
 // common.h defines a global `build_info` string derived from these variables.
 // In this integration path libcommon.a is linked directly from the build tree
@@ -21,6 +22,10 @@ const char * LLAMA_BUILD_TARGET = "unknown";
 
 struct autocommit_common_config {
     common_params params;
+};
+
+struct autocommit_common_sampler {
+    common_sampler * sampler;
 };
 
 namespace {
@@ -84,6 +89,9 @@ autocommit_common_config * autocommit_common_config_new(void) {
     cfg->params.n_parallel   = 1;
     cfg->params.n_batch      = 1024;
     cfg->params.n_ubatch     = 256;
+    cfg->params.sampling.top_p = 0.90f;
+    cfg->params.sampling.temp = 0.20f;
+    cfg->params.sampling.min_p = 0.0f;
 
     const unsigned hw_threads = std::thread::hardware_concurrency();
     if (hw_threads > 0) {
@@ -257,6 +265,97 @@ int32_t autocommit_common_config_n_keep(const autocommit_common_config * cfg) {
         return 0;
     }
     return cfg->params.n_keep;
+}
+
+autocommit_common_sampler * autocommit_common_sampler_new(
+        const autocommit_common_config * cfg,
+        struct llama_model * model,
+        const char * grammar,
+        int grammar_lazy) {
+    if (cfg == nullptr || model == nullptr) {
+        return nullptr;
+    }
+
+    common_params_sampling params = cfg->params.sampling;
+    if (grammar != nullptr) {
+        params.grammar = grammar;
+        params.grammar_lazy = grammar_lazy != 0;
+    } else {
+        params.grammar.clear();
+        params.grammar_lazy = false;
+    }
+
+    auto * sampler = common_sampler_init(model, params);
+    if (sampler == nullptr) {
+        return nullptr;
+    }
+
+    auto * wrapper = new (std::nothrow) autocommit_common_sampler();
+    if (wrapper == nullptr) {
+        common_sampler_free(sampler);
+        return nullptr;
+    }
+    wrapper->sampler = sampler;
+    return wrapper;
+}
+
+autocommit_common_sampler * autocommit_common_sampler_clone(
+        autocommit_common_sampler * sampler) {
+    if (sampler == nullptr || sampler->sampler == nullptr) {
+        return nullptr;
+    }
+
+    auto * cloned = common_sampler_clone(sampler->sampler);
+    if (cloned == nullptr) {
+        return nullptr;
+    }
+
+    auto * wrapper = new (std::nothrow) autocommit_common_sampler();
+    if (wrapper == nullptr) {
+        common_sampler_free(cloned);
+        return nullptr;
+    }
+    wrapper->sampler = cloned;
+    return wrapper;
+}
+
+void autocommit_common_sampler_free(autocommit_common_sampler * sampler) {
+    if (sampler == nullptr) {
+        return;
+    }
+    if (sampler->sampler != nullptr) {
+        common_sampler_free(sampler->sampler);
+        sampler->sampler = nullptr;
+    }
+    delete sampler;
+}
+
+llama_token autocommit_common_sampler_sample(
+        autocommit_common_sampler * sampler,
+        struct llama_context * ctx,
+        int idx,
+        int grammar_first) {
+    if (sampler == nullptr || sampler->sampler == nullptr || ctx == nullptr) {
+        return LLAMA_TOKEN_NULL;
+    }
+    return common_sampler_sample(sampler->sampler, ctx, idx, grammar_first != 0);
+}
+
+void autocommit_common_sampler_accept(
+        autocommit_common_sampler * sampler,
+        llama_token token,
+        int accept_grammar) {
+    if (sampler == nullptr || sampler->sampler == nullptr) {
+        return;
+    }
+    common_sampler_accept(sampler->sampler, token, accept_grammar != 0);
+}
+
+void autocommit_common_sampler_reset(autocommit_common_sampler * sampler) {
+    if (sampler == nullptr || sampler->sampler == nullptr) {
+        return;
+    }
+    common_sampler_reset(sampler->sampler);
 }
 
 } // extern "C"

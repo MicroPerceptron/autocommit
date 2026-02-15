@@ -87,6 +87,17 @@ pub fn run(args: &[String]) -> Result<String, String> {
     }
 
     let diff_text = load_diff(diff_file.as_deref()).map_err(|err| err.to_string())?;
+    if let Ok(repo) = git::Repo::discover() {
+        if let Some(cache_dir) = repo
+            .common_git_dir()
+            .join("autocommit/kv/partials")
+            .to_str()
+        {
+            unsafe {
+                std::env::set_var("AUTOCOMMIT_PARTIAL_CACHE_DIR", cache_dir);
+            }
+        }
+    }
 
     let diff_hash = report_cache::diff_hash(&diff_text);
     let cache_key = report_cache::cache_key("analyze", runtime_profile.as_str(), &diff_hash, "1.0");

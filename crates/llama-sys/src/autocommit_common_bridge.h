@@ -11,6 +11,7 @@ extern "C" {
 #endif
 
 typedef struct autocommit_common_config autocommit_common_config;
+typedef struct autocommit_common_sampler autocommit_common_sampler;
 
 autocommit_common_config * autocommit_common_config_new(void);
 void autocommit_common_config_free(autocommit_common_config * cfg);
@@ -43,6 +44,25 @@ int autocommit_common_config_fill_fit_buffers(
 
 int autocommit_common_config_ctx_shift_enabled(const autocommit_common_config * cfg);
 int32_t autocommit_common_config_n_keep(const autocommit_common_config * cfg);
+
+autocommit_common_sampler * autocommit_common_sampler_new(
+        const autocommit_common_config * cfg,
+        struct llama_model * model,
+        const char * grammar,
+        int grammar_lazy);
+autocommit_common_sampler * autocommit_common_sampler_clone(
+        autocommit_common_sampler * sampler);
+void autocommit_common_sampler_free(autocommit_common_sampler * sampler);
+llama_token autocommit_common_sampler_sample(
+        autocommit_common_sampler * sampler,
+        struct llama_context * ctx,
+        int idx,
+        int grammar_first);
+void autocommit_common_sampler_accept(
+        autocommit_common_sampler * sampler,
+        llama_token token,
+        int accept_grammar);
+void autocommit_common_sampler_reset(autocommit_common_sampler * sampler);
 
 #ifdef __cplusplus
 }

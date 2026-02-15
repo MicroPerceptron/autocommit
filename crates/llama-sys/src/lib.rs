@@ -47,5 +47,26 @@ pub mod bridge {
 
         pub fn autocommit_common_config_ctx_shift_enabled(cfg: *const c_void) -> c_int;
         pub fn autocommit_common_config_n_keep(cfg: *const c_void) -> i32;
+
+        pub fn autocommit_common_sampler_new(
+            cfg: *const c_void,
+            model: *mut ffi::llama_model,
+            grammar: *const c_char,
+            grammar_lazy: c_int,
+        ) -> *mut c_void;
+        pub fn autocommit_common_sampler_clone(sampler: *mut c_void) -> *mut c_void;
+        pub fn autocommit_common_sampler_free(sampler: *mut c_void);
+        pub fn autocommit_common_sampler_sample(
+            sampler: *mut c_void,
+            ctx: *mut ffi::llama_context,
+            idx: c_int,
+            grammar_first: c_int,
+        ) -> ffi::llama_token;
+        pub fn autocommit_common_sampler_accept(
+            sampler: *mut c_void,
+            token: ffi::llama_token,
+            accept_grammar: c_int,
+        );
+        pub fn autocommit_common_sampler_reset(sampler: *mut c_void);
     }
 }

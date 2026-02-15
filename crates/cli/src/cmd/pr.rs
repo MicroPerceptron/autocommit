@@ -6,6 +6,7 @@ use autocommit_core::llm::traits::LlmEngine;
 use autocommit_core::{AnalyzeOptions, CoreError, run as core_run};
 use dialoguer::console::{Term, style};
 use dialoguer::{Confirm, Editor, Select, theme::ColorfulTheme};
+use serde::Deserialize;
 use indicatif::{ProgressBar, ProgressStyle};
 
 use crate::cmd::{analysis_progress::AnalysisProgress, git, report_cache};
@@ -129,6 +130,16 @@ pub fn run(args: &[String]) -> Result<String, String> {
 
     let repo = run_step(rich_interactive, "Discovering repository", git::Repo::discover)
         .map_err(|err| err.to_string())?;
+    // Best-effort partial cache for large diffs.
+    if let Some(cache_dir) = repo
+        .common_git_dir()
+        .join("autocommit/kv/partials")
+        .to_str()
+    {
+        unsafe {
+            std::env::set_var("AUTOCOMMIT_PARTIAL_CACHE_DIR", cache_dir);
+        }
+    }
 
     let remote_names = repo.remote_names().map_err(|err| err.to_string())?;
 
@@ -271,6 +282,33 @@ pub fn run(args: &[String]) -> Result<String, String> {
             .map_err(|err| err.to_string())?;
     }
 
+    if let Some(existing) = find_existing_pr(gh_head.as_deref(), gh_base.as_deref())? {
+        let policy = if interactive && !assume_yes {
+            prompt_existing_pr_policy(&existing, rich_interactive)?
+        } else if assume_yes {
+            ExistingPrPolicy::Update
+        } else {
+            return Err(format!(
+                "an open pull request already exists (#{}) for this branch; rerun with --interactive or --yes",
+                existing.number
+            ));
+        };
+
+        match policy {
+            ExistingPrPolicy::Update => {
+                let output = run_step(rich_interactive, "Updating pull request", || {
+                    update_pr(existing.number, &final_title, &final_body)
+                })
+                .map_err(|err| err.to_string())?;
+                return Ok(output);
+            }
+            ExistingPrPolicy::CreateNew => {}
+            ExistingPrPolicy::Cancel => {
+                return Ok("pull request canceled by user\n".to_string());
+            }
+        }
+    }
+
     let output = run_step(rich_interactive, "Creating pull request", || {
         create_pr(
             &final_title,
@@ -283,6 +321,139 @@ pub fn run(args: &[String]) -> Result<String, String> {
     .map_err(|err| err.to_string())?;
 
     Ok(output)
+}
+
+#[derive(Debug, Deserialize)]
+struct ExistingPr {
+    number: u64,
+    title: String,
+    url: String,
+    #[serde(rename = "headRefName")]
+    head_ref_name: String,
+    #[serde(rename = "baseRefName")]
+    base_ref_name: String,
+    #[serde(rename = "isDraft")]
+    is_draft: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ExistingPrPolicy {
+    Update,
+    CreateNew,
+    Cancel,
+}
+
+fn find_existing_pr(head: Option<&str>, base: Option<&str>) -> Result<Option<ExistingPr>, String> {
+    let Some(head) = head else {
+        return Ok(None);
+    };
+
+    let mut cmd = Command::new("gh");
+    cmd.args([
+        "pr",
+        "list",
+        "--state",
+        "open",
+        "--head",
+        head,
+        "--json",
+        "number,title,url,headRefName,baseRefName,isDraft",
+    ]);
+
+    if let Some(base) = base {
+        cmd.args(["--base", base]);
+    }
+
+    let output = cmd
+        .output()
+        .map_err(|err| format!("failed to run gh pr list: {err}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("gh pr list failed: {}", stderr.trim()));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut list: Vec<ExistingPr> =
+        serde_json::from_str(stdout.trim()).map_err(|err| {
+            format!("failed to parse gh pr list output: {err}")
+        })?;
+
+    if list.is_empty() {
+        return Ok(None);
+    }
+
+    list.sort_by_key(|pr| pr.number);
+    Ok(list.into_iter().next())
+}
+
+fn prompt_existing_pr_policy(pr: &ExistingPr, rich: bool) -> Result<ExistingPrPolicy, String> {
+    let prompt = format!(
+        "An open pull request already exists (#{}: {})",
+        pr.number, pr.title
+    );
+
+    if rich {
+        let options = ["Update existing PR", "Create new PR", "Cancel"];
+        let selection = Select::with_theme(&ColorfulTheme::default())
+            .with_prompt(prompt)
+            .items(options)
+            .default(0)
+            .interact_on_opt(&Term::stderr())
+            .map_err(|err| format!("failed to read PR policy: {err}"))?;
+
+        return Ok(match selection {
+            Some(0) => ExistingPrPolicy::Update,
+            Some(1) => ExistingPrPolicy::CreateNew,
+            _ => ExistingPrPolicy::Cancel,
+        });
+    }
+
+    loop {
+        println!("{prompt}");
+        println!("  [u] Update existing PR");
+        println!("  [n] Create new PR");
+        println!("  [c] Cancel");
+        print!("Select action [u/n/c]: ");
+        std::io::stdout()
+            .flush()
+            .map_err(|err| format!("failed to flush prompt output: {err}"))?;
+        let choice = read_line_trimmed()?;
+        match choice.as_str() {
+            "u" | "U" => return Ok(ExistingPrPolicy::Update),
+            "n" | "N" => return Ok(ExistingPrPolicy::CreateNew),
+            "c" | "C" => return Ok(ExistingPrPolicy::Cancel),
+            _ => println!("invalid choice, enter u, n, or c"),
+        }
+    }
+}
+
+fn update_pr(number: u64, title: &str, body: &str) -> Result<String, String> {
+    let output = Command::new("gh")
+        .args([
+            "pr",
+            "edit",
+            &number.to_string(),
+            "--title",
+            title,
+            "--body",
+            body,
+        ])
+        .output()
+        .map_err(|err| format!("failed to run gh pr edit: {err}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("gh pr edit failed: {}", stderr.trim()));
+    }
+
+    let mut msg = String::new();
+    msg.push_str("updated pull request\n");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !stdout.trim().is_empty() {
+        msg.push_str(stdout.trim());
+        msg.push('\n');
+    }
+    Ok(msg)
 }
 
 fn resolve_interactive_mode(interactive_override: Option<bool>) -> Result<bool, String> {

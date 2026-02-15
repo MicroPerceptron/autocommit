@@ -259,6 +259,47 @@ impl Repo {
         }
     }
 
+    pub(crate) fn remote_names(&self) -> Result<Vec<String>, CoreError> {
+        let repo_root = self.repo_root();
+        let output = Command::new("git")
+            .arg("remote")
+            .current_dir(&repo_root)
+            .output()
+            .map_err(|err| CoreError::Io(format!("failed to run git remote: {err}")))?;
+
+        if !output.status.success() {
+            return Err(CoreError::Io(format!(
+                "git remote failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut remotes = stdout
+            .lines()
+            .map(|line| line.trim().to_string())
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>();
+        remotes.sort();
+        Ok(remotes)
+    }
+
+    pub(crate) fn remote_branch_exists(
+        &self,
+        remote: &str,
+        branch: &str,
+    ) -> Result<bool, CoreError> {
+        let repo_root = self.repo_root();
+        let ref_name = format!("refs/remotes/{remote}/{branch}");
+        let output = Command::new("git")
+            .args(["show-ref", "--verify", "--quiet", &ref_name])
+            .current_dir(&repo_root)
+            .output()
+            .map_err(|err| CoreError::Io(format!("failed to run git show-ref: {err}")))?;
+
+        Ok(output.status.success())
+    }
+
     pub(crate) fn diff_range(&self, base: &str, head: &str) -> Result<String, CoreError> {
         let repo_root = self.repo_root();
         let range = format!("{base}...{head}");

@@ -127,6 +127,8 @@ pub fn run(args: &[String]) -> Result<String, String> {
     let repo = run_step(rich_interactive, "Discovering repository", git::Repo::discover)
         .map_err(|err| err.to_string())?;
 
+    let remote_names = repo.remote_names().map_err(|err| err.to_string())?;
+
     let (base, head) = resolve_pr_branches(
         &repo,
         base,
@@ -200,19 +202,51 @@ pub fn run(args: &[String]) -> Result<String, String> {
         (generated_title, generated_body)
     };
 
-    if push {
-        run_step(rich_interactive, "Pushing branch", || repo.push())
-            .map_err(|err| err.to_string())?;
-    } else if interactive && !assume_yes {
-        let should_push = prompt_should_push(rich_interactive)?;
-        if should_push {
-            run_step(rich_interactive, "Pushing branch", || repo.push())
-                .map_err(|err| err.to_string())?;
+    let gh_base = base
+        .as_deref()
+        .map(|value| normalize_branch_for_gh(value, &remote_names));
+    let gh_head = head
+        .as_deref()
+        .map(|value| normalize_branch_for_gh(value, &remote_names));
+
+    let head_requires_push = if let Some(head_value) = head.as_deref() {
+        let remote = extract_remote_prefix(head_value, &remote_names);
+        if let Some(remote) = remote {
+            let branch = normalize_branch_for_gh(head_value, &remote_names);
+            !repo
+                .remote_branch_exists(&remote, &branch)
+                .map_err(|err| err.to_string())?
+        } else {
+            !repo
+                .remote_branch_exists("origin", head_value)
+                .map_err(|err| err.to_string())?
+        }
+    } else {
+        false
+    };
+
+    let mut should_push = push;
+    if head_requires_push && !should_push {
+        if interactive && !assume_yes {
+            should_push = prompt_should_push(rich_interactive)?;
+        } else {
+            return Err("head branch is not on remote; rerun with --push".to_string());
         }
     }
 
+    if should_push {
+        run_step(rich_interactive, "Pushing branch", || repo.push())
+            .map_err(|err| err.to_string())?;
+    }
+
     let output = run_step(rich_interactive, "Creating pull request", || {
-        create_pr(&final_title, &final_body, draft, base.as_deref(), head.as_deref())
+        create_pr(
+            &final_title,
+            &final_body,
+            draft,
+            gh_base.as_deref(),
+            gh_head.as_deref(),
+        )
     })
     .map_err(|err| err.to_string())?;
 
@@ -542,7 +576,7 @@ fn resolve_pr_branches(
         None => {
             if interactive {
                 Some(prompt_for_branch(
-                    "Select source branch",
+                    "Select source branch (current)",
                     &head_options,
                     current_branch.as_deref(),
                     rich,
@@ -633,13 +667,26 @@ fn prompt_for_branch(
 }
 
 fn collect_base_branch_options(repo: &git::Repo) -> Result<Vec<String>, String> {
-    let mut remotes = repo.remote_branches().map_err(|err| err.to_string())?;
+    let mut remote_branches = repo.remote_branches().map_err(|err| err.to_string())?;
     let mut locals = repo.local_branches().map_err(|err| err.to_string())?;
-    remotes.sort();
+    remote_branches.sort();
     locals.sort();
 
     let mut ordered = Vec::new();
-    ordered.extend(remotes);
+    // Prefer origin/* for base selection, then other remotes, then locals.
+    let mut origin_first = Vec::new();
+    let mut other_remotes = Vec::new();
+    for branch in remote_branches {
+        if branch.starts_with("origin/") {
+            origin_first.push(branch);
+        } else {
+            other_remotes.push(branch);
+        }
+    }
+    origin_first.sort();
+    other_remotes.sort();
+    ordered.extend(origin_first);
+    ordered.extend(other_remotes);
     for local in locals {
         if !ordered.contains(&local) {
             ordered.push(local);
@@ -690,6 +737,26 @@ fn prompt_for_branch_manual(prompt: &str) -> Result<String, String> {
     }
 }
 
+fn normalize_branch_for_gh(value: &str, remotes: &[String]) -> String {
+    for remote in remotes {
+        let prefix = format!("{remote}/");
+        if let Some(stripped) = value.strip_prefix(&prefix) {
+            return stripped.to_string();
+        }
+    }
+    value.to_string()
+}
+
+fn extract_remote_prefix(value: &str, remotes: &[String]) -> Option<String> {
+    for remote in remotes {
+        let prefix = format!("{remote}/");
+        if value.starts_with(&prefix) {
+            return Some(remote.to_string());
+        }
+    }
+    None
+}
+
 fn prepare_pr_diff(
     repo: &git::Repo,
     staged_only: bool,
@@ -708,9 +775,12 @@ fn prepare_pr_diff(
 
     if let (Some(base), Some(head)) = (base, head) {
         let diff = repo.diff_range(base, head)?;
-        if !diff.trim().is_empty() {
-            return Ok(diff);
+        if diff.trim().is_empty() {
+            return Err(CoreError::InvalidDiff(format!(
+                "no commits between {base} and {head}"
+            )));
         }
+        return Ok(diff);
     }
 
     let staged = repo.diff_cached()?;

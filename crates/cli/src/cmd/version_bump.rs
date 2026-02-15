@@ -389,26 +389,39 @@ pub(crate) fn apply(
 }
 
 fn suggested_level(report: &AnalysisReport) -> BumpLevel {
-    let has_breaking = report.items.iter().any(|item| {
-        let text = format!(
-            "{} {}",
-            item.title.to_ascii_lowercase(),
-            item.intent.to_ascii_lowercase()
-        );
-        text.contains("breaking") || text.contains("break ")
-    });
+    let subject = report.commit_message.trim().to_ascii_lowercase();
+    let summary = report.summary.trim().to_ascii_lowercase();
+    let risk_notes = report.risk.notes.join(" ").to_ascii_lowercase();
+
+    let has_breaking = contains_breaking_signal(&subject)
+        || contains_breaking_signal(&summary)
+        || contains_breaking_signal(&risk_notes)
+        || report.items.iter().any(|item| {
+            let text = format!(
+                "{} {}",
+                item.title.to_ascii_lowercase(),
+                item.intent.to_ascii_lowercase()
+            );
+            contains_breaking_signal(&text)
+        });
     if has_breaking {
         return BumpLevel::Major;
     }
 
-    let subject = report.commit_message.trim().to_ascii_lowercase();
     let subject_feature = subject.starts_with("feat(")
         || subject.starts_with("feat:")
         || subject.starts_with("feature(")
         || subject.starts_with("feature:");
-    if subject_feature {
-        return BumpLevel::Minor;
-    }
+    let subject_patchy = subject.starts_with("fix(")
+        || subject.starts_with("fix:")
+        || subject.starts_with("refactor(")
+        || subject.starts_with("refactor:")
+        || subject.starts_with("chore(")
+        || subject.starts_with("chore:")
+        || subject.starts_with("docs(")
+        || subject.starts_with("docs:")
+        || subject.starts_with("test(")
+        || subject.starts_with("test:");
 
     let total = report.items.len();
     let feature_like = report
@@ -428,16 +441,88 @@ fn suggested_level(report: &AnalysisReport) -> BumpLevel {
                 || matches!(item.bucket, autocommit_core::types::ChangeBucket::Feature)
         })
         .count();
+    let feature_phrase_hits = report
+        .items
+        .iter()
+        .filter(|item| {
+            let text = format!(
+                "{} {}",
+                item.title.to_ascii_lowercase(),
+                item.intent.to_ascii_lowercase()
+            );
+            contains_feature_signal(&text)
+        })
+        .count();
+    let subject_or_summary_feature =
+        contains_feature_signal(&subject) || contains_feature_signal(&summary);
 
-    if total > 0
-        && strong_feature_like >= 1
-        && feature_like.saturating_mul(2) >= total
-        && strong_feature_like.saturating_mul(3) >= total
-    {
-        BumpLevel::Minor
-    } else {
+    if subject_patchy && strong_feature_like == 0 {
         BumpLevel::Patch
+    } else {
+        let mut score = 0usize;
+        if subject_feature {
+            score += 1;
+        }
+        if total > 0 && feature_like.saturating_mul(2) >= total {
+            score += 1;
+        }
+        if total > 0 && strong_feature_like.saturating_mul(2) >= total && strong_feature_like > 0 {
+            score += 1;
+        }
+        if feature_phrase_hits > 0 {
+            score += 1;
+        }
+        if subject_or_summary_feature {
+            score += 1;
+        }
+        if report.stats.files_changed >= 3 && strong_feature_like >= 1 {
+            score += 1;
+        }
+
+        // Require more than a single noisy signal to classify as minor.
+        if score >= 3 {
+            BumpLevel::Minor
+        } else {
+            BumpLevel::Patch
+        }
     }
+}
+
+fn contains_breaking_signal(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    [
+        "breaking change",
+        "breaking:",
+        "breaks compatibility",
+        "incompatible",
+        "backward incompatible",
+        "backwards incompatible",
+        "remove ",
+        "removed ",
+        "deprecat",
+        "migration",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+fn contains_feature_signal(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    [
+        "add ",
+        "adds ",
+        "added ",
+        "new ",
+        "introduce",
+        "support ",
+        "enable ",
+        "implements ",
+        "implement ",
+        "expose ",
+        "allow ",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
 }
 
 fn parse_changed_paths(diff_text: &str) -> BTreeSet<String> {
@@ -1510,6 +1595,87 @@ diff --git a/Cargo.toml b/Cargo.toml\n";
         };
 
         assert_eq!(suggested_level(&report), BumpLevel::Patch);
+    }
+
+    #[test]
+    fn suggested_level_keeps_patch_for_feat_subject_without_real_feature_signals() {
+        let report = AnalysisReport {
+            schema_version: "1.0".to_string(),
+            commit_message: "feat(core): refactor internals".to_string(),
+            summary: "Refactor internals".to_string(),
+            items: vec![autocommit_core::types::ChangeItem {
+                id: "x".to_string(),
+                bucket: autocommit_core::types::ChangeBucket::Patch,
+                type_tag: TypeTag::Refactor,
+                title: "Refactor internals".to_string(),
+                intent: "Reorganize implementation".to_string(),
+                files: Vec::new(),
+                confidence: 0.82,
+            }],
+            risk: autocommit_core::types::RiskReport {
+                level: "low".to_string(),
+                notes: Vec::new(),
+            },
+            stats: autocommit_core::types::DiffStats {
+                files_changed: 2,
+                lines_changed: 40,
+                hunks: 3,
+                binary_files: 0,
+            },
+            dispatch: autocommit_core::types::DispatchDecision {
+                route: autocommit_core::types::DispatchRoute::DraftOnly,
+                reason_codes: Vec::new(),
+                estimated_cost_tokens: 0,
+            },
+        };
+
+        assert_eq!(suggested_level(&report), BumpLevel::Patch);
+    }
+
+    #[test]
+    fn suggested_level_returns_minor_for_multi_signal_feature_change() {
+        let report = AnalysisReport {
+            schema_version: "1.0".to_string(),
+            commit_message: "feat(core): add workspace config command".to_string(),
+            summary: "Add a new command to configure workspace defaults".to_string(),
+            items: vec![
+                autocommit_core::types::ChangeItem {
+                    id: "a".to_string(),
+                    bucket: autocommit_core::types::ChangeBucket::Feature,
+                    type_tag: TypeTag::Feat,
+                    title: "Add `config` command".to_string(),
+                    intent: "Add interactive config workflow".to_string(),
+                    files: Vec::new(),
+                    confidence: 0.91,
+                },
+                autocommit_core::types::ChangeItem {
+                    id: "b".to_string(),
+                    bucket: autocommit_core::types::ChangeBucket::Feature,
+                    type_tag: TypeTag::Feat,
+                    title: "Support persisted defaults".to_string(),
+                    intent: "Enable per-repo defaults".to_string(),
+                    files: Vec::new(),
+                    confidence: 0.86,
+                },
+            ],
+            risk: autocommit_core::types::RiskReport {
+                level: "low".to_string(),
+                notes: vec!["adds new CLI workflow".to_string()],
+            },
+            stats: autocommit_core::types::DiffStats {
+                files_changed: 4,
+                lines_changed: 120,
+                hunks: 8,
+                binary_files: 0,
+            },
+            dispatch: autocommit_core::types::DispatchDecision {
+                route: autocommit_core::types::DispatchRoute::DraftOnly,
+                reason_codes: Vec::new(),
+                estimated_cost_tokens: 0,
+            },
+        };
+
+        assert_eq!(suggested_level(&report), BumpLevel::Minor);
     }
 
     #[test]

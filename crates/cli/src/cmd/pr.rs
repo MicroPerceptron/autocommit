@@ -513,17 +513,21 @@ fn resolve_pr_branches(
         return Ok((base, head));
     }
 
-    let branches = collect_branch_options(repo)?;
     let current_branch = repo.current_branch().map_err(|err| err.to_string())?;
+    let base_options = collect_base_branch_options(repo)?;
+    let head_options = collect_head_branch_options(repo, current_branch.as_deref())?;
+    let remote_default = repo
+        .remote_default_branch()
+        .map_err(|err| err.to_string())?;
 
     let base = match base {
         Some(value) => Some(value),
         None => {
-            let default = pick_default_base(&branches);
+            let default = pick_default_base(&base_options, remote_default.as_deref());
             if interactive {
                 Some(prompt_for_branch(
-                    "Select base branch",
-                    &branches,
+                    "Select destination branch",
+                    &base_options,
                     default.as_deref(),
                     rich,
                 )?)
@@ -538,8 +542,8 @@ fn resolve_pr_branches(
         None => {
             if interactive {
                 Some(prompt_for_branch(
-                    "Select head branch",
-                    &branches,
+                    "Select source branch",
+                    &head_options,
                     current_branch.as_deref(),
                     rich,
                 )?)
@@ -559,14 +563,19 @@ fn resolve_pr_branches(
     Ok((base, head))
 }
 
-fn pick_default_base(branches: &[String]) -> Option<String> {
-    for candidate in ["main", "master", "trunk", "develop"] {
-        if branches.iter().any(|branch| branch == candidate) {
-            return Some(candidate.to_string());
+fn pick_default_base(branches: &[String], remote_default: Option<&str>) -> Option<String> {
+    if let Some(default) = remote_default {
+        if branches.iter().any(|branch| branch == default) {
+            return Some(default.to_string());
         }
+    }
+    for candidate in ["main", "master", "trunk", "develop"] {
         let remote_candidate = format!("origin/{candidate}");
         if branches.iter().any(|branch| branch == &remote_candidate) {
             return Some(remote_candidate);
+        }
+        if branches.iter().any(|branch| branch == candidate) {
+            return Some(candidate.to_string());
         }
     }
     branches.first().cloned()
@@ -623,16 +632,48 @@ fn prompt_for_branch(
     }
 }
 
-fn collect_branch_options(repo: &git::Repo) -> Result<Vec<String>, String> {
-    let mut branches = repo.local_branches().map_err(|err| err.to_string())?;
-    let remotes = repo.remote_branches().map_err(|err| err.to_string())?;
-    for remote in remotes {
-        if !branches.contains(&remote) {
-            branches.push(remote);
+fn collect_base_branch_options(repo: &git::Repo) -> Result<Vec<String>, String> {
+    let mut remotes = repo.remote_branches().map_err(|err| err.to_string())?;
+    let mut locals = repo.local_branches().map_err(|err| err.to_string())?;
+    remotes.sort();
+    locals.sort();
+
+    let mut ordered = Vec::new();
+    ordered.extend(remotes);
+    for local in locals {
+        if !ordered.contains(&local) {
+            ordered.push(local);
         }
     }
-    branches.sort();
-    Ok(branches)
+
+    Ok(ordered)
+}
+
+fn collect_head_branch_options(
+    repo: &git::Repo,
+    current_branch: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let mut locals = repo.local_branches().map_err(|err| err.to_string())?;
+    let mut remotes = repo.remote_branches().map_err(|err| err.to_string())?;
+    locals.sort();
+    remotes.sort();
+
+    let mut ordered = Vec::new();
+    if let Some(current) = current_branch {
+        ordered.push(current.to_string());
+    }
+    for local in locals {
+        if !ordered.contains(&local) {
+            ordered.push(local);
+        }
+    }
+    for remote in remotes {
+        if !ordered.contains(&remote) {
+            ordered.push(remote);
+        }
+    }
+
+    Ok(ordered)
 }
 
 fn prompt_for_branch_manual(prompt: &str) -> Result<String, String> {

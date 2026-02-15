@@ -234,6 +234,31 @@ impl Repo {
         Ok(branches)
     }
 
+    pub(crate) fn remote_default_branch(&self) -> Result<Option<String>, CoreError> {
+        let repo_root = self.repo_root();
+        let output = Command::new("git")
+            .args(["symbolic-ref", "refs/remotes/origin/HEAD"])
+            .current_dir(&repo_root)
+            .output()
+            .map_err(|err| CoreError::Io(format!("failed to run git symbolic-ref: {err}")))?;
+
+        if !output.status.success() {
+            return Ok(None);
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let value = stdout.trim();
+        if value.is_empty() {
+            return Ok(None);
+        }
+        let name = value.trim_start_matches("refs/remotes/").to_string();
+        if name.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(name))
+        }
+    }
+
     pub(crate) fn diff_range(&self, base: &str, head: &str) -> Result<String, CoreError> {
         let repo_root = self.repo_root();
         let range = format!("{base}...{head}");

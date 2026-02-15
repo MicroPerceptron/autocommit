@@ -1,6 +1,5 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use autocommit_core::CoreError;
@@ -44,19 +43,16 @@ impl RepoKvMetadata {
 }
 
 pub(crate) fn discover_repo_kv_paths() -> Result<RepoKvPaths, CoreError> {
-    let repo_root = PathBuf::from(run_git(&["rev-parse", "--show-toplevel"])?);
-    if repo_root.as_os_str().is_empty() {
-        return Err(CoreError::Io(
-            "failed to resolve repository root path".to_string(),
-        ));
-    }
+    let cwd = std::env::current_dir()
+        .map_err(|err| CoreError::Io(format!("failed to read current directory: {err}")))?;
+    let repo = gix::discover_with_environment_overrides(&cwd)
+        .map_err(|err| CoreError::Io(format!("failed to discover git repository: {err}")))?;
 
-    let git_dir_raw = PathBuf::from(run_git(&["rev-parse", "--git-common-dir"])?);
-    let git_dir = if git_dir_raw.is_absolute() {
-        git_dir_raw
-    } else {
-        repo_root.join(git_dir_raw)
-    };
+    let repo_root = repo
+        .workdir()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| repo.git_dir().to_path_buf());
+    let git_dir = repo.common_dir().to_path_buf();
     let cache_dir = git_dir.join(CACHE_DIR);
 
     Ok(RepoKvPaths {
@@ -100,21 +96,4 @@ pub(crate) fn read_metadata(paths: &RepoKvPaths) -> Option<RepoKvMetadata> {
     } else {
         None
     }
-}
-
-fn run_git(args: &[&str]) -> Result<String, CoreError> {
-    let output = Command::new("git")
-        .args(args)
-        .output()
-        .map_err(|err| CoreError::Io(format!("failed to run git {}: {err}", args.join(" "))))?;
-
-    if !output.status.success() {
-        return Err(CoreError::Io(format!(
-            "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }

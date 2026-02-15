@@ -1473,7 +1473,8 @@ fn synthesize_fallback_commit_message(items: &[ChangeItem], partial_count: usize
     if let Some(best) = top_subject_candidates(items, 1).into_iter().next() {
         let commit_type = type_tag_prefix(best.type_tag);
         let scope = best.scope.or_else(|| dominant_scope(items));
-        let description = decapitalize_first(&best.subject);
+        let description =
+            trim_redundant_commit_type_prefix(commit_type, &decapitalize_first(&best.subject));
 
         return match scope {
             Some(scope) => format!("{commit_type}({scope}): {description}"),
@@ -1510,11 +1511,96 @@ fn synthesize_fallback_summary(items: &[ChangeItem], stats: &DiffStats) -> Strin
         );
     }
 
+    let merged_second = merge_summary_subject(subjects[0].as_str(), subjects[1].as_str());
     format!(
         "{} and {} across {file_count} {noun}.",
         capitalize_first(&subjects[0]),
-        subjects[1]
+        merged_second
     )
+}
+
+fn trim_redundant_commit_type_prefix(commit_type: &str, description: &str) -> String {
+    let trimmed = description.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    let mut out = match commit_type {
+        "refactor" if lower.starts_with("refactor ") => trimmed["refactor ".len()..].trim(),
+        "fix" if lower.starts_with("fix ") => trimmed["fix ".len()..].trim(),
+        "docs" if lower.starts_with("document ") => trimmed["document ".len()..].trim(),
+        "test" if lower.starts_with("test ") => trimmed["test ".len()..].trim(),
+        _ => trimmed,
+    };
+
+    if out.is_empty() {
+        out = trimmed;
+    }
+
+    out.to_string()
+}
+
+fn merge_summary_subject(first: &str, second: &str) -> String {
+    let first_token = leading_action_token(first);
+    let second_token = leading_action_token(second);
+
+    if let (Some(a), Some(b)) = (first_token.as_deref(), second_token.as_deref()) {
+        if a == b && is_mergeable_action_token(a) {
+            let suffix = drop_leading_action_token(second, a).trim();
+            if !suffix.is_empty() {
+                return decapitalize_first(suffix);
+            }
+        }
+    }
+
+    decapitalize_first(second)
+}
+
+fn leading_action_token(subject: &str) -> Option<String> {
+    let token = subject
+        .split_whitespace()
+        .next()?
+        .trim()
+        .to_ascii_lowercase();
+    if token.is_empty() { None } else { Some(token) }
+}
+
+fn drop_leading_action_token<'a>(subject: &'a str, token: &str) -> &'a str {
+    let trimmed = subject.trim_start();
+    let mut parts = trimmed.splitn(2, char::is_whitespace);
+    let first = parts.next().unwrap_or_default();
+    if first.eq_ignore_ascii_case(token) {
+        parts.next().unwrap_or_default()
+    } else {
+        trimmed
+    }
+}
+
+fn is_mergeable_action_token(token: &str) -> bool {
+    token.contains('/')
+        || matches!(
+            token,
+            "add"
+                | "build"
+                | "fix"
+                | "refactor"
+                | "update"
+                | "improve"
+                | "guard"
+                | "prevent"
+                | "remove"
+                | "support"
+                | "enable"
+                | "disable"
+                | "migrate"
+                | "introduce"
+                | "extract"
+                | "simplify"
+                | "reorganize"
+                | "document"
+                | "test"
+        )
 }
 
 fn dominant_scope(items: &[ChangeItem]) -> Option<String> {
@@ -2085,6 +2171,20 @@ mod tests {
     }
 
     #[test]
+    fn synthesize_fallback_commit_message_strips_redundant_refactor_prefix() {
+        let items = vec![sample_item(
+            TypeTag::Refactor,
+            "Refactor model labels logic",
+            "Refactor model labels logic",
+            "crates/llama-runtime/src/model.rs",
+            0.9,
+        )];
+
+        let commit = synthesize_fallback_commit_message(&items, 1);
+        assert_eq!(commit, "refactor(llama-runtime): model labels logic");
+    }
+
+    #[test]
     fn synthesize_fallback_summary_composes_two_subjects() {
         let items = vec![
             sample_item(
@@ -2110,11 +2210,47 @@ mod tests {
         };
 
         let summary = synthesize_fallback_summary(&items, &stats);
+        let acceptable = [
+            "Guard backend config export and Consolidate runtime prompt handling across 2 files.",
+            "Guard backend config export and consolidate runtime prompt handling across 2 files.",
+            "Consolidate runtime prompt handling and Guard backend config export across 2 files.",
+            "Consolidate runtime prompt handling and guard backend config export across 2 files.",
+        ];
         assert!(
-            summary
-                == "Guard backend config export and Consolidate runtime prompt handling across 2 files."
-                || summary
-                    == "Consolidate runtime prompt handling and Guard backend config export across 2 files."
+            acceptable.contains(&summary.as_str()),
+            "unexpected summary: {summary}"
+        );
+    }
+
+    #[test]
+    fn synthesize_fallback_summary_merges_shared_refactor_prefix() {
+        let items = vec![
+            sample_item(
+                TypeTag::Refactor,
+                "Refactor model labels logic",
+                "Refactor model labels logic",
+                "crates/llama-runtime/src/model.rs",
+                0.91,
+            ),
+            sample_item(
+                TypeTag::Refactor,
+                "Refactor commit message formatting",
+                "Refactor commit message formatting",
+                "crates/cli/src/cmd/commit.rs",
+                0.89,
+            ),
+        ];
+        let stats = DiffStats {
+            files_changed: 2,
+            lines_changed: 50,
+            hunks: 4,
+            binary_files: 0,
+        };
+
+        let summary = synthesize_fallback_summary(&items, &stats);
+        assert_eq!(
+            summary,
+            "Refactor model labels logic and commit message formatting across 2 files."
         );
     }
 

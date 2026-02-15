@@ -26,6 +26,7 @@ pub(crate) struct ContextHandle {
     pooling_type: ffi::llama_pooling_type,
     #[allow(dead_code)]
     seq_capacity: usize,
+    session_tokens: Vec<ffi::llama_token>,
 }
 
 // SAFETY: ContextHandle is never accessed concurrently in this crate; Engine wraps it in Mutex
@@ -107,6 +108,7 @@ impl ContextHandle {
             mode,
             pooling_type,
             seq_capacity,
+            session_tokens: Vec::new(),
         })
     }
 
@@ -225,6 +227,16 @@ impl ContextHandle {
     #[allow(dead_code)]
     pub(crate) fn max_sequences(&self) -> usize {
         self.seq_capacity
+    }
+
+    pub(crate) fn set_session_tokens(&mut self, tokens: Vec<ffi::llama_token>) {
+        if self.mode == ContextMode::Generation {
+            self.session_tokens = tokens;
+        }
+    }
+
+    pub(crate) fn session_tokens(&self) -> &[ffi::llama_token] {
+        &self.session_tokens
     }
 
     pub(crate) fn load_state_file(
@@ -585,7 +597,9 @@ impl ContextHandle {
             return Ok(String::new());
         }
 
-        self.decode_prompt_tokens(&prompt_tokens, 0)?;
+        let n_match = self.prepare_prompt_cache_state(&prompt_tokens)?;
+        self.decode_prompt_tokens_from(&prompt_tokens, n_match, 0, false)?;
+        self.session_tokens = prompt_tokens.clone();
 
         let mut sampler = SamplerChain::new(self.model.vocab(), grammar)?;
         let mut generated = String::new();
@@ -654,6 +668,11 @@ impl ContextHandle {
             )));
         }
 
+        if prompts.len() == 1 {
+            let result = self.generate_text(&prompts[0], grammar, requested_max_tokens[0]);
+            return Ok(vec![result]);
+        }
+
         if prompts.len() > self.seq_capacity {
             return Err(RuntimeError::Inference(format!(
                 "requested {} sequences exceeds generation capacity {}",
@@ -661,6 +680,9 @@ impl ContextHandle {
                 self.seq_capacity
             )));
         }
+
+        // Multi-sequence decoding does not currently preserve a single-session prefix contract.
+        self.session_tokens.clear();
 
         let n_ctx_seq = unsafe {
             // SAFETY: pure context metadata query.
@@ -986,6 +1008,16 @@ impl ContextHandle {
         tokens: &[ffi::llama_token],
         seq_id: ffi::llama_seq_id,
     ) -> Result<(), RuntimeError> {
+        self.decode_prompt_tokens_from(tokens, 0, seq_id, true)
+    }
+
+    fn decode_prompt_tokens_from(
+        &mut self,
+        tokens: &[ffi::llama_token],
+        start_pos: usize,
+        seq_id: ffi::llama_seq_id,
+        clear_memory: bool,
+    ) -> Result<(), RuntimeError> {
         let max_batch_tokens = unsafe {
             // SAFETY: pure context metadata query.
             ffi::llama_n_batch(self.ptr)
@@ -997,13 +1029,19 @@ impl ContextHandle {
             ));
         }
 
-        unsafe {
-            // SAFETY: ptr is valid while ContextHandle is alive.
-            let mem = ffi::llama_get_memory(self.ptr);
-            ffi::llama_memory_clear(mem, true);
+        if clear_memory {
+            unsafe {
+                // SAFETY: ptr is valid while ContextHandle is alive.
+                let mem = ffi::llama_get_memory(self.ptr);
+                ffi::llama_memory_clear(mem, true);
+            }
         }
 
-        let mut start = 0usize;
+        if start_pos >= tokens.len() {
+            return Ok(());
+        }
+
+        let mut start = start_pos;
         while start < tokens.len() {
             let end = (start + max_batch_tokens).min(tokens.len());
             let chunk = &tokens[start..end];
@@ -1051,6 +1089,61 @@ impl ContextHandle {
         }
 
         Ok(())
+    }
+
+    fn prepare_prompt_cache_state(
+        &mut self,
+        prompt_tokens: &[ffi::llama_token],
+    ) -> Result<usize, RuntimeError> {
+        if self.mode != ContextMode::Generation {
+            return Ok(0);
+        }
+
+        let mem = unsafe {
+            // SAFETY: self.ptr is a live context pointer while ContextHandle is alive.
+            ffi::llama_get_memory(self.ptr)
+        };
+        if mem.is_null() {
+            self.session_tokens.clear();
+            return Ok(0);
+        }
+
+        let mut n_match = 0usize;
+        while n_match < self.session_tokens.len()
+            && n_match < prompt_tokens.len()
+            && self.session_tokens[n_match] == prompt_tokens[n_match]
+        {
+            n_match = n_match.saturating_add(1);
+        }
+
+        if self.session_tokens.len() > n_match {
+            let pos = i32::try_from(n_match)
+                .map_err(|_| RuntimeError::Inference("session prefix exceeds i32".to_string()))?;
+            let removed = unsafe {
+                // SAFETY: remove tokens from the global sequence memory after the matched prefix.
+                ffi::llama_memory_seq_rm(mem, -1, pos, -1)
+            };
+            if !removed {
+                unsafe {
+                    // SAFETY: fallback to clean state when selective removal fails.
+                    ffi::llama_memory_clear(mem, true);
+                }
+                self.session_tokens.clear();
+                n_match = 0;
+            } else {
+                self.session_tokens.truncate(n_match);
+            }
+        }
+
+        if n_match == 0 {
+            unsafe {
+                // SAFETY: no reusable prefix remains, start from a clean context state.
+                ffi::llama_memory_clear(mem, true);
+            }
+            self.session_tokens.clear();
+        }
+
+        Ok(n_match)
     }
 
     fn decode_prompt_tokens_multi(

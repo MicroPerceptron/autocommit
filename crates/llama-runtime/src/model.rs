@@ -100,12 +100,15 @@ impl LoadedRuntime {
 
             if let Some(state_path) = self.generation_state_path.as_deref() {
                 if state_path.is_file() {
-                    if let Err(err) = ctx.load_state_file(state_path) {
-                        if llama_logs_enabled() {
-                            eprintln!(
-                                "autocommit warning: failed to load generation state from {}: {err}",
-                                state_path.display()
-                            );
+                    match ctx.load_state_file(state_path) {
+                        Ok(tokens) => ctx.set_session_tokens(tokens),
+                        Err(err) => {
+                            if llama_logs_enabled() {
+                                eprintln!(
+                                    "autocommit warning: failed to load generation state from {}: {err}",
+                                    state_path.display()
+                                );
+                            }
                         }
                     }
                 }
@@ -128,6 +131,22 @@ impl LoadedRuntime {
         let generation_ctx = self.generation_ctx()?;
         generation_ctx.warmup()?;
         generation_ctx.save_state_file(&state_path, &[])
+    }
+
+    fn persist_generation_state_if_needed(generation_ctx: &mut ContextHandle, state_path: &Path) {
+        let tokens = generation_ctx.session_tokens().to_vec();
+        if tokens.is_empty() {
+            return;
+        }
+
+        if let Err(err) = generation_ctx.save_state_file(state_path, &tokens) {
+            if llama_logs_enabled() {
+                eprintln!(
+                    "autocommit warning: failed to save generation state to {}: {err}",
+                    state_path.display()
+                );
+            }
+        }
     }
 
     fn embed(&mut self, text: &str) -> Result<Vec<f32>, RuntimeError> {
@@ -170,6 +189,7 @@ impl LoadedRuntime {
             })
             .collect::<Vec<_>>();
         let budgets = chunks.iter().map(analyze_token_budget).collect::<Vec<_>>();
+        let generation_state_path = self.generation_state_path.clone();
 
         let generation_ctx = self.generation_ctx()?;
         let mut out: Vec<PartialReport> = chunks
@@ -288,6 +308,10 @@ impl LoadedRuntime {
             start = end;
         }
 
+        if let Some(path) = generation_state_path.as_deref() {
+            Self::persist_generation_state_if_needed(generation_ctx, path);
+        }
+
         Ok(out)
     }
 
@@ -306,10 +330,11 @@ impl LoadedRuntime {
                     prompt
                 )
             });
+        let generation_state_path = self.generation_state_path.clone();
         let generation_ctx = self.generation_ctx()?;
 
         let raw = generation_ctx.generate_text(&prompt, Some(grammar::REDUCE_GBNF), max_tokens);
-        match raw {
+        let result = match raw {
             Ok(raw) => match parse_reduce_output(&raw) {
                 Ok(parsed) => Ok(parsed),
                 Err(parse_err) => {
@@ -344,7 +369,13 @@ impl LoadedRuntime {
                     Err(err)
                 }
             }
+        };
+
+        if let Some(path) = generation_state_path.as_deref() {
+            Self::persist_generation_state_if_needed(generation_ctx, path);
         }
+
+        result
     }
 }
 
@@ -471,32 +502,12 @@ impl LlmEngine for Engine {
         let reduce_plan = build_reduce_prompt_plan(partials, decision, stats);
         let generated_result = self.reduce_output_with_runtime(&reduce_plan);
         let generated = generated_result.as_ref().ok();
-
-        let default_commit_message = {
-            let commit_type = dominant_type_tag(&items).map_or("chore", type_tag_prefix);
-            format!(
-                "{commit_type}(autocommit): synthesize {} chunk analyses",
-                partials.len()
-            )
-        };
-
-        let commit_message_raw = generated
+        let generated_commit_candidate = generated
             .as_ref()
-            .map(|g| g.commit_message.clone())
-            .unwrap_or_else(|| default_commit_message.clone());
+            .and_then(|g| normalize_commit_message(&g.commit_message));
 
-        let commit_message = normalize_commit_message(&commit_message_raw)
-            .unwrap_or_else(|| default_commit_message.clone());
-
-        let summary = generated
-            .as_ref()
-            .map(|g| g.summary.clone())
-            .unwrap_or_else(|| {
-                format!(
-                    "Reduced {} chunk analyses via adaptive reducer",
-                    partials.len()
-                )
-            });
+        let commit_message = synthesize_fallback_commit_message(&items, partials.len());
+        let summary = synthesize_fallback_summary(&items, stats);
 
         let risk_level = generated
             .as_ref()
@@ -522,6 +533,14 @@ impl LlmEngine for Engine {
                 }
                 notes
             });
+        risk_notes.push("commit_source:composed_partials".to_string());
+        if generated.is_some() {
+            risk_notes.push(if generated_commit_candidate.is_some() {
+                "reduce_commit_candidate:usable".to_string()
+            } else {
+                "reduce_commit_candidate:invalid".to_string()
+            });
+        }
         let analyze_fallbacks = partials
             .iter()
             .filter(|p| {
@@ -1158,8 +1177,12 @@ fn sanitize_sentence(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn mapped_change_item_id(path: &str, ordinal: usize) -> String {
+    format!("{path}#chunk-{}", ordinal.saturating_add(1))
+}
+
 fn partial_from_model_chunk(
-    runtime_context: &RuntimeContext,
+    _runtime_context: &RuntimeContext,
     ordinal: usize,
     chunk: &DiffChunk,
     model: AnalyzeModelOutput,
@@ -1180,12 +1203,7 @@ fn partial_from_model_chunk(
             summary
         },
         items: vec![ChangeItem {
-            id: format!(
-                "rt-{}-{}-{}",
-                runtime_context.id,
-                ordinal,
-                chunk.path.replace('/', "_")
-            ),
+            id: mapped_change_item_id(&chunk.path, ordinal),
             bucket: model.bucket,
             type_tag: model.type_tag,
             title: if title.is_empty() {
@@ -1224,7 +1242,7 @@ fn partial_from_chunk_with_error(
 }
 
 fn partial_from_chunk(
-    runtime_context: &RuntimeContext,
+    _runtime_context: &RuntimeContext,
     ordinal: usize,
     chunk: &DiffChunk,
 ) -> PartialReport {
@@ -1238,12 +1256,7 @@ fn partial_from_chunk(
             chunk.path, added, removed, ordinal
         ),
         items: vec![ChangeItem {
-            id: format!(
-                "rt-{}-{}-{}",
-                runtime_context.id,
-                ordinal,
-                chunk.path.replace('/', "_")
-            ),
+            id: mapped_change_item_id(&chunk.path, ordinal),
             bucket,
             type_tag,
             title: format!("{} {}", intent_label, chunk.path),
@@ -1364,6 +1377,314 @@ fn type_tag_prefix(tag: TypeTag) -> &'static str {
     }
 }
 
+#[derive(Debug)]
+struct SubjectCandidate {
+    score: f32,
+    subject: String,
+    type_tag: TypeTag,
+    scope: Option<String>,
+}
+
+fn synthesize_fallback_commit_message(items: &[ChangeItem], partial_count: usize) -> String {
+    if let Some(best) = top_subject_candidates(items, 1).into_iter().next() {
+        let commit_type = type_tag_prefix(best.type_tag);
+        let scope = best.scope.or_else(|| dominant_scope(items));
+        let description = decapitalize_first(&best.subject);
+
+        return match scope {
+            Some(scope) => format!("{commit_type}({scope}): {description}"),
+            None => format!("{commit_type}: {description}"),
+        };
+    }
+
+    let commit_type = dominant_type_tag(items).map_or("chore", type_tag_prefix);
+    let scope = dominant_scope(items);
+    let description = default_commit_subject(commit_type, partial_count);
+
+    match scope {
+        Some(scope) => format!("{commit_type}({scope}): {description}"),
+        None => format!("{commit_type}: {description}"),
+    }
+}
+
+fn synthesize_fallback_summary(items: &[ChangeItem], stats: &DiffStats) -> String {
+    let file_count = stats.files_changed.max(1);
+    let noun = if file_count == 1 { "file" } else { "files" };
+
+    let subjects = top_subject_candidates(items, 2)
+        .into_iter()
+        .map(|candidate| candidate.subject)
+        .collect::<Vec<_>>();
+    if subjects.is_empty() {
+        return format!("Update project code across {file_count} {noun}.");
+    }
+
+    if subjects.len() == 1 {
+        return format!(
+            "{} across {file_count} {noun}.",
+            capitalize_first(&subjects[0])
+        );
+    }
+
+    format!(
+        "{} and {} across {file_count} {noun}.",
+        capitalize_first(&subjects[0]),
+        subjects[1]
+    )
+}
+
+fn dominant_scope(items: &[ChangeItem]) -> Option<String> {
+    let mut counts = std::collections::BTreeMap::<String, usize>::new();
+
+    for item in items {
+        for file in &item.files {
+            if let Some(scope) = scope_from_path(&file.path) {
+                *counts.entry(scope).or_insert(0) += 1;
+            }
+        }
+    }
+
+    let mut best_scope: Option<String> = None;
+    let mut best_count = 0usize;
+    let mut tie = false;
+
+    for (scope, count) in counts {
+        if count > best_count {
+            best_scope = Some(scope);
+            best_count = count;
+            tie = false;
+        } else if count == best_count && count != 0 {
+            tie = true;
+        }
+    }
+
+    if tie { None } else { best_scope }
+}
+
+fn top_subject_candidates(items: &[ChangeItem], limit: usize) -> Vec<SubjectCandidate> {
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    let mut candidates = Vec::new();
+    for item in items {
+        let mut best_for_item: Option<SubjectCandidate> = None;
+        let item_scope = item
+            .files
+            .first()
+            .and_then(|file| scope_from_path(&file.path));
+
+        for (raw, bonus) in [(&item.title, 0.05f32), (&item.intent, 0.0f32)] {
+            let Some(candidate) = sanitize_commit_subject(raw) else {
+                continue;
+            };
+            if looks_like_reducer_meta(&candidate) {
+                continue;
+            }
+
+            let score = item.confidence + bonus + subject_quality_bonus(&candidate);
+            if best_for_item
+                .as_ref()
+                .map(|existing| score > existing.score)
+                .unwrap_or(true)
+            {
+                best_for_item = Some(SubjectCandidate {
+                    score,
+                    subject: candidate,
+                    type_tag: item.type_tag.clone(),
+                    scope: item_scope.clone(),
+                });
+            }
+        }
+
+        if let Some(candidate) = best_for_item {
+            candidates.push(candidate);
+        }
+    }
+
+    candidates.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.subject.cmp(&b.subject))
+    });
+
+    let mut out: Vec<SubjectCandidate> = Vec::new();
+    for candidate in candidates {
+        if out
+            .iter()
+            .any(|existing| existing.subject.eq_ignore_ascii_case(&candidate.subject))
+        {
+            continue;
+        }
+        out.push(candidate);
+        if out.len() >= limit {
+            break;
+        }
+    }
+
+    out
+}
+
+fn scope_from_path(path: &str) -> Option<String> {
+    let mut parts = path.split('/').filter(|part| !part.is_empty());
+    let first = parts.next()?;
+
+    let raw_scope = match first {
+        "crates" | "src" => parts.next().unwrap_or(first),
+        "tests" | "test" => "test",
+        "docs" => "docs",
+        "third_party" => "third-party",
+        _ => first,
+    };
+
+    sanitize_scope(raw_scope)
+}
+
+fn sanitize_scope(raw: &str) -> Option<String> {
+    let scope = raw
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+        .collect::<String>()
+        .to_ascii_lowercase();
+
+    if scope.is_empty() { None } else { Some(scope) }
+}
+
+fn subject_quality_bonus(subject: &str) -> f32 {
+    let lower = subject.to_ascii_lowercase();
+    let mut score = 0.0f32;
+
+    if lower.starts_with("add ")
+        || lower.starts_with("build ")
+        || lower.starts_with("fix ")
+        || lower.starts_with("refactor ")
+        || lower.starts_with("update ")
+        || lower.starts_with("improve ")
+        || lower.starts_with("guard ")
+        || lower.starts_with("prevent ")
+        || lower.starts_with("remove ")
+        || lower.starts_with("support ")
+        || lower.starts_with("enable ")
+        || lower.starts_with("disable ")
+        || lower.starts_with("migrate ")
+        || lower.starts_with("introduce ")
+    {
+        score += 0.08;
+    }
+
+    let word_count = lower.split_whitespace().count();
+    if (3..=12).contains(&word_count) {
+        score += 0.04;
+    } else if word_count < 2 || word_count > 16 {
+        score -= 0.06;
+    }
+
+    if lower.contains("commit message") {
+        score -= 0.35;
+    }
+    if lower.contains("synthesis") {
+        score -= 0.25;
+    }
+    if lower.contains("misc") || lower.contains("various") {
+        score -= 0.20;
+    }
+
+    score
+}
+
+fn sanitize_commit_subject(raw: &str) -> Option<String> {
+    let mut subject = sanitize_sentence(raw);
+    if subject.is_empty() {
+        return None;
+    }
+
+    if let Some((_, _, desc)) = parse_conventional_commit(&subject) {
+        subject = desc.to_string();
+    }
+
+    subject = subject
+        .trim_matches(|ch: char| ch == '"' || ch == '\'' || ch == '`')
+        .trim()
+        .trim_end_matches(['.', ';', ','])
+        .to_string();
+
+    if subject.is_empty() {
+        return None;
+    }
+
+    Some(clamp_chars(&subject, 72))
+}
+
+fn default_commit_subject(commit_type: &str, partial_count: usize) -> String {
+    match commit_type {
+        "feat" => "add requested behavior".to_string(),
+        "fix" => "fix incorrect behavior".to_string(),
+        "refactor" => "reorganize implementation details".to_string(),
+        "docs" => "update project documentation".to_string(),
+        "test" => "expand test coverage".to_string(),
+        "perf" => "improve runtime performance".to_string(),
+        "style" => "clean up code style".to_string(),
+        _ => format!("update code across {partial_count} changes"),
+    }
+}
+
+fn clamp_chars(value: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for ch in value.chars().take(max_chars) {
+        out.push(ch);
+    }
+    out.trim().to_string()
+}
+
+fn capitalize_first(value: &str) -> String {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    let mut out = first.to_uppercase().collect::<String>();
+    out.push_str(chars.as_str());
+    out
+}
+
+fn decapitalize_first(value: &str) -> String {
+    let looks_like_title_case = value
+        .split_whitespace()
+        .filter(|token| token.chars().any(|ch| ch.is_ascii_alphabetic()))
+        .all(|token| {
+            token
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_ascii_uppercase())
+        });
+    if looks_like_title_case {
+        return value.to_ascii_lowercase();
+    }
+
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    let mut out = first.to_lowercase().collect::<String>();
+    out.push_str(chars.as_str());
+    out
+}
+
+fn looks_like_reducer_meta(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    let has_any = |terms: &[&str]| terms.iter().any(|term| lower.contains(term));
+    let has_all = |terms: &[&str]| terms.iter().all(|term| lower.contains(term));
+
+    has_all(&["partial", "analys"])
+        || has_all(&["chunk", "analys"])
+        || has_all(&["consolidated", "report"])
+        || has_all(&["analysis", "report"])
+        || has_all(&["adaptive", "reducer"])
+        || (lower.contains("reduce")
+            && has_any(&["analysis", "analyses", "report", "chunk", "partial"]))
+        || (lower.contains("synthesi") && has_any(&["analysis", "analyses", "report", "chunk"]))
+}
+
 fn normalize_commit_message(raw: &str) -> Option<String> {
     let header = raw.lines().next()?.trim();
     if header.is_empty() {
@@ -1371,6 +1692,9 @@ fn normalize_commit_message(raw: &str) -> Option<String> {
     }
 
     if let Some((kind, scope, desc)) = parse_conventional_commit(header) {
+        if looks_like_reducer_meta(desc) {
+            return None;
+        }
         let mut out = kind.to_string();
         if let Some(scope) = scope {
             out.push('(');
@@ -1383,6 +1707,9 @@ fn normalize_commit_message(raw: &str) -> Option<String> {
     }
 
     if let Some((kind, desc)) = parse_type_prefixed_header(header) {
+        if looks_like_reducer_meta(desc) {
+            return None;
+        }
         return Some(format!("{kind}(autocommit): {desc}"));
     }
 
@@ -1462,6 +1789,28 @@ fn canonical_commit_type(value: &str) -> Option<&'static str> {
 mod tests {
     use super::*;
 
+    fn sample_item(
+        type_tag: TypeTag,
+        title: &str,
+        intent: &str,
+        path: &str,
+        confidence: f32,
+    ) -> ChangeItem {
+        ChangeItem {
+            id: "item-1".to_string(),
+            bucket: ChangeBucket::Patch,
+            type_tag,
+            title: title.to_string(),
+            intent: intent.to_string(),
+            files: vec![FileRef {
+                path: path.to_string(),
+                status: FileStatus::Modified,
+                ranges: Vec::new(),
+            }],
+            confidence,
+        }
+    }
+
     #[test]
     fn parse_analyze_output_recovers_from_truncated_json() {
         let raw = r#"{"summary":"Add state loading and saving","bucket":"Feature","type_tag":"Feat","title":"Add state loading","intent":"Add"#;
@@ -1488,6 +1837,99 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("failed to parse analyze JSON output")
+        );
+    }
+
+    #[test]
+    fn normalize_commit_message_rejects_reducer_meta() {
+        let raw = "refactor: Consolidate 9 partial analyses into one consolidated report";
+        assert!(normalize_commit_message(raw).is_none());
+    }
+
+    #[test]
+    fn reducer_meta_detection_keeps_valid_reduce_wording() {
+        let raw = "perf: reduce memory usage in model initialization";
+        let normalized = normalize_commit_message(raw).expect("valid commit should be kept");
+        assert_eq!(normalized, raw);
+    }
+
+    #[test]
+    fn synthesize_fallback_commit_message_prefers_item_details() {
+        let items = vec![sample_item(
+            TypeTag::Refactor,
+            "Consolidate runtime prompt handling",
+            "Align prompt flow for reducer output",
+            "crates/llama-runtime/src/model.rs",
+            0.88,
+        )];
+
+        let commit = synthesize_fallback_commit_message(&items, 3);
+        assert_eq!(
+            commit,
+            "refactor(llama-runtime): consolidate runtime prompt handling"
+        );
+    }
+
+    #[test]
+    fn synthesize_fallback_summary_composes_two_subjects() {
+        let items = vec![
+            sample_item(
+                TypeTag::Refactor,
+                "Consolidate runtime prompt handling",
+                "Align prompt flow",
+                "crates/llama-runtime/src/model.rs",
+                0.90,
+            ),
+            sample_item(
+                TypeTag::Fix,
+                "Guard backend config export",
+                "Prevent invalid backend defaults",
+                "crates/llama-runtime/src/model_handle.rs",
+                0.84,
+            ),
+        ];
+        let stats = DiffStats {
+            files_changed: 2,
+            lines_changed: 100,
+            hunks: 4,
+            binary_files: 0,
+        };
+
+        let summary = synthesize_fallback_summary(&items, &stats);
+        assert_eq!(
+            summary,
+            "Guard backend config export and Consolidate runtime prompt handling across 2 files."
+        );
+    }
+
+    #[test]
+    fn commit_synthesis_downranks_commit_message_meta_phrasing() {
+        let items = vec![
+            sample_item(
+                TypeTag::Feat,
+                "Build Reduce Prompt",
+                "Produce reduce metadata prompt",
+                "crates/core/src/llm/prompts.rs",
+                0.75,
+            ),
+            sample_item(
+                TypeTag::Refactor,
+                "Refactor commit message synthesis",
+                "Tune commit message synthesis flow",
+                "crates/llama-runtime/src/model.rs",
+                0.85,
+            ),
+        ];
+
+        let commit = synthesize_fallback_commit_message(&items, 2);
+        assert_eq!(commit, "feat(core): build reduce prompt");
+    }
+
+    #[test]
+    fn mapped_change_item_id_uses_file_path_shape() {
+        assert_eq!(
+            mapped_change_item_id("crates/core/src/llm/prompts.rs", 0),
+            "crates/core/src/llm/prompts.rs#chunk-1"
         );
     }
 }

@@ -34,12 +34,13 @@ Diff:\n```diff\n{}\n```",
 pub fn build_reduce_prompt(partial_count: usize) -> String {
     format!(
         "/no_think\n\
-Task: Reduce {partial_count} partial analyses into one consolidated report.\n\
+Task: Produce final commit metadata from {partial_count} chunk summaries.\n\
 Return ONLY JSON with this exact shape:\n\
 {{\"commit_message\":\"...\",\"summary\":\"...\",\"risk_level\":\"low|medium|high\",\"risk_notes\":[\"...\"]}}\n\
 Rules:\n\
-- commit_message must follow conventional commit style\n\
-- summary must be one sentence\n\
+- commit_message must be a single conventional commit header that describes concrete code changes\n\
+- commit_message must not mention analysis process words like: reduce, reducer, analysis, analyses, report, chunk, or partial\n\
+- summary must be one sentence about the code change outcome\n\
 - risk_level must be low, medium, or high\n\
 - risk_notes should be concise and concrete\n\
 - absolutely no explanations, no markdown, no <think> tags"

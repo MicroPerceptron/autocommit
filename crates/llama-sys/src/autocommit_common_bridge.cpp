@@ -6,6 +6,7 @@
 #include <new>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 #include "arg.h"
 #include "common.h"
@@ -74,12 +75,26 @@ autocommit_common_config * autocommit_common_config_new(void) {
         return nullptr;
     }
 
-    // Match llama.cpp common defaults used by cli/completion tooling.
+    // Startup-focused defaults for autocommit:
+    // - avoid full-train context allocations by default
+    // - keep batch memory moderate for short analysis prompts
+    // - leave room for UI responsiveness on desktop systems
     cfg->params.n_gpu_layers = -1;
-    cfg->params.n_ctx        = 0;
+    cfg->params.n_ctx        = 8192;
     cfg->params.n_parallel   = 1;
-    cfg->params.n_batch      = 2048;
-    cfg->params.n_ubatch     = 512;
+    cfg->params.n_batch      = 1024;
+    cfg->params.n_ubatch     = 256;
+
+    const unsigned hw_threads = std::thread::hardware_concurrency();
+    if (hw_threads > 0) {
+        int n_threads = static_cast<int>(hw_threads);
+        if (n_threads > 4) {
+            n_threads -= 2;
+        }
+        n_threads = std::max(1, n_threads);
+        cfg->params.cpuparams.n_threads = n_threads;
+        cfg->params.cpuparams_batch.n_threads = n_threads;
+    }
 
     return cfg;
 }

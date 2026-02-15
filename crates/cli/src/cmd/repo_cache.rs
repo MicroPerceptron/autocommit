@@ -1,9 +1,11 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use autocommit_core::CoreError;
 use serde::{Deserialize, Serialize};
+
+use crate::cmd::commit_policy::CommitPolicy;
 
 const CACHE_SCHEMA_VERSION: u32 = 1;
 const CACHE_DIR: &str = "autocommit/kv";
@@ -22,12 +24,26 @@ pub(crate) struct RepoKvPaths {
 pub(crate) struct RepoKvMetadata {
     pub(crate) version: u32,
     pub(crate) profile: String,
+    #[serde(default)]
     pub(crate) model_path: Option<String>,
+    #[serde(default)]
+    pub(crate) model_hf_repo: Option<String>,
+    #[serde(default)]
+    pub(crate) model_cache_dir: Option<String>,
+    #[serde(default)]
+    pub(crate) commit_policy: CommitPolicy,
+    #[serde(default)]
+    pub(crate) commit_policy_configured: bool,
     pub(crate) created_unix_secs: u64,
 }
 
 impl RepoKvMetadata {
-    pub(crate) fn new(profile: &str, model_path: Option<&Path>) -> Self {
+    pub(crate) fn new(
+        profile: &str,
+        model_path: Option<String>,
+        model_hf_repo: Option<String>,
+        model_cache_dir: Option<String>,
+    ) -> Self {
         let created_unix_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|dur| dur.as_secs())
@@ -36,7 +52,11 @@ impl RepoKvMetadata {
         Self {
             version: CACHE_SCHEMA_VERSION,
             profile: profile.to_string(),
-            model_path: model_path.map(|path| path.to_string_lossy().into_owned()),
+            model_path,
+            model_hf_repo,
+            model_cache_dir,
+            commit_policy: CommitPolicy::default(),
+            commit_policy_configured: false,
             created_unix_secs,
         }
     }

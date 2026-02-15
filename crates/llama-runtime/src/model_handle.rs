@@ -1,5 +1,5 @@
 use std::ffi::{CStr, CString};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use llama_sys::{bridge, ffi};
 
@@ -34,25 +34,43 @@ unsafe impl Send for ModelHandle {}
 unsafe impl Sync for ModelHandle {}
 
 impl ModelHandle {
-    pub(crate) fn load(model_path: &Path, cpu_only: bool) -> Result<Self, RuntimeError> {
+    pub(crate) fn load(
+        model_path: Option<&Path>,
+        model_hf_repo: Option<&str>,
+        model_cache_dir: Option<&Path>,
+        cpu_only: bool,
+    ) -> Result<Self, RuntimeError> {
+        let mut common = CommonParamsBridge::new()?;
+        common.set_n_parallel(1);
+        common.apply_env()?;
+        match model_path {
+            Some(path) => common.set_model_path(path)?,
+            None => {
+                let repo = model_hf_repo.ok_or_else(|| {
+                    RuntimeError::Embed(
+                        "runtime model source is not configured (local path or HF repo required)"
+                            .to_string(),
+                    )
+                })?;
+                common.set_hf_repo(repo)?;
+            }
+        }
+        if let Some(cache_dir) = model_cache_dir {
+            common.set_cache_dir(cache_dir)?;
+        }
+        let model_path = common.resolve_model_path()?;
         if !model_path.exists() {
             return Err(RuntimeError::Embed(format!(
-                "embedding model not found: {}",
+                "embedding model not found after resolution: {}",
                 model_path.display()
             )));
         }
-
         let path_cstr = CString::new(model_path.to_string_lossy().as_bytes()).map_err(|_| {
             RuntimeError::Embed(format!(
                 "embedding model path contains interior NUL: {}",
                 model_path.display()
             ))
         })?;
-
-        let mut common = CommonParamsBridge::new()?;
-        common.set_model_path(model_path)?;
-        common.set_n_parallel(1);
-        common.apply_env()?;
         let (mut mparams, mut cparams) = common.export_llama_params()?;
 
         if cpu_only {
@@ -327,6 +345,16 @@ impl Drop for ModelHandle {
     }
 }
 
+pub(crate) fn list_cached_models(
+    cache_dir: Option<&Path>,
+) -> Result<(PathBuf, Vec<String>), RuntimeError> {
+    let mut common = CommonParamsBridge::new()?;
+    if let Some(cache_dir) = cache_dir {
+        common.set_cache_dir(cache_dir)?;
+    }
+    common.list_cached_models()
+}
+
 #[derive(Debug)]
 struct CommonParamsBridge {
     ptr: *mut std::ffi::c_void,
@@ -362,6 +390,99 @@ impl CommonParamsBridge {
             bridge::autocommit_common_config_set_model_path(self.ptr, model_path.as_ptr());
         }
         Ok(())
+    }
+
+    fn set_hf_repo(&mut self, repo: &str) -> Result<(), RuntimeError> {
+        let repo = CString::new(repo.as_bytes()).map_err(|_| {
+            RuntimeError::Embed(format!("embedding HF repo contains interior NUL: {repo}"))
+        })?;
+        unsafe {
+            // SAFETY: bridge handle is valid and repo is a live NUL-terminated string.
+            bridge::autocommit_common_config_set_hf_repo(self.ptr, repo.as_ptr());
+        }
+        Ok(())
+    }
+
+    fn set_cache_dir(&mut self, cache_dir: &Path) -> Result<(), RuntimeError> {
+        let cache_dir = CString::new(cache_dir.to_string_lossy().as_bytes()).map_err(|_| {
+            RuntimeError::Embed(format!(
+                "model cache dir contains interior NUL: {}",
+                cache_dir.display()
+            ))
+        })?;
+        unsafe {
+            // SAFETY: bridge handle is valid and cache_dir is a live NUL-terminated string.
+            bridge::autocommit_common_config_set_cache_dir(self.ptr, cache_dir.as_ptr());
+        }
+        Ok(())
+    }
+
+    fn resolve_model_path(&mut self) -> Result<std::path::PathBuf, RuntimeError> {
+        let mut path_buf = vec![0i8; 1024];
+        let mut err_buf = vec![0i8; 512];
+        let ok = unsafe {
+            // SAFETY: bridge handle and output buffers are valid.
+            bridge::autocommit_common_config_resolve_model_path(
+                self.ptr,
+                path_buf.as_mut_ptr(),
+                path_buf.len(),
+                err_buf.as_mut_ptr(),
+                err_buf.len(),
+            )
+        };
+        if ok == 0 {
+            return Err(RuntimeError::Embed(format!(
+                "failed to resolve model path: {}",
+                err_buf_to_string(&err_buf)
+            )));
+        }
+        let path = err_buf_to_string(&path_buf);
+        if path.trim().is_empty() {
+            return Err(RuntimeError::Embed(
+                "common_params returned an empty model path".to_string(),
+            ));
+        }
+        Ok(std::path::PathBuf::from(path))
+    }
+
+    fn list_cached_models(&mut self) -> Result<(PathBuf, Vec<String>), RuntimeError> {
+        let mut models_buf = vec![0i8; 64 * 1024];
+        let mut cache_dir_buf = vec![0i8; 2048];
+        let mut err_buf = vec![0i8; 512];
+        let ok = unsafe {
+            // SAFETY: bridge handle and output buffers are valid.
+            bridge::autocommit_common_config_list_cached_models(
+                self.ptr,
+                models_buf.as_mut_ptr(),
+                models_buf.len(),
+                cache_dir_buf.as_mut_ptr(),
+                cache_dir_buf.len(),
+                err_buf.as_mut_ptr(),
+                err_buf.len(),
+            )
+        };
+        if ok == 0 {
+            return Err(RuntimeError::Embed(format!(
+                "failed to list cached models: {}",
+                err_buf_to_string(&err_buf)
+            )));
+        }
+
+        let cache_dir = err_buf_to_string(&cache_dir_buf);
+        if cache_dir.trim().is_empty() {
+            return Err(RuntimeError::Embed(
+                "common_params returned an empty cache directory".to_string(),
+            ));
+        }
+
+        let models = err_buf_to_string(&models_buf)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+
+        Ok((PathBuf::from(cache_dir), models))
     }
 
     fn set_n_parallel(&mut self, n_parallel: i32) {

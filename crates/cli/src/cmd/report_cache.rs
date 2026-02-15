@@ -74,8 +74,8 @@ pub(crate) fn cache_path(git_dir: &Path) -> PathBuf {
 }
 
 pub(crate) fn diff_hash(diff_text: &str) -> String {
-    use std::hash::{Hash, Hasher};
     use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
 
     let mut hasher = DefaultHasher::new();
     diff_text.hash(&mut hasher);

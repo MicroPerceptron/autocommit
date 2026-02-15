@@ -1,6 +1,7 @@
+use std::io::Write;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use autocommit_core::CoreError;
 use gix::bstr::{BStr, BString, ByteSlice};
@@ -97,6 +98,7 @@ impl Repo {
         message: &str,
         staged_only: bool,
         _no_verify: bool,
+        sign_commit: bool,
     ) -> Result<(), CoreError> {
         let tree_id = if staged_only {
             self.tree_id_for_index()?
@@ -104,17 +106,22 @@ impl Repo {
             self.tree_id_for_worktree()?
         };
 
-        let parents = self
+        let parent_id = self
             .inner
             .head()
             .map_err(|err| CoreError::Io(format!("failed to resolve HEAD: {err}")))?
             .id()
-            .map(|id| vec![id.detach()])
-            .unwrap_or_default();
+            .map(|id| id.detach());
 
-        self.inner
-            .commit("HEAD", message, tree_id, parents)
-            .map_err(|err| CoreError::Io(format!("failed to create commit: {err}")))?;
+        if sign_commit {
+            let commit_id = self.create_signed_commit(&tree_id, parent_id.as_ref(), message)?;
+            self.update_head_ref(&commit_id, parent_id.as_ref())?;
+        } else {
+            let parents = parent_id.iter().cloned().collect::<Vec<_>>();
+            self.inner
+                .commit("HEAD", message, tree_id, parents)
+                .map_err(|err| CoreError::Io(format!("failed to create commit: {err}")))?;
+        }
 
         let mut index = self.inner.index_from_tree(&tree_id).map_err(|err| {
             CoreError::Io(format!("failed to rebuild index from commit tree: {err}"))
@@ -126,6 +133,59 @@ impl Repo {
             })
             .map_err(|err| CoreError::Io(format!("failed to write index: {err}")))?;
 
+        Ok(())
+    }
+
+    pub(crate) fn signoff_identity(&self) -> Result<String, CoreError> {
+        let name = self.git_config_value("user.name")?;
+        let email = self.git_config_value("user.email")?;
+        if name.is_empty() || email.is_empty() {
+            return Err(CoreError::Io(
+                "git `user.name` and `user.email` are required for signoff".to_string(),
+            ));
+        }
+        Ok(format!("{name} <{email}>"))
+    }
+
+    pub(crate) fn signing_key(&self) -> Result<Option<String>, CoreError> {
+        let repo_root = self.repo_root();
+        let output = Command::new("git")
+            .args(["config", "--get", "user.signingkey"])
+            .current_dir(&repo_root)
+            .output()
+            .map_err(|err| CoreError::Io(format!("failed to run git config: {err}")))?;
+        if !output.status.success() {
+            return Ok(None);
+        }
+
+        let key = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if key.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(key))
+        }
+    }
+
+    pub(crate) fn set_signing_key(&self, key: &str, global: bool) -> Result<(), CoreError> {
+        let repo_root = self.repo_root();
+        let mut command = Command::new("git");
+        command.arg("config");
+        if global {
+            command.arg("--global");
+        } else {
+            command.arg("--local");
+        }
+        let output = command
+            .args(["user.signingkey", key])
+            .current_dir(&repo_root)
+            .output()
+            .map_err(|err| CoreError::Io(format!("failed to run git config: {err}")))?;
+        if !output.status.success() {
+            return Err(CoreError::Io(format!(
+                "git config user.signingkey failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
         Ok(())
     }
 
@@ -319,6 +379,131 @@ impl Repo {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
 
+    fn create_signed_commit(
+        &self,
+        tree_id: &gix::hash::ObjectId,
+        parent_id: Option<&gix::hash::ObjectId>,
+        message: &str,
+    ) -> Result<String, CoreError> {
+        let repo_root = self.repo_root();
+        let mut command = Command::new("git");
+        command
+            .arg("commit-tree")
+            .arg(tree_id.to_string())
+            .arg("-S");
+        if let Some(parent_id) = parent_id {
+            command.arg("-p").arg(parent_id.to_string());
+        }
+        command
+            .args(["-F", "-"])
+            .current_dir(&repo_root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let mut child = command
+            .spawn()
+            .map_err(|err| CoreError::Io(format!("failed to run git commit-tree: {err}")))?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(message.as_bytes()).map_err(|err| {
+                CoreError::Io(format!(
+                    "failed to write commit message to git commit-tree: {err}"
+                ))
+            })?;
+        }
+        let output = child.wait_with_output().map_err(|err| {
+            CoreError::Io(format!("failed to read git commit-tree output: {err}"))
+        })?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            if signing_tool_missing(&stderr) {
+                return Err(CoreError::Io(
+                    "git commit signing requires `gpg`, but it is not available. Install `gpg` or disable signing with `autocommit-cli commit --configure-commit-policy`".to_string(),
+                ));
+            }
+            if signing_secret_key_missing(&stderr) {
+                return Err(CoreError::Io(
+                    "git commit signing failed: no usable GPG secret key. Run `gpg --full-generate-key` (or import a key), then set `git config --global user.signingkey <KEYID>`.".to_string(),
+                ));
+            }
+            return Err(CoreError::Io(format!("git commit-tree failed: {}", stderr)));
+        }
+
+        let commit_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if commit_id.is_empty() {
+            return Err(CoreError::Io(
+                "git commit-tree returned an empty commit id".to_string(),
+            ));
+        }
+        Ok(commit_id)
+    }
+
+    fn update_head_ref(
+        &self,
+        commit_id: &str,
+        parent_id: Option<&gix::hash::ObjectId>,
+    ) -> Result<(), CoreError> {
+        let repo_root = self.repo_root();
+        let target_ref = self
+            .head_target_ref()?
+            .unwrap_or_else(|| "HEAD".to_string());
+        let mut command = Command::new("git");
+        command
+            .arg("update-ref")
+            .arg(&target_ref)
+            .arg(commit_id)
+            .current_dir(&repo_root);
+        if let Some(parent_id) = parent_id {
+            command.arg(parent_id.to_string());
+        }
+        let output = command
+            .output()
+            .map_err(|err| CoreError::Io(format!("failed to run git update-ref: {err}")))?;
+        if !output.status.success() {
+            return Err(CoreError::Io(format!(
+                "git update-ref failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Ok(())
+    }
+
+    fn head_target_ref(&self) -> Result<Option<String>, CoreError> {
+        let repo_root = self.repo_root();
+        let output = Command::new("git")
+            .args(["symbolic-ref", "-q", "HEAD"])
+            .current_dir(&repo_root)
+            .output()
+            .map_err(|err| CoreError::Io(format!("failed to run git symbolic-ref: {err}")))?;
+        if !output.status.success() {
+            return Ok(None);
+        }
+
+        let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if value.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(value))
+        }
+    }
+
+    fn git_config_value(&self, key: &str) -> Result<String, CoreError> {
+        let repo_root = self.repo_root();
+        let output = Command::new("git")
+            .args(["config", "--get", key])
+            .current_dir(&repo_root)
+            .output()
+            .map_err(|err| CoreError::Io(format!("failed to run git config: {err}")))?;
+        if !output.status.success() {
+            return Err(CoreError::Io(format!(
+                "git config --get {key} failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
     fn tree_id_for_index(&self) -> Result<gix::hash::ObjectId, CoreError> {
         let index = self
             .inner
@@ -396,6 +581,21 @@ impl Repo {
             .map(|id| id.detach())
             .map_err(|err| CoreError::Io(format!("failed to write worktree tree: {err}")))
     }
+}
+
+fn signing_tool_missing(stderr: &str) -> bool {
+    let lower = stderr.to_ascii_lowercase();
+    lower.contains("cannot run gpg")
+        || (lower.contains("gpg failed to sign the data")
+            && lower.contains("no such file or directory"))
+}
+
+fn signing_secret_key_missing(stderr: &str) -> bool {
+    let lower = stderr.to_ascii_lowercase();
+    lower.contains("no secret key")
+        || (lower.contains("inv_sgnr")
+            && lower.contains("failure sign")
+            && lower.contains("signing failed"))
 }
 
 fn append_tree_index_patch(

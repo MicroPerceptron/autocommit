@@ -1,9 +1,9 @@
 use indicatif::{ProgressBar, ProgressStyle};
 
 #[cfg(feature = "llama-native")]
-use std::sync::{Arc, Mutex};
-#[cfg(feature = "llama-native")]
 use llama_runtime::progress::{ProgressCallback, ProgressEvent, ProgressStage};
+#[cfg(feature = "llama-native")]
+use std::sync::{Arc, Mutex};
 
 pub struct AnalysisProgress {
     bar: ProgressBar,
@@ -57,8 +57,7 @@ impl AnalysisProgress {
     }
 
     pub fn finish(self) {
-        self.bar
-            .finish_with_message("[ok] Generating analysis");
+        self.bar.finish_with_message("[ok] Generating analysis");
     }
 }
 

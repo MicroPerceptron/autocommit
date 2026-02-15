@@ -1,8 +1,13 @@
+#[cfg(feature = "llama-native")]
 use std::io::IsTerminal;
+#[cfg(feature = "llama-native")]
 use std::path::Path;
 
+#[cfg(feature = "llama-native")]
 use dialoguer::Confirm;
+#[cfg(feature = "llama-native")]
 use dialoguer::console::Term;
+#[cfg(feature = "llama-native")]
 use dialoguer::theme::ColorfulTheme;
 
 #[cfg(feature = "llama-native")]
@@ -90,6 +95,7 @@ fn file_size(path: &Path) -> Result<u64, std::io::Error> {
     Ok(std::fs::metadata(path)?.len())
 }
 
+#[cfg(feature = "llama-native")]
 fn human_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut value = bytes as f64;

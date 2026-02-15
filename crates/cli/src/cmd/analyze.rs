@@ -1,12 +1,14 @@
 use std::fs;
 use std::path::Path;
+#[cfg(feature = "llama-native")]
+use std::path::PathBuf;
 
 use autocommit_core::llm::traits::LlmEngine;
 use autocommit_core::{AnalyzeOptions, CoreError, run as core_run};
 
-use crate::cmd::{git, report_cache};
 #[cfg(feature = "llama-native")]
 use crate::cmd::repo_cache;
+use crate::cmd::{git, report_cache};
 use crate::output;
 
 #[cfg(not(feature = "llama-native"))]
@@ -19,6 +21,8 @@ pub fn run(args: &[String]) -> Result<String, String> {
     let mut json = false;
     let mut diff_file: Option<String> = None;
     let mut model_path: Option<String> = None;
+    let mut model_hf_repo: Option<String> = None;
+    let mut model_cache_dir: Option<String> = None;
     #[cfg(feature = "llama-native")]
     let mut runtime_profile = "auto".to_string();
     #[cfg(feature = "llama-native")]
@@ -44,6 +48,20 @@ pub fn run(args: &[String]) -> Result<String, String> {
                 model_path = Some(path.clone());
                 i += 1;
             }
+            "--hf-repo" => {
+                let repo = args
+                    .get(i + 1)
+                    .ok_or_else(|| "--hf-repo requires a value".to_string())?;
+                model_hf_repo = Some(repo.clone());
+                i += 1;
+            }
+            "--cache-dir" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or_else(|| "--cache-dir requires a value".to_string())?;
+                model_cache_dir = Some(value.clone());
+                i += 1;
+            }
             "--profile" => {
                 let profile = args
                     .get(i + 1)
@@ -64,25 +82,32 @@ pub fn run(args: &[String]) -> Result<String, String> {
         i += 1;
     }
 
+    if model_path.is_some() && model_hf_repo.is_some() {
+        return Err("use either `--model-path` or `--hf-repo`, not both".to_string());
+    }
+    #[cfg(not(feature = "llama-native"))]
+    let _ = &model_cache_dir;
+
     #[cfg(feature = "llama-native")]
     let repo_paths = repo_cache::maybe_discover_repo_kv_paths();
 
     #[cfg(feature = "llama-native")]
-    if model_path.is_none() || !runtime_profile_overridden {
+    if model_path.is_none()
+        || model_hf_repo.is_none()
+        || model_cache_dir.is_none()
+        || !runtime_profile_overridden
+    {
         if let Some(metadata) = repo_paths.as_ref().and_then(repo_cache::read_metadata) {
-            if model_path.is_none() {
-                model_path = metadata.model_path;
+            if model_path.is_none() && model_hf_repo.is_none() {
+                model_path = metadata.model_path.clone();
+                model_hf_repo = metadata.model_hf_repo.clone();
+            }
+            if model_cache_dir.is_none() {
+                model_cache_dir = metadata.model_cache_dir.clone();
             }
             if !runtime_profile_overridden && !metadata.profile.trim().is_empty() {
                 runtime_profile = metadata.profile;
             }
-        }
-    }
-
-    if let Some(path) = model_path {
-        // SAFETY: this CLI is single-threaded for command setup and sets env before runtime init.
-        unsafe {
-            std::env::set_var("AUTOCOMMIT_EMBED_MODEL", path);
         }
     }
 
@@ -118,9 +143,24 @@ pub fn run(args: &[String]) -> Result<String, String> {
     let generation_state = repo_paths.map(|paths| paths.generation_state);
 
     #[cfg(feature = "llama-native")]
+    let model_config = llama_runtime::ModelConfig::from_explicit(
+        model_path.as_deref().map(expand_tilde).map(PathBuf::from),
+        model_hf_repo.clone(),
+        model_cache_dir
+            .as_deref()
+            .map(expand_tilde)
+            .map(PathBuf::from),
+    )
+    .with_default_hf_if_unset();
+
+    #[cfg(feature = "llama-native")]
     let engine: Box<dyn LlmEngine> = Box::new(
-        llama_runtime::Engine::new_with_generation_cache(&runtime_profile, generation_state)
-            .map_err(|err| format!("runtime init failed: {err}"))?,
+        llama_runtime::Engine::new_with_generation_cache_and_model(
+            &runtime_profile,
+            generation_state,
+            model_config,
+        )
+        .map_err(|err| format!("runtime init failed: {err}"))?,
     );
 
     #[cfg(not(feature = "llama-native"))]
@@ -171,6 +211,19 @@ fn read_git_diff() -> Result<String, CoreError> {
     }
 
     Ok(combined)
+}
+
+#[cfg(feature = "llama-native")]
+fn expand_tilde(path: &str) -> String {
+    if path == "~" {
+        return std::env::var("HOME").unwrap_or_else(|_| path.to_string());
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return format!("{home}/{rest}");
+        }
+    }
+    path.to_string()
 }
 
 #[cfg(not(feature = "llama-native"))]

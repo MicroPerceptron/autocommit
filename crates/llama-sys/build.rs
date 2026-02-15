@@ -255,5 +255,25 @@ fn emit_common_link_deps(build_dir: &Path) {
             httplib_dir.to_string_lossy()
         );
         println!("cargo:rustc-link-lib=static=cpp-httplib");
+        #[cfg(target_os = "macos")]
+        {
+            for candidate in [
+                "/opt/homebrew/opt/openssl@3/lib",
+                "/usr/local/opt/openssl@3/lib",
+                "/opt/homebrew/opt/openssl/lib",
+                "/usr/local/opt/openssl/lib",
+            ] {
+                if Path::new(candidate).is_dir() {
+                    println!("cargo:rustc-link-search=native={candidate}");
+                }
+            }
+        }
+        println!("cargo:rustc-link-lib=dylib=ssl");
+        println!("cargo:rustc-link-lib=dylib=crypto");
+        #[cfg(target_os = "macos")]
+        {
+            println!("cargo:rustc-link-lib=framework=Security");
+            println!("cargo:rustc-link-lib=framework=CoreFoundation");
+        }
     }
 }

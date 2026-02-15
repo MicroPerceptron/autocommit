@@ -331,13 +331,9 @@ fn build_go_mod_recommendation(
     let suggested = format!("v{target_major}");
     let current_version = format!("v{}", info.major);
     let reason = if manifest_changed {
-        format!(
-            "go.mod changed; breaking changes suggest module path bump to /{suggested}"
-        )
+        format!("go.mod changed; breaking changes suggest module path bump to /{suggested}")
     } else {
-        format!(
-            "breaking changes suggest Go module path bump to /{suggested}"
-        )
+        format!("breaking changes suggest Go module path bump to /{suggested}")
     };
 
     Some(VersionRecommendation {
@@ -902,9 +898,8 @@ fn apply_manifest_bump(
         ),
         ManifestKind::SetupPy => replace_setup_py_version(&content, suggested_version),
         ManifestKind::GoMod => {
-            let suggested_major = parse_go_mod_major(suggested_version).ok_or_else(|| {
-                std::io::Error::other("invalid Go module version format")
-            })?;
+            let suggested_major = parse_go_mod_major(suggested_version)
+                .ok_or_else(|| std::io::Error::other("invalid Go module version format"))?;
             replace_go_mod_module_path(&content, suggested_major)
         }
         ManifestKind::PomXml => replace_xml_tag_value(&content, "version", suggested_version),
@@ -1072,7 +1067,10 @@ fn replace_gemspec_version(content: &str, suggested_version: &str) -> Option<Str
 
             let indent_len = line.len().saturating_sub(trimmed.len());
             let indent = &line[..indent_len];
-            let lhs = trimmed.split_once('=').map(|(lhs, _)| lhs.trim()).unwrap_or("");
+            let lhs = trimmed
+                .split_once('=')
+                .map(|(lhs, _)| lhs.trim())
+                .unwrap_or("");
             if lhs.is_empty() {
                 return line.to_string();
             }
@@ -1102,10 +1100,7 @@ fn replace_mix_version(content: &str, suggested_version: &str) -> Option<String>
 
             let prefix = &line[..marker];
             let rest = &line[marker + "version:".len()..];
-            let suffix = rest
-                .find(',')
-                .map(|idx| &rest[idx..])
-                .unwrap_or("");
+            let suffix = rest.find(',').map(|idx| &rest[idx..]).unwrap_or("");
             changed = true;
             format!("{prefix}version: \"{suggested_version}\"{suffix}")
         })
@@ -1132,7 +1127,10 @@ fn replace_setup_py_version(content: &str, suggested_version: &str) -> Option<St
 
             let prefix = &line[..marker + "version=".len()];
             let rest = &line[marker + "version=".len()..];
-            let suffix_start = rest.find(',').or_else(|| rest.find(')')).unwrap_or(rest.len());
+            let suffix_start = rest
+                .find(',')
+                .or_else(|| rest.find(')'))
+                .unwrap_or(rest.len());
             let suffix = &rest[suffix_start..];
             changed = true;
             format!("{prefix}\"{suggested_version}\"{suffix}")
@@ -1167,10 +1165,7 @@ fn replace_yaml_key_value(content: &str, key: &str, suggested_version: &str) -> 
 
             let indent_len = line.len().saturating_sub(trimmed.len());
             let indent = &line[..indent_len];
-            let comment = rhs
-                .find('#')
-                .map(|idx| rhs[idx..].trim_end())
-                .unwrap_or("");
+            let comment = rhs.find('#').map(|idx| rhs[idx..].trim_end()).unwrap_or("");
             changed = true;
             if comment.is_empty() {
                 format!("{indent}{key}: {suggested_version}")
@@ -1208,9 +1203,7 @@ fn parse_go_mod_info(content: &str) -> Option<GoModInfo> {
         }
         let (_, major, _) = parse_go_mod_path_major(module_path);
         let major = major.unwrap_or(1);
-        return Some(GoModInfo {
-            major,
-        });
+        return Some(GoModInfo { major });
     }
     None
 }
@@ -1496,8 +1489,7 @@ diff --git a/Cargo.toml b/Cargo.toml\n";
             "[package]\nname = \"demo\"\nversion = \"0.4.0\"\n",
         );
 
-        apply_manifest_bump(&manifest, ManifestKind::CargoToml, "0.5.0")
-            .expect("cargo bump apply");
+        apply_manifest_bump(&manifest, ManifestKind::CargoToml, "0.5.0").expect("cargo bump apply");
         let next = fs::read_to_string(&manifest).expect("read cargo");
         assert!(next.contains("version = \"0.5.0\""));
 
@@ -1526,14 +1518,9 @@ diff --git a/Cargo.toml b/Cargo.toml\n";
     fn apply_manifest_bump_updates_go_mod_module_path() {
         let root = create_temp_tree();
         let manifest = root.join("go.mod");
-        write_file(
-            &root,
-            "go.mod",
-            "module example.com/demo\n\ngo 1.22\n",
-        );
+        write_file(&root, "go.mod", "module example.com/demo\n\ngo 1.22\n");
 
-        apply_manifest_bump(&manifest, ManifestKind::GoMod, "v2")
-            .expect("go mod bump apply");
+        apply_manifest_bump(&manifest, ManifestKind::GoMod, "v2").expect("go mod bump apply");
         let next = fs::read_to_string(&manifest).expect("read go.mod");
         assert!(next.contains("module example.com/demo/v2"));
 

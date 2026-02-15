@@ -14,9 +14,12 @@ use serde::Deserialize;
 
 use crate::context::RuntimeContext;
 use crate::context_handle::ContextHandle;
-use crate::embed::{EMBEDDING_MODEL_ENV, FALLBACK_MODEL_ENV, resolve_embedding_model_path};
+use crate::embed::{
+    DEFAULT_HF_REPO, resolve_embedding_hf_repo, resolve_embedding_model_path,
+    resolve_llama_cache_dir,
+};
 use crate::error::RuntimeError;
-use crate::model_handle::ModelHandle;
+use crate::model_handle::{ModelHandle, list_cached_models as list_cached_models_bridge};
 use crate::progress::{ProgressCallback, ProgressEvent, ProgressStage};
 
 static BACKEND_REFCOUNT: AtomicUsize = AtomicUsize::new(0);
@@ -79,12 +82,19 @@ struct LoadedRuntime {
 
 impl LoadedRuntime {
     fn load(
-        model_path: &Path,
+        model_path: Option<&Path>,
+        model_hf_repo: Option<&str>,
+        model_cache_dir: Option<&Path>,
         profile: &str,
         generation_state_path: Option<PathBuf>,
     ) -> Result<Self, RuntimeError> {
         let cpu_only = profile.eq_ignore_ascii_case("cpu");
-        let model = Arc::new(ModelHandle::load(model_path, cpu_only)?);
+        let model = Arc::new(ModelHandle::load(
+            model_path,
+            model_hf_repo,
+            model_cache_dir,
+            cpu_only,
+        )?);
 
         Ok(Self {
             generation_ctx: None,
@@ -386,10 +396,67 @@ impl LoadedRuntime {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ModelConfig {
+    pub local_path: Option<PathBuf>,
+    pub hf_repo: Option<String>,
+    pub cache_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CachedModelList {
+    pub cache_dir: PathBuf,
+    pub models: Vec<String>,
+}
+
+pub fn list_cached_models(cache_dir: Option<PathBuf>) -> Result<CachedModelList, RuntimeError> {
+    let (cache_dir, models) = list_cached_models_bridge(cache_dir.as_deref())?;
+    Ok(CachedModelList { cache_dir, models })
+}
+
+impl ModelConfig {
+    pub fn from_explicit(
+        local_path: Option<PathBuf>,
+        hf_repo: Option<String>,
+        cache_dir: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            local_path,
+            hf_repo: hf_repo
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+            cache_dir,
+        }
+    }
+
+    pub fn from_env_or_default() -> Self {
+        let local_path = resolve_embedding_model_path();
+        let hf_repo = if local_path.is_some() {
+            None
+        } else {
+            resolve_embedding_hf_repo().or_else(|| Some(DEFAULT_HF_REPO.to_string()))
+        };
+        let cache_dir = resolve_llama_cache_dir();
+
+        Self {
+            local_path,
+            hf_repo,
+            cache_dir,
+        }
+    }
+
+    pub fn with_default_hf_if_unset(mut self) -> Self {
+        if self.local_path.is_none() && self.hf_repo.is_none() {
+            self.hf_repo = Some(DEFAULT_HF_REPO.to_string());
+        }
+        self
+    }
+}
+
 pub struct Engine {
     _backend: Arc<BackendGuard>,
     context: RuntimeContext,
-    runtime_model_path: Option<PathBuf>,
+    runtime_model: ModelConfig,
     generation_state_path: Option<PathBuf>,
     runtime: Mutex<Option<LoadedRuntime>>,
     progress: Mutex<Option<ProgressCallback>>,
@@ -399,7 +466,7 @@ impl std::fmt::Debug for Engine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Engine")
             .field("context", &self.context)
-            .field("runtime_model_path", &self.runtime_model_path)
+            .field("runtime_model", &self.runtime_model)
             .field("generation_state_path", &self.generation_state_path)
             .finish_non_exhaustive()
     }
@@ -414,11 +481,24 @@ impl Engine {
         profile: &str,
         generation_state_path: Option<PathBuf>,
     ) -> Result<Self, RuntimeError> {
+        Self::new_with_generation_cache_and_model(
+            profile,
+            generation_state_path,
+            ModelConfig::from_env_or_default(),
+        )
+    }
+
+    pub fn new_with_generation_cache_and_model(
+        profile: &str,
+        generation_state_path: Option<PathBuf>,
+        model_config: ModelConfig,
+    ) -> Result<Self, RuntimeError> {
         let backend = Arc::new(BackendGuard::acquire());
+        let runtime_model = model_config.with_default_hf_if_unset();
         Ok(Self {
             _backend: backend,
             context: RuntimeContext::new(profile),
-            runtime_model_path: resolve_embedding_model_path(),
+            runtime_model,
             generation_state_path,
             runtime: Mutex::new(None),
             progress: Mutex::new(None),
@@ -435,7 +515,15 @@ impl Engine {
     }
 
     pub fn configured_model_path(&self) -> Option<&Path> {
-        self.runtime_model_path.as_deref()
+        self.runtime_model.local_path.as_deref()
+    }
+
+    pub fn configured_hf_repo(&self) -> Option<&str> {
+        self.runtime_model.hf_repo.as_deref()
+    }
+
+    pub fn configured_cache_dir(&self) -> Option<&Path> {
+        self.runtime_model.cache_dir.as_deref()
     }
 
     pub fn warmup_generation_cache(&self) -> Result<(), RuntimeError> {
@@ -452,11 +540,11 @@ impl Engine {
         &self,
         f: impl FnOnce(&mut LoadedRuntime) -> Result<T, RuntimeError>,
     ) -> Result<T, RuntimeError> {
-        let model_path = self.runtime_model_path.as_deref().ok_or_else(|| {
-            RuntimeError::Inference(format!(
-                "runtime model path is not configured; set {EMBEDDING_MODEL_ENV} or {FALLBACK_MODEL_ENV}"
-            ))
-        })?;
+        if self.runtime_model.local_path.is_none() && self.runtime_model.hf_repo.is_none() {
+            return Err(RuntimeError::Inference(
+                "runtime model is not configured".to_string(),
+            ));
+        }
 
         let mut guard = self
             .runtime
@@ -465,7 +553,9 @@ impl Engine {
 
         if guard.is_none() {
             *guard = Some(LoadedRuntime::load(
-                model_path,
+                self.runtime_model.local_path.as_deref(),
+                self.runtime_model.hf_repo.as_deref(),
+                self.runtime_model.cache_dir.as_deref(),
                 &self.context.profile,
                 self.generation_state_path.clone(),
             )?);

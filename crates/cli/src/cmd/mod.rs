@@ -5,3 +5,4 @@ mod git;
 pub mod init;
 #[cfg(feature = "llama-native")]
 pub mod repo_cache;
+mod version_bump;

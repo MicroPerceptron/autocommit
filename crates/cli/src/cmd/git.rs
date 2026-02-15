@@ -1,4 +1,5 @@
 use std::ops::ControlFlow;
+use std::path::{Path, PathBuf};
 
 use autocommit_core::CoreError;
 use gix::bstr::{BStr, BString, ByteSlice};
@@ -77,6 +78,17 @@ impl Repo {
         }
 
         Ok(out)
+    }
+
+    pub(crate) fn repo_root(&self) -> PathBuf {
+        self.inner
+            .workdir()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.inner.git_dir().to_path_buf())
+    }
+
+    pub(crate) fn common_git_dir(&self) -> &Path {
+        self.inner.common_dir()
     }
 
     pub(crate) fn commit(

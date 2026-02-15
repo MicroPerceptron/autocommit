@@ -7,9 +7,9 @@ use dialoguer::console::{Term, style};
 use dialoguer::{Confirm, Editor, Select, theme::ColorfulTheme};
 use indicatif::{ProgressBar, ProgressStyle};
 
-use crate::cmd::git;
 #[cfg(feature = "llama-native")]
 use crate::cmd::repo_cache;
+use crate::cmd::{git, version_bump};
 use crate::output;
 
 #[cfg(not(feature = "llama-native"))]
@@ -129,13 +129,20 @@ pub fn run(args: &[String]) -> Result<String, String> {
         core_run(engine.as_ref(), &diff_text, &AnalyzeOptions::default())
     })
     .map_err(|err| format!("analysis failed: {err}"))?;
+    let version_recommendations = version_bump::recommend(&repo, &diff_text, &report);
+    let approved_version_recommendations = resolve_version_bump_recommendations(
+        &version_recommendations,
+        interactive,
+        rich_interactive,
+        assume_yes,
+    )?;
 
     if dry_run {
         if json {
             return output::json::to_pretty_json(&report).map_err(|err| err.to_string());
         }
 
-        let composed_message = compose_commit_message(&report);
+        let composed_message = compose_commit_message(&report, &approved_version_recommendations);
         let mut out = String::new();
         out.push_str("dry-run: commit was not created\n");
         out.push_str(&format!("message:\n{}\n", composed_message));
@@ -143,7 +150,7 @@ pub fn run(args: &[String]) -> Result<String, String> {
         return Ok(out);
     }
 
-    let composed_message = compose_commit_message(&report);
+    let composed_message = compose_commit_message(&report, &approved_version_recommendations);
     let final_message = if interactive && !assume_yes {
         match prompt_for_commit_message(&composed_message, rich_interactive)? {
             Some(message) => message,
@@ -538,13 +545,16 @@ fn commit_with_message(
     Ok(())
 }
 
-fn compose_commit_message(report: &AnalysisReport) -> String {
+fn compose_commit_message(
+    report: &AnalysisReport,
+    recommendations: &[version_bump::VersionRecommendation],
+) -> String {
     let subject = report.commit_message.trim();
     if subject.is_empty() {
         return String::new();
     }
 
-    let body = compose_commit_body(report, subject);
+    let body = compose_commit_body(report, subject, recommendations);
     if body.is_empty() {
         subject.to_string()
     } else {
@@ -552,7 +562,100 @@ fn compose_commit_message(report: &AnalysisReport) -> String {
     }
 }
 
-fn compose_commit_body(report: &AnalysisReport, subject: &str) -> String {
+fn resolve_version_bump_recommendations(
+    recommendations: &[version_bump::VersionRecommendation],
+    interactive: bool,
+    rich_interactive: bool,
+    assume_yes: bool,
+) -> Result<Vec<version_bump::VersionRecommendation>, String> {
+    if recommendations.is_empty() {
+        return Ok(Vec::new());
+    }
+    if assume_yes {
+        return Ok(recommendations.to_vec());
+    }
+    if !interactive {
+        return Ok(Vec::new());
+    }
+
+    if rich_interactive {
+        return prompt_version_bump_recommendations_rich(recommendations);
+    }
+
+    prompt_version_bump_recommendations_basic(recommendations)
+}
+
+fn prompt_version_bump_recommendations_rich(
+    recommendations: &[version_bump::VersionRecommendation],
+) -> Result<Vec<version_bump::VersionRecommendation>, String> {
+    let theme = ColorfulTheme::default();
+    let term = Term::stderr();
+    let options = [
+        "Approve and include in commit message",
+        "Skip for this commit",
+    ];
+
+    println!();
+    println!(
+        "{}",
+        style("Version bump recommendations")
+            .bold()
+            .underlined()
+            .cyan()
+    );
+    for rec in recommendations {
+        println!(
+            "{}",
+            style(format!("- {}", format_version_recommendation(rec))).cyan()
+        );
+    }
+    println!();
+
+    let selection = Select::with_theme(&theme)
+        .with_prompt("Version bump action")
+        .items(options)
+        .default(0)
+        .interact_on_opt(&term)
+        .map_err(|err| format!("failed to read version bump action: {err}"))?;
+
+    match selection {
+        Some(0) => Ok(recommendations.to_vec()),
+        Some(1) | None => Ok(Vec::new()),
+        Some(_) => Err("invalid version bump action selection".to_string()),
+    }
+}
+
+fn prompt_version_bump_recommendations_basic(
+    recommendations: &[version_bump::VersionRecommendation],
+) -> Result<Vec<version_bump::VersionRecommendation>, String> {
+    println!();
+    println!("Version bump recommendations:");
+    for rec in recommendations {
+        println!("- {}", format_version_recommendation(rec));
+    }
+
+    loop {
+        print!("Include these in commit message? [Y/n]: ");
+        std::io::stdout()
+            .flush()
+            .map_err(|err| format!("failed to flush prompt output: {err}"))?;
+        let value = read_line_trimmed()?;
+        if value.is_empty() {
+            return Ok(recommendations.to_vec());
+        }
+        match value.to_ascii_lowercase().as_str() {
+            "y" | "yes" => return Ok(recommendations.to_vec()),
+            "n" | "no" => return Ok(Vec::new()),
+            _ => println!("invalid choice, enter y or n"),
+        }
+    }
+}
+
+fn compose_commit_body(
+    report: &AnalysisReport,
+    subject: &str,
+    recommendations: &[version_bump::VersionRecommendation],
+) -> String {
     let mut sections = Vec::new();
 
     let summary = report.summary.trim();
@@ -563,6 +666,11 @@ fn compose_commit_body(report: &AnalysisReport, subject: &str) -> String {
     let changes = compose_changes_section(report);
     if !changes.is_empty() {
         sections.push(changes);
+    }
+
+    let versions = compose_version_recommendations_section(recommendations);
+    if !versions.is_empty() {
+        sections.push(versions);
     }
 
     let risk = compose_risk_section(report);
@@ -652,6 +760,41 @@ fn compose_changes_section(report: &AnalysisReport) -> String {
         out.push('\n');
     }
     out.trim_end().to_string()
+}
+
+fn compose_version_recommendations_section(
+    recommendations: &[version_bump::VersionRecommendation],
+) -> String {
+    if recommendations.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::from("### Version Bump Recommendations\n");
+    for rec in recommendations {
+        out.push_str("- ");
+        out.push_str(&format_version_recommendation(rec));
+        out.push('\n');
+    }
+    out.trim_end().to_string()
+}
+
+fn format_version_recommendation(rec: &version_bump::VersionRecommendation) -> String {
+    let mut out = format!("[{}] {} / {}", rec.manifest_path, rec.ecosystem, rec.tool);
+    if let (Some(current), Some(suggested)) = (
+        rec.current_version.as_deref(),
+        rec.suggested_version.as_deref(),
+    ) {
+        out.push_str(&format!(
+            ": {} -> {} ({})",
+            current,
+            suggested,
+            rec.level.as_str()
+        ));
+        out.push_str(&format!("; {}", rec.reason));
+    } else {
+        out.push_str(&format!(": {} ({})", rec.reason, rec.level.as_str()));
+    }
+    out
 }
 
 fn compose_risk_section(report: &AnalysisReport) -> String {
@@ -974,7 +1117,7 @@ mod tests {
 
     #[test]
     fn compose_commit_message_includes_summary_changes_and_risk() {
-        let message = compose_commit_message(&sample_report());
+        let message = compose_commit_message(&sample_report(), &[]);
         assert!(message.starts_with("feat(core): add detailed commit composition\n\n"));
         assert!(message.contains("Compose commit output from chunk-level analyses."));
         assert!(message.contains("### Changes\n- [crates/cli/src/cmd/commit.rs] Compose final commit body: Include per-file details in commit body"));
@@ -995,7 +1138,7 @@ mod tests {
         report.risk.level.clear();
         report.risk.notes.clear();
 
-        let message = compose_commit_message(&report);
+        let message = compose_commit_message(&report, &[]);
         assert_eq!(message, "feat(core): add detailed commit composition");
     }
 
@@ -1008,7 +1151,7 @@ mod tests {
         report.risk.level.clear();
         report.risk.notes.clear();
 
-        let message = compose_commit_message(&report);
+        let message = compose_commit_message(&report, &[]);
         assert_eq!(message, "refactor(core): simplify reduction logic");
     }
 
@@ -1033,5 +1176,23 @@ mod tests {
             formatted,
             "[crates/cli/src/cmd/commit.rs] Commit Message Composition and Creation with Analysis Report: compose commit messages based on an analysis report and create commits with the composed messages"
         );
+    }
+
+    #[test]
+    fn compose_commit_message_includes_version_bump_recommendations_section() {
+        let report = sample_report();
+        let recommendations = vec![version_bump::VersionRecommendation {
+            manifest_path: "Cargo.toml".to_string(),
+            ecosystem: "Rust",
+            tool: "Cargo",
+            current_version: Some("0.1.0".to_string()),
+            suggested_version: Some("0.2.0".to_string()),
+            level: version_bump::BumpLevel::Minor,
+            reason: "code changes detected; suggest a minor project version bump".to_string(),
+        }];
+
+        let message = compose_commit_message(&report, &recommendations);
+        assert!(message.contains("### Version Bump Recommendations"));
+        assert!(message.contains("[Cargo.toml] Rust / Cargo: 0.1.0 -> 0.2.0 (minor)"));
     }
 }

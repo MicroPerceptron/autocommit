@@ -645,7 +645,7 @@ fn build_reduce_prompt_plan(
     let max_items = reduce_item_budget(stats, total);
     let max_prompt_chars = reduce_char_budget(stats, total);
 
-    let indices = sampled_indices(total, max_items);
+    let indices = sampled_indices(partials, max_items);
     let mut prompt = prompts::build_reduce_prompt(total);
     prompt.push_str("\nContext:\n");
     prompt.push_str(&format!(
@@ -719,7 +719,8 @@ fn reduce_char_budget(stats: &DiffStats, total: usize) -> usize {
     }
 }
 
-fn sampled_indices(total: usize, max_items: usize) -> Vec<usize> {
+fn sampled_indices(partials: &[PartialReport], max_items: usize) -> Vec<usize> {
+    let total = partials.len();
     if total == 0 || max_items == 0 {
         return Vec::new();
     }
@@ -728,26 +729,92 @@ fn sampled_indices(total: usize, max_items: usize) -> Vec<usize> {
         return (0..total).collect();
     }
 
-    let mut out = Vec::with_capacity(max_items);
-    out.push(0);
-    if max_items > 1 {
-        out.push(total - 1);
+    let mut scored = Vec::with_capacity(total);
+    let mut best_by_scope = std::collections::BTreeMap::<String, (usize, f32)>::new();
+
+    for (idx, partial) in partials.iter().enumerate() {
+        let score = reduce_partial_score(partial);
+        scored.push((idx, score));
+
+        let scope = reduce_partial_scope_key(partial);
+        let best = best_by_scope.entry(scope).or_insert((idx, score));
+        if score > best.1 {
+            *best = (idx, score);
+        }
     }
 
-    let remaining = max_items.saturating_sub(out.len());
-    if remaining > 0 {
-        let step = (total - 1) as f32 / (remaining + 1) as f32;
-        for n in 1..=remaining {
-            let idx = ((n as f32) * step).round() as usize;
-            if idx < total && !out.contains(&idx) {
-                out.push(idx);
+    let mut by_scope = best_by_scope.into_values().collect::<Vec<_>>();
+    by_scope.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+
+    let mut selected = Vec::with_capacity(max_items);
+    let mut selected_set = std::collections::BTreeSet::new();
+
+    for (idx, _) in by_scope {
+        if selected.len() >= max_items {
+            break;
+        }
+        if selected_set.insert(idx) {
+            selected.push(idx);
+        }
+    }
+
+    if selected.len() < max_items {
+        scored.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+
+        for (idx, _) in scored {
+            if selected.len() >= max_items {
+                break;
+            }
+            if selected_set.insert(idx) {
+                selected.push(idx);
             }
         }
     }
 
-    out.sort_unstable();
-    out.truncate(max_items);
-    out
+    selected.sort_unstable();
+    selected
+}
+
+fn reduce_partial_score(partial: &PartialReport) -> f32 {
+    let mut score = 0.42f32;
+    let normalized_summary = sanitize_sentence(&partial.summary);
+    if normalized_summary.contains("fallback heuristic due to analyze_error:") {
+        score -= 0.25;
+    } else {
+        score += 0.02;
+    }
+
+    if let Some(item) = partial.items.first() {
+        score += item.confidence.clamp(0.0, 1.0);
+        if item.files.len() > 1 {
+            score += 0.05;
+        }
+        if !matches!(item.type_tag, TypeTag::Mixed) {
+            score += 0.04;
+        }
+        if !matches!(item.bucket, ChangeBucket::Other) {
+            score += 0.03;
+        }
+    }
+
+    score
+}
+
+fn reduce_partial_scope_key(partial: &PartialReport) -> String {
+    partial
+        .items
+        .first()
+        .and_then(|item| item.files.first())
+        .and_then(|file| scope_from_path(&file.path))
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 fn format_partial_for_reduce(partial: &PartialReport) -> String {
@@ -1180,11 +1247,7 @@ fn build_analyze_prompt_capped(chunk: &DiffChunk) -> String {
         return prompts::build_analyze_prompt(chunk);
     }
 
-    let mut truncated = String::with_capacity(max_chars + 128);
-    for ch in chunk.text.chars().take(max_chars) {
-        truncated.push(ch);
-    }
-    truncated.push_str("\n... [diff truncated for budget]");
+    let truncated = compact_diff_for_prompt(&chunk.text, max_chars);
 
     format!(
         "Task: Analyze one diff chunk.\n\
@@ -1195,6 +1258,120 @@ Path: {}\n\
 Diff:\n```diff\n{}\n```",
         chunk.path, truncated
     )
+}
+
+fn compact_diff_for_prompt(text: &str, max_chars: usize) -> String {
+    if text.len() <= max_chars {
+        return text.to_string();
+    }
+
+    let lines = text.lines().collect::<Vec<_>>();
+    let mut used = vec![false; lines.len()];
+    let mut out = String::with_capacity(max_chars + 128);
+    let mut header_lines = 0usize;
+    let mut change_lines = 0usize;
+
+    for (idx, line) in lines.iter().copied().enumerate() {
+        if is_structural_diff_line(line) {
+            if !push_line_with_limit(&mut out, line, max_chars) {
+                break;
+            }
+            used[idx] = true;
+            header_lines += 1;
+        }
+    }
+
+    for (idx, line) in lines.iter().copied().enumerate() {
+        if used[idx] || !is_change_line(line) {
+            continue;
+        }
+        if !push_line_with_limit(&mut out, line, max_chars) {
+            break;
+        }
+        used[idx] = true;
+        change_lines += 1;
+    }
+
+    for (idx, line) in lines.iter().copied().enumerate() {
+        if used[idx] || !is_semantic_context_line(line) {
+            continue;
+        }
+        if !push_line_with_limit(&mut out, line, max_chars) {
+            break;
+        }
+        used[idx] = true;
+    }
+
+    if out.len() < max_chars / 3 {
+        out.clear();
+        append_head_tail_with_limit(text, &mut out, max_chars);
+    }
+
+    out.push_str(&format!(
+        "\n... [diff truncated for budget; kept {} headers and {} change lines]",
+        header_lines, change_lines
+    ));
+    out
+}
+
+fn push_line_with_limit(out: &mut String, line: &str, max_chars: usize) -> bool {
+    let required = line.len().saturating_add(1);
+    if out.len().saturating_add(required) > max_chars {
+        return false;
+    }
+    out.push_str(line);
+    out.push('\n');
+    true
+}
+
+fn append_head_tail_with_limit(text: &str, out: &mut String, max_chars: usize) {
+    let lines = text.lines().collect::<Vec<_>>();
+    let head = lines.len().min(24);
+    let tail = lines.len().saturating_sub(head).min(12);
+
+    for line in lines.iter().copied().take(head) {
+        if !push_line_with_limit(out, line, max_chars) {
+            return;
+        }
+    }
+    if head + tail < lines.len() {
+        if !push_line_with_limit(out, "...", max_chars) {
+            return;
+        }
+    }
+    for line in lines.iter().copied().skip(lines.len().saturating_sub(tail)) {
+        if !push_line_with_limit(out, line, max_chars) {
+            return;
+        }
+    }
+}
+
+fn is_structural_diff_line(line: &str) -> bool {
+    line.starts_with("diff --git ")
+        || line.starts_with("index ")
+        || line.starts_with("--- ")
+        || line.starts_with("+++ ")
+        || line.starts_with("@@ ")
+}
+
+fn is_change_line(line: &str) -> bool {
+    (line.starts_with('+') || line.starts_with('-'))
+        && !line.starts_with("+++ ")
+        && !line.starts_with("--- ")
+}
+
+fn is_semantic_context_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("fn ")
+        || trimmed.starts_with("pub fn ")
+        || trimmed.starts_with("impl ")
+        || trimmed.starts_with("struct ")
+        || trimmed.starts_with("enum ")
+        || trimmed.starts_with("trait ")
+        || trimmed.starts_with("class ")
+        || trimmed.starts_with("interface ")
+        || trimmed.starts_with("mod ")
+        || trimmed.starts_with("const ")
 }
 
 fn sanitize_sentence(value: &str) -> String {
@@ -2375,5 +2552,80 @@ mod tests {
             mapped_change_item_id("crates/core/src/llm/prompts.rs", 0),
             "crates/core/src/llm/prompts.rs#chunk-1"
         );
+    }
+
+    #[test]
+    fn sampled_indices_prefers_confident_diverse_partials() {
+        let partials = vec![
+            PartialReport {
+                summary: "low confidence core".to_string(),
+                items: vec![sample_item(
+                    TypeTag::Refactor,
+                    "Refactor core plumbing",
+                    "Refactor core plumbing",
+                    "crates/core/src/lib.rs",
+                    0.20,
+                )],
+            },
+            PartialReport {
+                summary: "high confidence cli".to_string(),
+                items: vec![sample_item(
+                    TypeTag::Feat,
+                    "Add interactive commit flow",
+                    "Add interactive commit flow",
+                    "crates/cli/src/cmd/commit.rs",
+                    0.95,
+                )],
+            },
+            PartialReport {
+                summary: "high confidence runtime".to_string(),
+                items: vec![sample_item(
+                    TypeTag::Fix,
+                    "Fix runtime reduce selection",
+                    "Fix runtime reduce selection",
+                    "crates/llama-runtime/src/model.rs",
+                    0.91,
+                )],
+            },
+            PartialReport {
+                summary: "mid confidence cli".to_string(),
+                items: vec![sample_item(
+                    TypeTag::Refactor,
+                    "Refactor commit preview styles",
+                    "Refactor commit preview styles",
+                    "crates/cli/src/cmd/commit.rs",
+                    0.62,
+                )],
+            },
+        ];
+
+        let picked = sampled_indices(&partials, 2);
+        assert_eq!(picked, vec![1, 2]);
+    }
+
+    #[test]
+    fn compact_diff_for_prompt_keeps_structure_and_changes() {
+        let diff = "\
+diff --git a/crates/cli/src/cmd/commit.rs b/crates/cli/src/cmd/commit.rs\n\
+index 111..222 100644\n\
+--- a/crates/cli/src/cmd/commit.rs\n\
++++ b/crates/cli/src/cmd/commit.rs\n\
+@@ -1,4 +1,8 @@\n\
+-fn old_name() {}\n\
++fn new_name() {}\n\
+ context line one\n\
+ context line two\n\
+@@ -20,2 +24,6 @@\n\
+-let a = 1;\n\
++let a = 2;\n\
++let b = 3;\n\
+ impl CommitComposer {}\n\
+";
+
+        let compacted = compact_diff_for_prompt(diff, 320);
+        assert!(compacted.contains("diff --git"));
+        assert!(compacted.contains("@@ -1,4 +1,8 @@"));
+        assert!(compacted.contains("+fn new_name() {}") || compacted.contains("+let b = 3;"));
+        assert!(compacted.contains("diff truncated for budget"));
     }
 }

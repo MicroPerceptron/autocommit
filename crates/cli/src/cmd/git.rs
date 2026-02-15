@@ -234,6 +234,25 @@ impl Repo {
         Ok(branches)
     }
 
+    pub(crate) fn diff_range(&self, base: &str, head: &str) -> Result<String, CoreError> {
+        let repo_root = self.repo_root();
+        let range = format!("{base}...{head}");
+        let output = Command::new("git")
+            .args(["diff", "--no-color", &range])
+            .current_dir(&repo_root)
+            .output()
+            .map_err(|err| CoreError::Io(format!("failed to run git diff: {err}")))?;
+
+        if !output.status.success() {
+            return Err(CoreError::Io(format!(
+                "git diff failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    }
+
     fn tree_id_for_index(&self) -> Result<gix::hash::ObjectId, CoreError> {
         let index = self
             .inner

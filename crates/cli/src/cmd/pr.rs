@@ -127,8 +127,16 @@ pub fn run(args: &[String]) -> Result<String, String> {
     let repo = run_step(rich_interactive, "Discovering repository", git::Repo::discover)
         .map_err(|err| err.to_string())?;
 
-    let diff_text = run_step(rich_interactive, "Collecting staged/worktree diff", || {
-        prepare_diff(&repo, staged_only, dry_run)
+    let (base, head) = resolve_pr_branches(
+        &repo,
+        base,
+        head,
+        interactive,
+        rich_interactive,
+    )?;
+
+    let diff_text = run_step(rich_interactive, "Collecting PR diff", || {
+        prepare_pr_diff(&repo, staged_only, base.as_deref(), head.as_deref())
     })
     .map_err(|err| err.to_string())?;
 
@@ -163,14 +171,6 @@ pub fn run(args: &[String]) -> Result<String, String> {
     if generated_title.trim().is_empty() {
         return Err("generated pull request title is empty".to_string());
     }
-
-    let (base, head) = resolve_pr_branches(
-        &repo,
-        base,
-        head,
-        interactive,
-        rich_interactive,
-    )?;
 
     let draft = if draft {
         true
@@ -649,7 +649,12 @@ fn prompt_for_branch_manual(prompt: &str) -> Result<String, String> {
     }
 }
 
-fn prepare_diff(repo: &git::Repo, staged_only: bool, dry_run: bool) -> Result<String, CoreError> {
+fn prepare_pr_diff(
+    repo: &git::Repo,
+    staged_only: bool,
+    base: Option<&str>,
+    head: Option<&str>,
+) -> Result<String, CoreError> {
     if staged_only {
         let staged = repo.diff_cached()?;
         if staged.trim().is_empty() {
@@ -660,17 +665,20 @@ fn prepare_diff(repo: &git::Repo, staged_only: bool, dry_run: bool) -> Result<St
         return Ok(staged);
     }
 
+    if let (Some(base), Some(head)) = (base, head) {
+        let diff = repo.diff_range(base, head)?;
+        if !diff.trim().is_empty() {
+            return Ok(diff);
+        }
+    }
+
     let staged = repo.diff_cached()?;
     let unstaged = repo.diff_worktree()?;
     let combined = concat_diffs(&staged, &unstaged);
     if combined.trim().is_empty() {
         return Err(CoreError::InvalidDiff(
-            "no changes in working tree".to_string(),
+            "no changes between base/head and no local diffs to include".to_string(),
         ));
-    }
-
-    if dry_run {
-        return Ok(combined);
     }
 
     Ok(combined)

@@ -4,7 +4,7 @@ use std::path::Path;
 use autocommit_core::llm::traits::LlmEngine;
 use autocommit_core::{AnalyzeOptions, CoreError, run as core_run};
 
-use crate::cmd::git;
+use crate::cmd::{git, report_cache};
 #[cfg(feature = "llama-native")]
 use crate::cmd::repo_cache;
 use crate::output;
@@ -23,6 +23,8 @@ pub fn run(args: &[String]) -> Result<String, String> {
     let mut runtime_profile = "auto".to_string();
     #[cfg(feature = "llama-native")]
     let mut runtime_profile_overridden = false;
+    #[cfg(not(feature = "llama-native"))]
+    let runtime_profile = "mock".to_string();
 
     let mut i = 0;
     while i < args.len() {
@@ -86,6 +88,21 @@ pub fn run(args: &[String]) -> Result<String, String> {
 
     let diff_text = load_diff(diff_file.as_deref()).map_err(|err| err.to_string())?;
 
+    let diff_hash = report_cache::diff_hash(&diff_text);
+    let cache_key = report_cache::cache_key("analyze", runtime_profile.as_str(), &diff_hash, "1.0");
+    let cache_path = git::Repo::discover()
+        .ok()
+        .map(|repo| report_cache::cache_path(repo.common_git_dir()));
+    if let Some(cache_path) = cache_path.as_ref() {
+        if let Some(report) = report_cache::read_cached_report(cache_path, &cache_key) {
+            return if json {
+                output::json::to_pretty_json(&report).map_err(|err| err.to_string())
+            } else {
+                Ok(output::text::render_report(&report))
+            };
+        }
+    }
+
     #[cfg(feature = "llama-native")]
     let generation_state = repo_paths.map(|paths| paths.generation_state);
 
@@ -100,6 +117,9 @@ pub fn run(args: &[String]) -> Result<String, String> {
 
     let report = core_run(engine.as_ref(), &diff_text, &AnalyzeOptions::default())
         .map_err(|err| format!("analysis failed: {err}"))?;
+    if let Some(cache_path) = cache_path.as_ref() {
+        let _ = report_cache::write_cached_report(cache_path, &cache_key, &report);
+    }
 
     if json {
         output::json::to_pretty_json(&report).map_err(|err| err.to_string())

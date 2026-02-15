@@ -1,13 +1,14 @@
 use std::io::{IsTerminal, Write};
 use std::process::Command;
 
+#[cfg(not(feature = "llama-native"))]
 use autocommit_core::llm::traits::LlmEngine;
 use autocommit_core::{AnalyzeOptions, CoreError, run as core_run};
 use dialoguer::console::{Term, style};
 use dialoguer::{Confirm, Editor, Select, theme::ColorfulTheme};
 use indicatif::{ProgressBar, ProgressStyle};
 
-use crate::cmd::git;
+use crate::cmd::{analysis_progress::AnalysisProgress, git, report_cache};
 #[cfg(feature = "llama-native")]
 use crate::cmd::repo_cache;
 
@@ -33,6 +34,8 @@ pub fn run(args: &[String]) -> Result<String, String> {
     let mut runtime_profile = "auto".to_string();
     #[cfg(feature = "llama-native")]
     let mut runtime_profile_overridden = false;
+    #[cfg(not(feature = "llama-native"))]
+    let runtime_profile = "mock".to_string();
 
     let mut i = 0;
     while i < args.len() {
@@ -142,28 +145,57 @@ pub fn run(args: &[String]) -> Result<String, String> {
     })
     .map_err(|err| err.to_string())?;
 
-    #[cfg(feature = "llama-native")]
-    let generation_state = repo_paths.map(|paths| paths.generation_state);
+    let diff_hash = report_cache::diff_hash(&diff_text);
+    let cache_key = report_cache::cache_key("pr", runtime_profile.as_str(), &diff_hash, "1.0");
+    let cache_path = report_cache::cache_path(repo.common_git_dir());
+    let cached_report = report_cache::read_cached_report(&cache_path, &cache_key);
 
-    #[cfg(feature = "llama-native")]
-    let engine: Box<dyn LlmEngine> =
-        run_step(rich_interactive, "Initializing llama runtime", || {
+    let report = if let Some(report) = cached_report {
+        if rich_interactive {
+            println!("[ok] Using cached analysis");
+        }
+        report
+    } else {
+        #[cfg(feature = "llama-native")]
+        let generation_state = repo_paths.map(|paths| paths.generation_state);
+
+        #[cfg(feature = "llama-native")]
+        let engine = run_step(rich_interactive, "Initializing llama runtime", || {
             llama_runtime::Engine::new_with_generation_cache(&runtime_profile, generation_state)
-                .map(|engine| Box::new(engine) as Box<dyn LlmEngine>)
         })
         .map_err(|err| format!("runtime init failed: {err}"))?;
 
-    #[cfg(not(feature = "llama-native"))]
-    let engine: Box<dyn LlmEngine> =
-        run_step(rich_interactive, "Initializing analysis engine", || {
-            Ok::<Box<dyn LlmEngine>, CoreError>(Box::new(MockEngine))
+        #[cfg(not(feature = "llama-native"))]
+        let engine = run_step(rich_interactive, "Initializing analysis engine", || {
+            Ok::<MockEngine, CoreError>(MockEngine)
         })
         .map_err(|err| format!("runtime init failed: {err}"))?;
 
-    let report = run_step(rich_interactive, "Generating PR analysis", || {
-        core_run(engine.as_ref(), &diff_text, &AnalyzeOptions::default())
-    })
-    .map_err(|err| format!("analysis failed: {err}"))?;
+        let progress = if rich_interactive {
+            Some(AnalysisProgress::new(&diff_text))
+        } else {
+            None
+        };
+
+        #[cfg(feature = "llama-native")]
+        if let Some(progress) = progress.as_ref() {
+            engine.set_progress_callback(Some(progress.callback()));
+        }
+
+        let report = core_run(&engine, &diff_text, &AnalyzeOptions::default())
+            .map_err(|err| format!("analysis failed: {err}"))?;
+
+        #[cfg(feature = "llama-native")]
+        {
+            engine.set_progress_callback(None);
+        }
+        if let Some(progress) = progress {
+            progress.finish();
+        }
+
+        let _ = report_cache::write_cached_report(&cache_path, &cache_key, &report);
+        report
+    };
 
     let generated_title = title
         .clone()

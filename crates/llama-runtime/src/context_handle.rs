@@ -931,11 +931,26 @@ impl ContextHandle {
             ));
         }
 
-        let tokens = self.tokenize(text)?;
+        let mut tokens = self.tokenize(text)?;
         if tokens.is_empty() {
             return Err(RuntimeError::Embed(
                 "tokenization produced an empty token list".to_string(),
             ));
+        }
+
+        let max_batch_tokens = unsafe {
+            // SAFETY: pure context metadata query.
+            ffi::llama_n_batch(self.ptr)
+        } as usize;
+
+        if max_batch_tokens == 0 {
+            return Err(RuntimeError::Embed(
+                "llama context reports n_batch=0".to_string(),
+            ));
+        }
+
+        if tokens.len() > max_batch_tokens {
+            tokens.truncate(max_batch_tokens);
         }
 
         let mut batch_handle = BatchHandle::new(tokens.len())?;

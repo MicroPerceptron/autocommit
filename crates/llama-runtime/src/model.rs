@@ -17,6 +17,7 @@ use crate::context_handle::ContextHandle;
 use crate::embed::{EMBEDDING_MODEL_ENV, FALLBACK_MODEL_ENV, resolve_embedding_model_path};
 use crate::error::RuntimeError;
 use crate::model_handle::ModelHandle;
+use crate::progress::{ProgressCallback, ProgressEvent, ProgressStage};
 
 static BACKEND_REFCOUNT: AtomicUsize = AtomicUsize::new(0);
 
@@ -167,6 +168,7 @@ impl LoadedRuntime {
         &mut self,
         runtime_context: &RuntimeContext,
         chunks: &[DiffChunk],
+        mut on_progress: impl FnMut(usize),
     ) -> Result<Vec<PartialReport>, RuntimeError> {
         if chunks.is_empty() {
             return Ok(Vec::new());
@@ -199,6 +201,7 @@ impl LoadedRuntime {
             .collect();
 
         let window = generation_ctx.max_sequences().max(1);
+        let mut completed = 0usize;
         let mut start = 0usize;
         while start < prompts.len() {
             let end = (start + window).min(prompts.len());
@@ -278,6 +281,8 @@ impl LoadedRuntime {
                                 }
                             }
                         };
+                        completed = completed.saturating_add(1);
+                        on_progress(completed);
                     }
                 }
                 Err(batch_err) => {
@@ -301,6 +306,8 @@ impl LoadedRuntime {
                                 )
                             }
                         };
+                        completed = completed.saturating_add(1);
+                        on_progress(completed);
                     }
                 }
             }
@@ -379,13 +386,23 @@ impl LoadedRuntime {
     }
 }
 
-#[derive(Debug)]
 pub struct Engine {
     _backend: Arc<BackendGuard>,
     context: RuntimeContext,
     runtime_model_path: Option<PathBuf>,
     generation_state_path: Option<PathBuf>,
     runtime: Mutex<Option<LoadedRuntime>>,
+    progress: Mutex<Option<ProgressCallback>>,
+}
+
+impl std::fmt::Debug for Engine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Engine")
+            .field("context", &self.context)
+            .field("runtime_model_path", &self.runtime_model_path)
+            .field("generation_state_path", &self.generation_state_path)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Engine {
@@ -404,6 +421,7 @@ impl Engine {
             runtime_model_path: resolve_embedding_model_path(),
             generation_state_path,
             runtime: Mutex::new(None),
+            progress: Mutex::new(None),
         })
     }
 
@@ -422,6 +440,12 @@ impl Engine {
 
     pub fn warmup_generation_cache(&self) -> Result<(), RuntimeError> {
         self.with_runtime(|runtime| runtime.warmup_generation_cache())
+    }
+
+    pub fn set_progress_callback(&self, callback: Option<ProgressCallback>) {
+        if let Ok(mut guard) = self.progress.lock() {
+            *guard = callback;
+        }
     }
 
     fn with_runtime<T>(
@@ -450,6 +474,13 @@ impl Engine {
         f(guard.as_mut().expect("runtime just initialized"))
     }
 
+    fn emit_progress(&self, stage: ProgressStage) {
+        let callback = self.progress.lock().ok().and_then(|guard| guard.clone());
+        if let Some(cb) = callback {
+            cb(ProgressEvent { stage });
+        }
+    }
+
     fn embed_with_runtime(&self, text: &str) -> Result<Vec<f32>, RuntimeError> {
         self.with_runtime(|runtime| runtime.embed(text))
     }
@@ -458,7 +489,12 @@ impl Engine {
         &self,
         chunks: &[DiffChunk],
     ) -> Result<Vec<PartialReport>, RuntimeError> {
-        self.with_runtime(|runtime| runtime.analyze_chunks(&self.context, chunks))
+        let total = chunks.len();
+        self.with_runtime(|runtime| {
+            runtime.analyze_chunks(&self.context, chunks, |completed| {
+                self.emit_progress(ProgressStage::Analyze { completed, total });
+            })
+        })
     }
 
     fn reduce_output_with_runtime(
@@ -589,7 +625,7 @@ impl LlmEngine for Engine {
         }
         risk_notes.push(format!("dispatch:{:?}", decision.route));
 
-        Ok(AnalysisReport {
+        let report = AnalysisReport {
             schema_version: "1.0".to_string(),
             commit_message,
             summary,
@@ -600,12 +636,18 @@ impl LlmEngine for Engine {
             },
             stats: stats.clone(),
             dispatch: decision.clone(),
-        })
+        };
+
+        self.emit_progress(ProgressStage::Reduce);
+        Ok(report)
     }
 
     fn embed(&self, text: &str) -> Result<Vec<f32>, CoreError> {
-        self.embed_with_runtime(text)
-            .map_err(|err| CoreError::Engine(err.to_string()))
+        let result = self
+            .embed_with_runtime(text)
+            .map_err(|err| CoreError::Engine(err.to_string()))?;
+        self.emit_progress(ProgressStage::Embedding);
+        Ok(result)
     }
 }
 

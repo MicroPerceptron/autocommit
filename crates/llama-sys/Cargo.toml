@@ -9,3 +9,4 @@ links = "llama"
 
 [build-dependencies]
 bindgen = "0.71"
+cc = "1.2"

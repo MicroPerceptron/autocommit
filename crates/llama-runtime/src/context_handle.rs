@@ -164,7 +164,7 @@ impl ContextHandle {
         next_pos: &mut i32,
         n_ctx_seq: usize,
     ) -> Result<bool, RuntimeError> {
-        if !context_shift_enabled() || !self.context_can_shift() {
+        if !self.model.context_shift_enabled() || !self.context_can_shift() {
             return Ok(false);
         }
         if (*next_pos as usize) < n_ctx_seq.saturating_sub(1) {
@@ -569,8 +569,10 @@ impl ContextHandle {
             prompt_tokens.truncate(max_prompt_tokens);
         }
 
-        let keep_tokens = context_shift_keep_tokens(prompt_tokens.len());
-        let ctx_shift_enabled = context_shift_enabled() && self.context_can_shift();
+        let keep_tokens = self
+            .model
+            .context_shift_keep_tokens(prompt_tokens.len(), n_ctx_seq);
+        let ctx_shift_enabled = self.model.context_shift_enabled() && self.context_can_shift();
         let remaining_slots = n_ctx_seq
             .saturating_sub(prompt_tokens.len())
             .saturating_sub(1);
@@ -678,7 +680,7 @@ impl ContextHandle {
         let mut tokenized = Vec::with_capacity(prompts.len());
         let mut per_seq_budget = Vec::with_capacity(prompts.len());
         let mut keep_tokens = Vec::with_capacity(prompts.len());
-        let ctx_shift_enabled = context_shift_enabled() && self.context_can_shift();
+        let ctx_shift_enabled = self.model.context_shift_enabled() && self.context_can_shift();
 
         for (prompt, requested) in prompts.iter().zip(requested_max_tokens.iter().copied()) {
             let mut tokens = self.tokenize(prompt)?;
@@ -690,7 +692,10 @@ impl ContextHandle {
             if tokens.len() > max_prompt_tokens {
                 tokens.truncate(max_prompt_tokens);
             }
-            keep_tokens.push(context_shift_keep_tokens(tokens.len()));
+            keep_tokens.push(
+                self.model
+                    .context_shift_keep_tokens(tokens.len(), n_ctx_seq),
+            );
 
             let remaining_slots = n_ctx_seq.saturating_sub(tokens.len()).saturating_sub(1);
             let budget = if ctx_shift_enabled {
@@ -1686,23 +1691,6 @@ fn selected_token(cur_p: &ffi::llama_token_data_array) -> Result<ffi::llama_toke
         (*cur_p.data.add(cur_p.selected as usize)).id
     };
     Ok(token)
-}
-
-fn context_shift_enabled() -> bool {
-    std::env::var("LLAMA_ARG_CONTEXT_SHIFT")
-        .ok()
-        .or_else(|| std::env::var("AUTOCOMMIT_CTX_SHIFT").ok())
-        .as_deref()
-        .map(|v| !matches!(v, "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF"))
-        .unwrap_or(true)
-}
-
-fn context_shift_keep_tokens(prompt_tokens: usize) -> usize {
-    let configured = std::env::var("AUTOCOMMIT_CTX_KEEP")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(256);
-    configured.min(prompt_tokens)
 }
 
 impl BatchHandle {

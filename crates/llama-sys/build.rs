@@ -19,6 +19,8 @@ fn profile_name() -> &'static str {
 
 fn main() {
     println!("cargo:rerun-if-env-changed=LLAMA_CPP_DIR");
+    println!("cargo:rerun-if-changed=src/autocommit_common_bridge.cpp");
+    println!("cargo:rerun-if-changed=src/autocommit_common_bridge.h");
 
     let manifest_dir =
         PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("missing CARGO_MANIFEST_DIR"));
@@ -66,11 +68,18 @@ fn main() {
             install_dir.to_string_lossy()
         ))
         .arg("-DBUILD_SHARED_LIBS=OFF")
-        .arg("-DLLAMA_BUILD_COMMON=OFF")
+        .arg("-DLLAMA_BUILD_COMMON=ON")
         .arg("-DLLAMA_BUILD_TESTS=OFF")
         .arg("-DLLAMA_BUILD_EXAMPLES=OFF")
         .arg("-DLLAMA_BUILD_TOOLS=OFF")
         .arg("-DLLAMA_BUILD_SERVER=OFF");
+    if cfg!(target_os = "macos") {
+        let deployment_target = env::var("MACOSX_DEPLOYMENT_TARGET")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "11.0".to_string());
+        configure.arg(format!("-DCMAKE_OSX_DEPLOYMENT_TARGET={deployment_target}"));
+    }
     run(&mut configure, "configure");
 
     let mut build = Command::new("cmake");
@@ -95,6 +104,8 @@ fn main() {
         .arg(profile);
     run(&mut install, "install");
 
+    build_common_bridge(&source_dir, &manifest_dir);
+    emit_common_link_deps(&build_dir);
     emit_link_search_paths(&install_dir);
 
     println!(
@@ -198,5 +209,48 @@ fn emit_link_libs_from_dir(dir: &Path) {
         if !lib_name.is_empty() {
             println!("cargo:rustc-link-lib=static={lib_name}");
         }
+    }
+}
+
+fn build_common_bridge(source_dir: &Path, manifest_dir: &Path) {
+    let bridge_cpp = manifest_dir
+        .join("src")
+        .join("autocommit_common_bridge.cpp");
+    let common_dir = source_dir.join("common");
+    let include_dir = source_dir.join("include");
+    let ggml_include = source_dir.join("ggml").join("include");
+    let vendor_dir = source_dir.join("vendor");
+
+    cc::Build::new()
+        .cpp(true)
+        .file(&bridge_cpp)
+        .include(&common_dir)
+        .include(&include_dir)
+        .include(&ggml_include)
+        .include(&vendor_dir)
+        .flag_if_supported("-std=c++17")
+        .flag_if_supported("-Wno-unused-function")
+        .compile("autocommit_common_bridge");
+}
+
+fn emit_common_link_deps(build_dir: &Path) {
+    let common_dir = build_dir.join("common");
+    let common_lib = common_dir.join("libcommon.a");
+    if common_lib.exists() {
+        println!(
+            "cargo:rustc-link-search=native={}",
+            common_dir.to_string_lossy()
+        );
+        println!("cargo:rustc-link-lib=static=common");
+    }
+
+    let httplib_dir = build_dir.join("vendor").join("cpp-httplib");
+    let httplib_lib = httplib_dir.join("libcpp-httplib.a");
+    if httplib_lib.exists() {
+        println!(
+            "cargo:rustc-link-search=native={}",
+            httplib_dir.to_string_lossy()
+        );
+        println!("cargo:rustc-link-lib=static=cpp-httplib");
     }
 }

@@ -1,7 +1,7 @@
 use std::ffi::{CStr, CString};
 use std::path::Path;
 
-use llama_sys::ffi;
+use llama_sys::{bridge, ffi};
 
 use crate::error::RuntimeError;
 
@@ -22,6 +22,8 @@ pub(crate) struct ModelHandle {
     base_context_params: ffi::llama_context_params,
     has_encoder: bool,
     has_decoder: bool,
+    context_shift_enabled: bool,
+    context_shift_n_keep: i32,
 }
 
 // SAFETY: ModelHandle wraps an immutable llama_model after construction. All mutations happen
@@ -46,21 +48,11 @@ impl ModelHandle {
             ))
         })?;
 
-        let mut mparams = unsafe {
-            // SAFETY: pure default parameter initialization.
-            ffi::llama_model_default_params()
-        };
-        let mut cparams = unsafe {
-            // SAFETY: pure default parameter initialization.
-            ffi::llama_context_default_params()
-        };
-
-        // Match llama.cpp common_params defaults for model/context setup.
-        mparams.n_gpu_layers = -1;
-        cparams.n_ctx = 0;
-        cparams.n_seq_max = 1;
-        cparams.n_batch = 2048;
-        cparams.n_ubatch = 512;
+        let mut common = CommonParamsBridge::new()?;
+        common.set_model_path(model_path)?;
+        common.set_n_parallel(1);
+        common.apply_env()?;
+        let (mut mparams, mut cparams) = common.export_llama_params()?;
 
         if cpu_only {
             mparams.n_gpu_layers = 0;
@@ -70,9 +62,8 @@ impl ModelHandle {
             cparams.op_offload = false;
             cparams.flash_attn_type = ffi::llama_flash_attn_type_LLAMA_FLASH_ATTN_TYPE_DISABLED;
         }
-        let mut requested_devices =
-            resolve_requested_devices().map_err(|err| RuntimeError::Embed(err.to_string()))?;
-        if let Some(devices) = requested_devices.as_mut() {
+        let mut legacy_requested_devices = resolve_legacy_requested_devices()?;
+        if let Some(devices) = legacy_requested_devices.as_mut() {
             mparams.devices = devices.as_mut_ptr();
         }
 
@@ -93,6 +84,8 @@ impl ModelHandle {
             };
             max_overrides.max(1)
         ];
+
+        common.fill_fit_buffers(&mut tensor_split, &mut tensor_buft_overrides, &mut margins)?;
 
         mparams.tensor_split = tensor_split.as_ptr();
         mparams.tensor_buft_overrides = tensor_buft_overrides.as_ptr();
@@ -186,6 +179,8 @@ impl ModelHandle {
             base_context_params: cparams,
             has_encoder,
             has_decoder,
+            context_shift_enabled: common.context_shift_enabled(),
+            context_shift_n_keep: legacy_keep_tokens_override(common.context_shift_n_keep()),
         })
     }
 
@@ -211,6 +206,25 @@ impl ModelHandle {
 
     pub(crate) fn context_params(&self) -> ffi::llama_context_params {
         self.base_context_params
+    }
+
+    pub(crate) fn context_shift_enabled(&self) -> bool {
+        legacy_context_shift_override(self.context_shift_enabled)
+    }
+
+    pub(crate) fn context_shift_keep_tokens(
+        &self,
+        prompt_tokens: usize,
+        n_ctx_seq: usize,
+    ) -> usize {
+        let keep = if self.context_shift_n_keep < 0 {
+            prompt_tokens
+        } else {
+            usize::try_from(self.context_shift_n_keep)
+                .unwrap_or(usize::MAX)
+                .min(prompt_tokens)
+        };
+        keep.min(n_ctx_seq.saturating_sub(4))
     }
 
     pub(crate) fn apply_chat_template(
@@ -307,10 +321,185 @@ impl Drop for ModelHandle {
     }
 }
 
-fn resolve_requested_devices() -> Result<Option<Vec<ffi::ggml_backend_dev_t>>, RuntimeError> {
-    let requested = std::env::var("LLAMA_ARG_DEVICE")
+#[derive(Debug)]
+struct CommonParamsBridge {
+    ptr: *mut std::ffi::c_void,
+}
+
+impl CommonParamsBridge {
+    fn new() -> Result<Self, RuntimeError> {
+        let ptr = unsafe {
+            // SAFETY: constructor is pure and returns a new owned bridge handle or null on failure.
+            bridge::autocommit_common_config_new()
+        };
+        if ptr.is_null() {
+            return Err(RuntimeError::Embed(
+                "failed to allocate common_params bridge".to_string(),
+            ));
+        }
+        Ok(Self { ptr })
+    }
+
+    fn set_model_path(&mut self, model_path: &Path) -> Result<(), RuntimeError> {
+        let model_path = CString::new(model_path.to_string_lossy().as_bytes()).map_err(|_| {
+            RuntimeError::Embed(format!(
+                "embedding model path contains interior NUL: {}",
+                model_path.display()
+            ))
+        })?;
+        unsafe {
+            // SAFETY: bridge handle is valid and model_path is a live NUL-terminated string.
+            bridge::autocommit_common_config_set_model_path(self.ptr, model_path.as_ptr());
+        }
+        Ok(())
+    }
+
+    fn set_n_parallel(&mut self, n_parallel: i32) {
+        unsafe {
+            // SAFETY: bridge handle is valid and the setter is side-effect free outside the handle.
+            bridge::autocommit_common_config_set_n_parallel(self.ptr, n_parallel);
+        }
+    }
+
+    fn apply_env(&mut self) -> Result<(), RuntimeError> {
+        let mut err_buf = vec![0i8; 512];
+        let ok = unsafe {
+            // SAFETY: bridge handle and output buffer are valid.
+            bridge::autocommit_common_config_apply_env(
+                self.ptr,
+                err_buf.as_mut_ptr(),
+                err_buf.len(),
+            )
+        };
+        if ok == 0 {
+            return Err(RuntimeError::Embed(format!(
+                "failed to apply common_params env options: {}",
+                err_buf_to_string(&err_buf)
+            )));
+        }
+        Ok(())
+    }
+
+    fn export_llama_params(
+        &mut self,
+    ) -> Result<(ffi::llama_model_params, ffi::llama_context_params), RuntimeError> {
+        let mut mparams = unsafe {
+            // SAFETY: pure default parameter initialization.
+            ffi::llama_model_default_params()
+        };
+        let mut cparams = unsafe {
+            // SAFETY: pure default parameter initialization.
+            ffi::llama_context_default_params()
+        };
+        let mut err_buf = vec![0i8; 512];
+        let ok = unsafe {
+            // SAFETY: bridge handle and output parameter pointers are valid.
+            bridge::autocommit_common_config_export_llama_params(
+                self.ptr,
+                &mut mparams,
+                &mut cparams,
+                err_buf.as_mut_ptr(),
+                err_buf.len(),
+            )
+        };
+        if ok == 0 {
+            return Err(RuntimeError::Embed(format!(
+                "failed to export llama params from common_params: {}",
+                err_buf_to_string(&err_buf)
+            )));
+        }
+        Ok((mparams, cparams))
+    }
+
+    fn fill_fit_buffers(
+        &mut self,
+        tensor_split: &mut [f32],
+        tensor_buft_overrides: &mut [ffi::llama_model_tensor_buft_override],
+        margins: &mut [usize],
+    ) -> Result<(), RuntimeError> {
+        let mut err_buf = vec![0i8; 512];
+        let ok = unsafe {
+            // SAFETY: bridge handle and all mutable slices are valid buffers.
+            bridge::autocommit_common_config_fill_fit_buffers(
+                self.ptr,
+                tensor_split.as_mut_ptr(),
+                tensor_split.len(),
+                tensor_buft_overrides.as_mut_ptr(),
+                tensor_buft_overrides.len(),
+                margins.as_mut_ptr(),
+                margins.len(),
+                err_buf.as_mut_ptr(),
+                err_buf.len(),
+            )
+        };
+        if ok == 0 {
+            return Err(RuntimeError::Embed(format!(
+                "failed to prepare llama_params_fit buffers from common_params: {}",
+                err_buf_to_string(&err_buf)
+            )));
+        }
+        Ok(())
+    }
+
+    fn context_shift_enabled(&self) -> bool {
+        let enabled = unsafe {
+            // SAFETY: bridge handle is valid for the lifetime of this wrapper.
+            bridge::autocommit_common_config_ctx_shift_enabled(self.ptr)
+        };
+        enabled != 0
+    }
+
+    fn context_shift_n_keep(&self) -> i32 {
+        unsafe {
+            // SAFETY: bridge handle is valid for the lifetime of this wrapper.
+            bridge::autocommit_common_config_n_keep(self.ptr)
+        }
+    }
+}
+
+impl Drop for CommonParamsBridge {
+    fn drop(&mut self) {
+        unsafe {
+            // SAFETY: pointer is owned by this wrapper and must be freed exactly once.
+            bridge::autocommit_common_config_free(self.ptr);
+        }
+    }
+}
+
+fn err_buf_to_string(err_buf: &[i8]) -> String {
+    unsafe {
+        // SAFETY: bridge writes a NUL-terminated C string into err_buf on failure.
+        CStr::from_ptr(err_buf.as_ptr())
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+
+fn legacy_context_shift_override(common_default: bool) -> bool {
+    match std::env::var("AUTOCOMMIT_CTX_SHIFT")
         .ok()
-        .or_else(|| std::env::var("AUTOCOMMIT_LLAMA_DEVICE").ok());
+        .as_deref()
+        .map(str::trim)
+    {
+        Some(v) if matches!(v, "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON") => true,
+        Some(v) if matches!(v, "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF") => false,
+        _ => common_default,
+    }
+}
+
+fn legacy_keep_tokens_override(common_default: i32) -> i32 {
+    std::env::var("AUTOCOMMIT_CTX_KEEP")
+        .ok()
+        .and_then(|raw| raw.parse::<i32>().ok())
+        .unwrap_or(common_default)
+}
+
+fn resolve_legacy_requested_devices() -> Result<Option<Vec<ffi::ggml_backend_dev_t>>, RuntimeError>
+{
+    if std::env::var("LLAMA_ARG_DEVICE").is_ok() {
+        return Ok(None);
+    }
+    let requested = std::env::var("AUTOCOMMIT_LLAMA_DEVICE").ok();
     let Some(raw) = requested else {
         return Ok(None);
     };
@@ -322,7 +511,7 @@ fn resolve_requested_devices() -> Result<Option<Vec<ffi::ggml_backend_dev_t>>, R
         .collect::<Vec<_>>();
     if entries.is_empty() {
         return Err(RuntimeError::Embed(
-            "LLAMA_ARG_DEVICE/AUTOCOMMIT_LLAMA_DEVICE is empty".to_string(),
+            "AUTOCOMMIT_LLAMA_DEVICE is empty".to_string(),
         ));
     }
 
@@ -376,7 +565,7 @@ fn resolve_requested_devices() -> Result<Option<Vec<ffi::ggml_backend_dev_t>>, R
                 .collect::<Vec<_>>()
                 .join(",");
             return Err(RuntimeError::Embed(format!(
-                "invalid device '{target}' in LLAMA_ARG_DEVICE/AUTOCOMMIT_LLAMA_DEVICE (available: {choices})"
+                "invalid device '{target}' in AUTOCOMMIT_LLAMA_DEVICE (available: {choices})"
             )));
         };
         out.push(*dev);

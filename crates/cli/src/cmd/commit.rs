@@ -6,6 +6,7 @@ use std::process::Command;
 use autocommit_core::AnalysisReport;
 use autocommit_core::llm::traits::LlmEngine;
 use autocommit_core::{AnalyzeOptions, CoreError, run as core_run};
+use clap::Parser;
 use dialoguer::console::{Term, style};
 use dialoguer::{Confirm, Editor, Select, theme::ColorfulTheme};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -25,17 +26,31 @@ use autocommit_core::types::{
 };
 
 pub fn run(args: &[String]) -> Result<String, String> {
-    let mut staged_only = false;
-    let mut push = false;
-    let mut dry_run = false;
-    let mut json = false;
-    let mut no_verify = false;
-    let mut configure_commit_policy = false;
-    let mut interactive_override: Option<bool> = None;
-    let mut assume_yes = false;
-    let mut model_path: Option<String> = None;
-    let mut model_hf_repo: Option<String> = None;
-    let mut model_cache_dir: Option<String> = None;
+    let parsed = match CommitArgs::parse_from(args)? {
+        ParseOutcome::Continue(parsed) => parsed,
+        ParseOutcome::EarlyExit(text) => return Ok(text),
+    };
+
+    let staged_only = parsed.staged;
+    let push = parsed.push;
+    let dry_run = parsed.dry_run;
+    let json = parsed.json;
+    let no_verify = parsed.no_verify;
+    let configure_commit_policy = parsed.configure_commit_policy;
+    let interactive_override = if parsed.interactive {
+        Some(true)
+    } else if parsed.no_interactive {
+        Some(false)
+    } else {
+        None
+    };
+    let assume_yes = parsed.yes;
+    #[allow(unused_mut)]
+    let mut model_path = parsed.model_path;
+    #[allow(unused_mut)]
+    let mut model_hf_repo = parsed.hf_repo;
+    #[allow(unused_mut)]
+    let mut model_cache_dir = parsed.cache_dir;
     #[cfg(feature = "llama-native")]
     let mut runtime_profile = "auto".to_string();
     #[cfg(feature = "llama-native")]
@@ -43,57 +58,16 @@ pub fn run(args: &[String]) -> Result<String, String> {
     #[cfg(not(feature = "llama-native"))]
     let runtime_profile = "mock".to_string();
 
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--staged" | "-s" => staged_only = true,
-            "--push" | "-p" => push = true,
-            "--dry-run" => dry_run = true,
-            "--json" => json = true,
-            "--no-verify" => no_verify = true,
-            "--configure-commit-policy" => configure_commit_policy = true,
-            "--interactive" => interactive_override = Some(true),
-            "--no-interactive" => interactive_override = Some(false),
-            "--yes" | "-y" => assume_yes = true,
-            "--model-path" => {
-                let path = args
-                    .get(i + 1)
-                    .ok_or_else(|| "--model-path requires a path".to_string())?;
-                model_path = Some(path.clone());
-                i += 1;
-            }
-            "--hf-repo" => {
-                let repo = args
-                    .get(i + 1)
-                    .ok_or_else(|| "--hf-repo requires a value".to_string())?;
-                model_hf_repo = Some(repo.clone());
-                i += 1;
-            }
-            "--cache-dir" => {
-                let value = args
-                    .get(i + 1)
-                    .ok_or_else(|| "--cache-dir requires a value".to_string())?;
-                model_cache_dir = Some(value.clone());
-                i += 1;
-            }
-            "--profile" => {
-                let profile = args
-                    .get(i + 1)
-                    .ok_or_else(|| "--profile requires a value".to_string())?;
-                #[cfg(feature = "llama-native")]
-                {
-                    runtime_profile = profile.clone();
-                    runtime_profile_overridden = true;
-                }
-                #[cfg(not(feature = "llama-native"))]
-                {
-                    let _ = profile;
-                }
-                i += 1;
-            }
-            flag => return Err(format!("unknown commit option: {flag}")),
+    if let Some(profile) = parsed.profile {
+        #[cfg(feature = "llama-native")]
+        {
+            runtime_profile = profile;
+            runtime_profile_overridden = true;
         }
-        i += 1;
+        #[cfg(not(feature = "llama-native"))]
+        {
+            let _ = profile;
+        }
     }
 
     if model_path.is_some() && model_hf_repo.is_some() {
@@ -444,6 +418,76 @@ where
     }
 
     result
+}
+
+enum ParseOutcome<T> {
+    Continue(T),
+    EarlyExit(String),
+}
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "autocommit-cli commit",
+    about = "Generate and create a commit message from local repository changes"
+)]
+struct CommitArgs {
+    /// Use staged changes only
+    #[arg(long, short = 's')]
+    staged: bool,
+    /// Push commit after creation
+    #[arg(long, short = 'p')]
+    push: bool,
+    /// Preview output without creating a commit
+    #[arg(long = "dry-run")]
+    dry_run: bool,
+    /// Render output as JSON and disable interactive mode
+    #[arg(long)]
+    json: bool,
+    /// Skip git hooks
+    #[arg(long = "no-verify")]
+    no_verify: bool,
+    /// Reconfigure repository commit policy before commit
+    #[arg(long = "configure-commit-policy")]
+    configure_commit_policy: bool,
+    /// Force interactive UI
+    #[arg(long, conflicts_with = "no_interactive")]
+    interactive: bool,
+    /// Disable interactive UI
+    #[arg(long = "no-interactive", conflicts_with = "interactive")]
+    no_interactive: bool,
+    /// Assume yes for confirmations
+    #[arg(long, short = 'y')]
+    yes: bool,
+    /// Explicit local model path (`.gguf`)
+    #[arg(long = "model-path", value_name = "PATH")]
+    model_path: Option<String>,
+    /// Hugging Face model repo (`org/model` or `org/model:file`)
+    #[arg(long = "hf-repo", value_name = "REPO")]
+    hf_repo: Option<String>,
+    /// Override llama.cpp model cache directory
+    #[arg(long = "cache-dir", value_name = "PATH")]
+    cache_dir: Option<String>,
+    /// Runtime profile (`auto`, etc.)
+    #[arg(long = "profile", value_name = "PROFILE")]
+    profile: Option<String>,
+}
+
+impl CommitArgs {
+    fn parse_from(args: &[String]) -> Result<ParseOutcome<Self>, String> {
+        let argv = std::iter::once("autocommit-cli commit".to_string()).chain(args.iter().cloned());
+        match Self::try_parse_from(argv) {
+            Ok(parsed) => Ok(ParseOutcome::Continue(parsed)),
+            Err(err) => {
+                use clap::error::ErrorKind;
+                match err.kind() {
+                    ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => {
+                        Ok(ParseOutcome::EarlyExit(err.to_string()))
+                    }
+                    _ => Err(err.to_string()),
+                }
+            }
+        }
+    }
 }
 
 fn spinner_style() -> ProgressStyle {

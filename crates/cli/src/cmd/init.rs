@@ -11,6 +11,8 @@ use std::io::IsTerminal;
 #[cfg(feature = "llama-native")]
 use std::path::PathBuf;
 
+use clap::Parser;
+
 #[cfg(feature = "llama-native")]
 use crate::cmd::repo_cache::{
     RepoKvMetadata, discover_repo_kv_paths, ensure_cache_dir, write_metadata,
@@ -19,50 +21,16 @@ use crate::cmd::repo_cache::{
 use crate::cmd::{commit_policy, commit_policy::CommitPolicy};
 
 pub fn run(args: &[String]) -> Result<String, String> {
-    let mut model_path: Option<String> = None;
-    let mut model_hf_repo: Option<String> = None;
-    let mut model_cache_dir: Option<String> = None;
-    let mut list_cached_models = false;
-    let mut runtime_profile = "auto".to_string();
-    let mut assume_yes = false;
-
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--yes" | "-y" => assume_yes = true,
-            "--model-path" => {
-                let path = args
-                    .get(i + 1)
-                    .ok_or_else(|| "--model-path requires a path".to_string())?;
-                model_path = Some(path.clone());
-                i += 1;
-            }
-            "--hf-repo" => {
-                let repo = args
-                    .get(i + 1)
-                    .ok_or_else(|| "--hf-repo requires a value".to_string())?;
-                model_hf_repo = Some(repo.clone());
-                i += 1;
-            }
-            "--cache-dir" => {
-                let value = args
-                    .get(i + 1)
-                    .ok_or_else(|| "--cache-dir requires a value".to_string())?;
-                model_cache_dir = Some(value.clone());
-                i += 1;
-            }
-            "--list-cached-models" | "--cache-list" => list_cached_models = true,
-            "--profile" => {
-                let profile = args
-                    .get(i + 1)
-                    .ok_or_else(|| "--profile requires a value".to_string())?;
-                runtime_profile = profile.clone();
-                i += 1;
-            }
-            flag => return Err(format!("unknown init option: {flag}")),
-        }
-        i += 1;
-    }
+    let parsed = match InitArgs::parse_from(args)? {
+        ParseOutcome::Continue(parsed) => parsed,
+        ParseOutcome::EarlyExit(text) => return Ok(text),
+    };
+    let model_path = parsed.model_path;
+    let model_hf_repo = parsed.hf_repo;
+    let model_cache_dir = parsed.cache_dir;
+    let list_cached_models = parsed.list_cached_models;
+    let runtime_profile = parsed.profile.unwrap_or_else(|| "auto".to_string());
+    let assume_yes = parsed.yes;
 
     if model_path.is_some() && model_hf_repo.is_some() {
         return Err("use either `--model-path` or `--hf-repo`, not both".to_string());
@@ -86,6 +54,55 @@ pub fn run(args: &[String]) -> Result<String, String> {
     {
         let _ = (runtime_profile, assume_yes);
         Err("init requires llama-native feature at build time".to_string())
+    }
+}
+
+enum ParseOutcome<T> {
+    Continue(T),
+    EarlyExit(String),
+}
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "autocommit-cli init",
+    about = "Initialize per-repository runtime cache and policy settings"
+)]
+struct InitArgs {
+    /// Accept defaults and skip interactive prompts
+    #[arg(long, short = 'y')]
+    yes: bool,
+    /// Explicit local model path (`.gguf`)
+    #[arg(long = "model-path", value_name = "PATH")]
+    model_path: Option<String>,
+    /// Hugging Face model repo (`org/model` or `org/model:file`)
+    #[arg(long = "hf-repo", value_name = "REPO")]
+    hf_repo: Option<String>,
+    /// Override llama.cpp model cache directory
+    #[arg(long = "cache-dir", value_name = "PATH")]
+    cache_dir: Option<String>,
+    /// List models in the configured cache and exit
+    #[arg(long = "list-cached-models", alias = "cache-list")]
+    list_cached_models: bool,
+    /// Runtime profile (`auto`, etc.)
+    #[arg(long = "profile", value_name = "PROFILE")]
+    profile: Option<String>,
+}
+
+impl InitArgs {
+    fn parse_from(args: &[String]) -> Result<ParseOutcome<Self>, String> {
+        let argv = std::iter::once("autocommit-cli init".to_string()).chain(args.iter().cloned());
+        match Self::try_parse_from(argv) {
+            Ok(parsed) => Ok(ParseOutcome::Continue(parsed)),
+            Err(err) => {
+                use clap::error::ErrorKind;
+                match err.kind() {
+                    ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => {
+                        Ok(ParseOutcome::EarlyExit(err.to_string()))
+                    }
+                    _ => Err(err.to_string()),
+                }
+            }
+        }
     }
 }
 

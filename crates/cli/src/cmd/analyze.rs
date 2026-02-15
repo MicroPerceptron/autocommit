@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use autocommit_core::llm::traits::LlmEngine;
 use autocommit_core::{AnalyzeOptions, CoreError, run as core_run};
+use clap::Parser;
 
 #[cfg(feature = "llama-native")]
 use crate::cmd::repo_cache;
@@ -18,11 +19,19 @@ use autocommit_core::types::{
 };
 
 pub fn run(args: &[String]) -> Result<String, String> {
-    let mut json = false;
-    let mut diff_file: Option<String> = None;
-    let mut model_path: Option<String> = None;
-    let mut model_hf_repo: Option<String> = None;
-    let mut model_cache_dir: Option<String> = None;
+    let parsed = match AnalyzeArgs::parse_from(args)? {
+        ParseOutcome::Continue(parsed) => parsed,
+        ParseOutcome::EarlyExit(text) => return Ok(text),
+    };
+
+    let json = parsed.json;
+    let diff_file = parsed.diff_file;
+    #[allow(unused_mut)]
+    let mut model_path = parsed.model_path;
+    #[allow(unused_mut)]
+    let mut model_hf_repo = parsed.hf_repo;
+    #[allow(unused_mut)]
+    let mut model_cache_dir = parsed.cache_dir;
     #[cfg(feature = "llama-native")]
     let mut runtime_profile = "auto".to_string();
     #[cfg(feature = "llama-native")]
@@ -30,56 +39,16 @@ pub fn run(args: &[String]) -> Result<String, String> {
     #[cfg(not(feature = "llama-native"))]
     let runtime_profile = "mock".to_string();
 
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--json" => json = true,
-            "--diff-file" => {
-                let path = args
-                    .get(i + 1)
-                    .ok_or_else(|| "--diff-file requires a path".to_string())?;
-                diff_file = Some(path.clone());
-                i += 1;
-            }
-            "--model-path" => {
-                let path = args
-                    .get(i + 1)
-                    .ok_or_else(|| "--model-path requires a path".to_string())?;
-                model_path = Some(path.clone());
-                i += 1;
-            }
-            "--hf-repo" => {
-                let repo = args
-                    .get(i + 1)
-                    .ok_or_else(|| "--hf-repo requires a value".to_string())?;
-                model_hf_repo = Some(repo.clone());
-                i += 1;
-            }
-            "--cache-dir" => {
-                let value = args
-                    .get(i + 1)
-                    .ok_or_else(|| "--cache-dir requires a value".to_string())?;
-                model_cache_dir = Some(value.clone());
-                i += 1;
-            }
-            "--profile" => {
-                let profile = args
-                    .get(i + 1)
-                    .ok_or_else(|| "--profile requires a value".to_string())?;
-                #[cfg(feature = "llama-native")]
-                {
-                    runtime_profile = profile.clone();
-                    runtime_profile_overridden = true;
-                }
-                #[cfg(not(feature = "llama-native"))]
-                {
-                    let _ = profile;
-                }
-                i += 1;
-            }
-            flag => return Err(format!("unknown analyze option: {flag}")),
+    if let Some(profile) = parsed.profile {
+        #[cfg(feature = "llama-native")]
+        {
+            runtime_profile = profile;
+            runtime_profile_overridden = true;
         }
-        i += 1;
+        #[cfg(not(feature = "llama-native"))]
+        {
+            let _ = profile;
+        }
     }
 
     if model_path.is_some() && model_hf_repo.is_some() {
@@ -185,6 +154,56 @@ fn load_diff(diff_file: Option<&str>) -> Result<String, CoreError> {
     }
 
     read_git_diff()
+}
+
+enum ParseOutcome<T> {
+    Continue(T),
+    EarlyExit(String),
+}
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "autocommit-cli analyze",
+    about = "Analyze staged/worktree changes and emit a structured report"
+)]
+struct AnalyzeArgs {
+    /// Render output as JSON
+    #[arg(long)]
+    json: bool,
+    /// Read unified diff text from a file instead of git
+    #[arg(long = "diff-file", value_name = "PATH")]
+    diff_file: Option<String>,
+    /// Explicit local model path (`.gguf`)
+    #[arg(long = "model-path", value_name = "PATH")]
+    model_path: Option<String>,
+    /// Hugging Face model repo (`org/model` or `org/model:file`)
+    #[arg(long = "hf-repo", value_name = "REPO")]
+    hf_repo: Option<String>,
+    /// Override llama.cpp model cache directory
+    #[arg(long = "cache-dir", value_name = "PATH")]
+    cache_dir: Option<String>,
+    /// Runtime profile (`auto`, etc.)
+    #[arg(long = "profile", value_name = "PROFILE")]
+    profile: Option<String>,
+}
+
+impl AnalyzeArgs {
+    fn parse_from(args: &[String]) -> Result<ParseOutcome<Self>, String> {
+        let argv =
+            std::iter::once("autocommit-cli analyze".to_string()).chain(args.iter().cloned());
+        match Self::try_parse_from(argv) {
+            Ok(parsed) => Ok(ParseOutcome::Continue(parsed)),
+            Err(err) => {
+                use clap::error::ErrorKind;
+                match err.kind() {
+                    ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => {
+                        Ok(ParseOutcome::EarlyExit(err.to_string()))
+                    }
+                    _ => Err(err.to_string()),
+                }
+            }
+        }
+    }
 }
 
 fn read_git_diff() -> Result<String, CoreError> {

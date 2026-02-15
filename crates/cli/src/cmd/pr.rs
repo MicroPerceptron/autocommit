@@ -164,6 +164,22 @@ pub fn run(args: &[String]) -> Result<String, String> {
         return Err("generated pull request title is empty".to_string());
     }
 
+    let (base, head) = resolve_pr_branches(
+        &repo,
+        base,
+        head,
+        interactive,
+        rich_interactive,
+    )?;
+
+    let draft = if draft {
+        true
+    } else if interactive && !assume_yes {
+        prompt_should_draft(rich_interactive)?
+    } else {
+        false
+    };
+
     if dry_run {
         return Ok(render_dry_run(
             &generated_title,
@@ -416,6 +432,32 @@ fn prompt_should_push(rich: bool) -> Result<bool, String> {
     }
 }
 
+fn prompt_should_draft(rich: bool) -> Result<bool, String> {
+    if rich {
+        return Confirm::with_theme(&ColorfulTheme::default())
+            .with_prompt("Create as draft pull request?")
+            .default(false)
+            .interact_on(&Term::stderr())
+            .map_err(|err| format!("failed to read draft confirmation: {err}"));
+    }
+
+    loop {
+        print!("Create as draft pull request? [y/N]: ");
+        std::io::stdout()
+            .flush()
+            .map_err(|err| format!("failed to flush prompt output: {err}"))?;
+        let value = read_line_trimmed()?;
+        if value.is_empty() {
+            return Ok(false);
+        }
+        match value.to_ascii_lowercase().as_str() {
+            "y" | "yes" => return Ok(true),
+            "n" | "no" => return Ok(false),
+            _ => println!("invalid choice, enter y or n"),
+        }
+    }
+}
+
 fn print_pr_preview(title: &str, body: &str, rich: bool) {
     if !rich {
         println!("\nProposed pull request:\n\n{title}\n\n{body}\n");
@@ -455,6 +497,156 @@ fn read_line_trimmed() -> Result<String, String> {
         return Err("interactive input was closed".to_string());
     }
     Ok(buffer.trim().to_string())
+}
+
+fn resolve_pr_branches(
+    repo: &git::Repo,
+    base: Option<String>,
+    head: Option<String>,
+    interactive: bool,
+    rich: bool,
+) -> Result<(Option<String>, Option<String>), String> {
+    if base.is_some() && head.is_some() {
+        if base == head {
+            return Err("base and head branches cannot be the same".to_string());
+        }
+        return Ok((base, head));
+    }
+
+    let branches = collect_branch_options(repo)?;
+    let current_branch = repo.current_branch().map_err(|err| err.to_string())?;
+
+    let base = match base {
+        Some(value) => Some(value),
+        None => {
+            let default = pick_default_base(&branches);
+            if interactive {
+                Some(prompt_for_branch(
+                    "Select base branch",
+                    &branches,
+                    default.as_deref(),
+                    rich,
+                )?)
+            } else {
+                default.or_else(|| current_branch.clone())
+            }
+        }
+    };
+
+    let head = match head {
+        Some(value) => Some(value),
+        None => {
+            if interactive {
+                Some(prompt_for_branch(
+                    "Select head branch",
+                    &branches,
+                    current_branch.as_deref(),
+                    rich,
+                )?)
+            } else {
+                current_branch.clone()
+            }
+        }
+    };
+
+    if base.is_none() || head.is_none() {
+        return Err("unable to resolve base/head branch; pass --base and --head".to_string());
+    }
+    if base == head {
+        return Err("base and head branches cannot be the same".to_string());
+    }
+
+    Ok((base, head))
+}
+
+fn pick_default_base(branches: &[String]) -> Option<String> {
+    for candidate in ["main", "master", "trunk", "develop"] {
+        if branches.iter().any(|branch| branch == candidate) {
+            return Some(candidate.to_string());
+        }
+        let remote_candidate = format!("origin/{candidate}");
+        if branches.iter().any(|branch| branch == &remote_candidate) {
+            return Some(remote_candidate);
+        }
+    }
+    branches.first().cloned()
+}
+
+fn prompt_for_branch(
+    prompt: &str,
+    branches: &[String],
+    default: Option<&str>,
+    rich: bool,
+) -> Result<String, String> {
+    if branches.is_empty() {
+        return prompt_for_branch_manual(prompt);
+    }
+
+    let mut options = branches.to_vec();
+    options.push("Enter manually".to_string());
+    let default_index = default
+        .and_then(|value| options.iter().position(|opt| opt == value))
+        .unwrap_or(0);
+
+    if rich {
+        let selection = Select::with_theme(&ColorfulTheme::default())
+            .with_prompt(prompt)
+            .items(&options)
+            .default(default_index)
+            .interact_on_opt(&Term::stderr())
+            .map_err(|err| format!("failed to read branch selection: {err}"))?;
+
+        match selection {
+            Some(index) if index < branches.len() => Ok(options[index].clone()),
+            Some(_) => prompt_for_branch_manual(prompt),
+            None => prompt_for_branch_manual(prompt),
+        }
+    } else {
+        println!("{prompt}:");
+        for (idx, option) in options.iter().enumerate() {
+            println!("  [{}] {}", idx + 1, option);
+        }
+        print!("Select branch [1-{}]: ", options.len());
+        std::io::stdout()
+            .flush()
+            .map_err(|err| format!("failed to flush prompt output: {err}"))?;
+        let value = read_line_trimmed()?;
+        let index = value.parse::<usize>().unwrap_or(0);
+        if index == 0 || index > options.len() {
+            return Err("invalid branch selection".to_string());
+        }
+        if index - 1 < branches.len() {
+            Ok(options[index - 1].clone())
+        } else {
+            prompt_for_branch_manual(prompt)
+        }
+    }
+}
+
+fn collect_branch_options(repo: &git::Repo) -> Result<Vec<String>, String> {
+    let mut branches = repo.local_branches().map_err(|err| err.to_string())?;
+    let remotes = repo.remote_branches().map_err(|err| err.to_string())?;
+    for remote in remotes {
+        if !branches.contains(&remote) {
+            branches.push(remote);
+        }
+    }
+    branches.sort();
+    Ok(branches)
+}
+
+fn prompt_for_branch_manual(prompt: &str) -> Result<String, String> {
+    loop {
+        print!("{prompt} (manual entry): ");
+        std::io::stdout()
+            .flush()
+            .map_err(|err| format!("failed to flush prompt output: {err}"))?;
+        let value = read_line_trimmed()?;
+        if !value.is_empty() {
+            return Ok(value);
+        }
+        println!("branch name cannot be empty");
+    }
 }
 
 fn prepare_diff(repo: &git::Repo, staged_only: bool, dry_run: bool) -> Result<String, CoreError> {

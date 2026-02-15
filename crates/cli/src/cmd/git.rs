@@ -160,6 +160,80 @@ impl Repo {
         Err(CoreError::Io(format!("git push failed: {detail}")))
     }
 
+    pub(crate) fn current_branch(&self) -> Result<Option<String>, CoreError> {
+        let repo_root = self.repo_root();
+        let output = Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .current_dir(&repo_root)
+            .output()
+            .map_err(|err| CoreError::Io(format!("failed to run git rev-parse: {err}")))?;
+
+        if !output.status.success() {
+            return Err(CoreError::Io(format!(
+                "git rev-parse failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+
+        let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if name.is_empty() || name == "HEAD" {
+            Ok(None)
+        } else {
+            Ok(Some(name))
+        }
+    }
+
+    pub(crate) fn local_branches(&self) -> Result<Vec<String>, CoreError> {
+        let repo_root = self.repo_root();
+        let output = Command::new("git")
+            .args(["for-each-ref", "refs/heads", "--format=%(refname:short)"])
+            .current_dir(&repo_root)
+            .output()
+            .map_err(|err| CoreError::Io(format!("failed to run git for-each-ref: {err}")))?;
+
+        if !output.status.success() {
+            return Err(CoreError::Io(format!(
+                "git for-each-ref failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut branches = stdout
+            .lines()
+            .map(|line| line.trim().to_string())
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>();
+        branches.sort();
+        Ok(branches)
+    }
+
+    pub(crate) fn remote_branches(&self) -> Result<Vec<String>, CoreError> {
+        let repo_root = self.repo_root();
+        let output = Command::new("git")
+            .args(["for-each-ref", "refs/remotes", "--format=%(refname:short)"])
+            .current_dir(&repo_root)
+            .output()
+            .map_err(|err| CoreError::Io(format!("failed to run git for-each-ref: {err}")))?;
+
+        if !output.status.success() {
+            return Err(CoreError::Io(format!(
+                "git for-each-ref failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut branches = stdout
+            .lines()
+            .map(|line| line.trim().to_string())
+            .filter(|line| !line.is_empty())
+            .filter(|line| !line.ends_with("/HEAD"))
+            .collect::<Vec<_>>();
+        branches.sort();
+        Ok(branches)
+    }
+
     fn tree_id_for_index(&self) -> Result<gix::hash::ObjectId, CoreError> {
         let index = self
             .inner

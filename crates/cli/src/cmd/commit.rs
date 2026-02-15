@@ -544,7 +544,7 @@ fn compose_commit_message(report: &AnalysisReport) -> String {
         return String::new();
     }
 
-    let body = compose_commit_body(report);
+    let body = compose_commit_body(report, subject);
     if body.is_empty() {
         subject.to_string()
     } else {
@@ -552,11 +552,11 @@ fn compose_commit_message(report: &AnalysisReport) -> String {
     }
 }
 
-fn compose_commit_body(report: &AnalysisReport) -> String {
+fn compose_commit_body(report: &AnalysisReport, subject: &str) -> String {
     let mut sections = Vec::new();
 
     let summary = report.summary.trim();
-    if !summary.is_empty() {
+    if should_include_summary(summary, subject) {
         sections.push(summary.to_string());
     }
 
@@ -571,6 +571,73 @@ fn compose_commit_body(report: &AnalysisReport) -> String {
     }
 
     sections.join("\n\n")
+}
+
+fn should_include_summary(summary: &str, subject: &str) -> bool {
+    if summary.is_empty() {
+        return false;
+    }
+
+    let summary_norm = normalize_for_compare(summary_subject(summary));
+    let subject_norm = normalize_for_compare(subject_description(subject));
+    if summary_norm.is_empty() || subject_norm.is_empty() {
+        return true;
+    }
+
+    if summary_norm == subject_norm {
+        return false;
+    }
+
+    !(summary_norm.starts_with(&subject_norm) || subject_norm.starts_with(&summary_norm))
+}
+
+fn subject_description(subject: &str) -> &str {
+    if let Some((_, desc)) = subject.split_once(':') {
+        return desc.trim();
+    }
+    subject.trim()
+}
+
+fn summary_subject(summary: &str) -> &str {
+    let summary = summary.trim();
+    let Some((label, rest)) = summary.split_once(':') else {
+        return summary;
+    };
+
+    let label = label.trim().to_ascii_lowercase();
+    if matches!(
+        label.as_str(),
+        "feat"
+            | "feature"
+            | "fix"
+            | "refactor"
+            | "docs"
+            | "doc"
+            | "test"
+            | "chore"
+            | "perf"
+            | "style"
+    ) {
+        rest.trim()
+    } else {
+        summary
+    }
+}
+
+fn normalize_for_compare(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn compose_changes_section(report: &AnalysisReport) -> String {
@@ -934,6 +1001,19 @@ mod tests {
 
         let message = compose_commit_message(&report);
         assert_eq!(message, "feat(core): add detailed commit composition");
+    }
+
+    #[test]
+    fn compose_commit_message_omits_duplicate_summary_from_body() {
+        let mut report = sample_report();
+        report.commit_message = "refactor(core): simplify reduction logic".to_string();
+        report.summary = "Refactor: simplify reduction logic".to_string();
+        report.items.clear();
+        report.risk.level.clear();
+        report.risk.notes.clear();
+
+        let message = compose_commit_message(&report);
+        assert_eq!(message, "refactor(core): simplify reduction logic");
     }
 
     #[test]

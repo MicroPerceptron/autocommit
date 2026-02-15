@@ -143,6 +143,85 @@ impl ContextHandle {
         }
     }
 
+    fn context_can_shift(&self) -> bool {
+        let mem = unsafe {
+            // SAFETY: self.ptr is a live context pointer while ContextHandle is alive.
+            ffi::llama_get_memory(self.ptr)
+        };
+        if mem.is_null() {
+            return false;
+        }
+        unsafe {
+            // SAFETY: memory handle was returned from a live context.
+            ffi::llama_memory_can_shift(mem)
+        }
+    }
+
+    fn try_shift_context_window(
+        &mut self,
+        seq_id: ffi::llama_seq_id,
+        keep_tokens: usize,
+        next_pos: &mut i32,
+        n_ctx_seq: usize,
+    ) -> Result<bool, RuntimeError> {
+        if !context_shift_enabled() || !self.context_can_shift() {
+            return Ok(false);
+        }
+        if (*next_pos as usize) < n_ctx_seq.saturating_sub(1) {
+            return Ok(true);
+        }
+
+        let keep = keep_tokens.min((*next_pos).max(0) as usize);
+        let shiftable = (*next_pos).max(0) as usize;
+        let shiftable = shiftable.saturating_sub(keep);
+        if shiftable <= 1 {
+            return Ok(false);
+        }
+
+        let n_discard = (shiftable / 2).max(1);
+        let pos_keep = i32::try_from(keep)
+            .map_err(|_| RuntimeError::Inference("keep token count exceeds i32".to_string()))?;
+        let pos_discard_end = i32::try_from(keep.saturating_add(n_discard)).map_err(|_| {
+            RuntimeError::Inference("context discard position exceeds i32".to_string())
+        })?;
+        let pos_cur = *next_pos;
+
+        let mem = unsafe {
+            // SAFETY: self.ptr is a live context pointer while ContextHandle is alive.
+            ffi::llama_get_memory(self.ptr)
+        };
+        if mem.is_null() {
+            return Ok(false);
+        }
+
+        let removed = unsafe {
+            // SAFETY: memory handle is valid and sequence id/range are bounded by current context positions.
+            ffi::llama_memory_seq_rm(mem, seq_id, pos_keep, pos_discard_end)
+        };
+        if !removed {
+            return Ok(false);
+        }
+
+        unsafe {
+            // SAFETY: shift the remaining tokens in-place for the same valid sequence.
+            ffi::llama_memory_seq_add(
+                mem,
+                seq_id,
+                pos_discard_end,
+                pos_cur,
+                pos_keep - pos_discard_end,
+            );
+            ffi::llama_synchronize(self.ptr);
+        }
+
+        *next_pos = (*next_pos).saturating_sub(i32::try_from(n_discard).unwrap_or(i32::MAX));
+        if *next_pos < pos_keep {
+            *next_pos = pos_keep;
+        }
+
+        Ok((*next_pos as usize) < n_ctx_seq.saturating_sub(1))
+    }
+
     #[allow(dead_code)]
     pub(crate) fn max_sequences(&self) -> usize {
         self.seq_capacity
@@ -485,15 +564,21 @@ impl ContextHandle {
             // SAFETY: pure context metadata query.
             ffi::llama_n_ctx_seq(self.ptr)
         } as usize;
-        let max_prompt_tokens = n_ctx_seq.saturating_sub(64).clamp(256, 1536);
+        let max_prompt_tokens = n_ctx_seq.saturating_sub(64).max(1);
         if prompt_tokens.len() > max_prompt_tokens {
             prompt_tokens.truncate(max_prompt_tokens);
         }
 
+        let keep_tokens = context_shift_keep_tokens(prompt_tokens.len());
+        let ctx_shift_enabled = context_shift_enabled() && self.context_can_shift();
         let remaining_slots = n_ctx_seq
             .saturating_sub(prompt_tokens.len())
             .saturating_sub(1);
-        let max_tokens = requested_max_tokens.min(remaining_slots);
+        let max_tokens = if ctx_shift_enabled {
+            requested_max_tokens
+        } else {
+            requested_max_tokens.min(remaining_slots)
+        };
         if max_tokens == 0 {
             return Ok(String::new());
         }
@@ -530,7 +615,11 @@ impl ContextHandle {
                 break;
             }
             if (next_pos as usize) >= n_ctx_seq.saturating_sub(1) {
-                break;
+                let shifted =
+                    self.try_shift_context_window(0, keep_tokens, &mut next_pos, n_ctx_seq)?;
+                if !shifted {
+                    break;
+                }
             }
             self.decode_single_token(token, next_pos, 0)?;
             next_pos = next_pos.saturating_add(1);
@@ -585,9 +674,11 @@ impl ContextHandle {
             ));
         }
 
-        let max_prompt_tokens = n_ctx_seq.saturating_sub(64).clamp(256, 1536);
+        let max_prompt_tokens = n_ctx_seq.saturating_sub(64).max(1);
         let mut tokenized = Vec::with_capacity(prompts.len());
         let mut per_seq_budget = Vec::with_capacity(prompts.len());
+        let mut keep_tokens = Vec::with_capacity(prompts.len());
+        let ctx_shift_enabled = context_shift_enabled() && self.context_can_shift();
 
         for (prompt, requested) in prompts.iter().zip(requested_max_tokens.iter().copied()) {
             let mut tokens = self.tokenize(prompt)?;
@@ -599,9 +690,14 @@ impl ContextHandle {
             if tokens.len() > max_prompt_tokens {
                 tokens.truncate(max_prompt_tokens);
             }
+            keep_tokens.push(context_shift_keep_tokens(tokens.len()));
 
             let remaining_slots = n_ctx_seq.saturating_sub(tokens.len()).saturating_sub(1);
-            let budget = requested.min(remaining_slots);
+            let budget = if ctx_shift_enabled {
+                requested
+            } else {
+                requested.min(remaining_slots)
+            };
             tokenized.push(tokens);
             per_seq_budget.push(budget);
         }
@@ -657,10 +753,6 @@ impl ContextHandle {
                     active[seq_idx] = false;
                     continue;
                 }
-                if (next_pos[seq_idx] as usize) >= n_ctx_seq.saturating_sub(1) {
-                    active[seq_idx] = false;
-                    continue;
-                }
 
                 let Some(sampler) = samplers[seq_idx].as_mut() else {
                     active[seq_idx] = false;
@@ -705,6 +797,28 @@ impl ContextHandle {
                 if generated[seq_idx] >= per_seq_budget[seq_idx] {
                     active[seq_idx] = false;
                     continue;
+                }
+                if (next_pos[seq_idx] as usize) >= n_ctx_seq.saturating_sub(1) {
+                    let seq_id = i32::try_from(seq_idx).map_err(|_| {
+                        RuntimeError::Inference("sequence id exceeds i32".to_string())
+                    })?;
+                    match self.try_shift_context_window(
+                        seq_id,
+                        keep_tokens[seq_idx],
+                        &mut next_pos[seq_idx],
+                        n_ctx_seq,
+                    ) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            active[seq_idx] = false;
+                            continue;
+                        }
+                        Err(err) => {
+                            errors[seq_idx] = Some(err);
+                            active[seq_idx] = false;
+                            continue;
+                        }
+                    }
                 }
 
                 pending_decode.push((seq_idx, token));
@@ -1572,6 +1686,23 @@ fn selected_token(cur_p: &ffi::llama_token_data_array) -> Result<ffi::llama_toke
         (*cur_p.data.add(cur_p.selected as usize)).id
     };
     Ok(token)
+}
+
+fn context_shift_enabled() -> bool {
+    std::env::var("LLAMA_ARG_CONTEXT_SHIFT")
+        .ok()
+        .or_else(|| std::env::var("AUTOCOMMIT_CTX_SHIFT").ok())
+        .as_deref()
+        .map(|v| !matches!(v, "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF"))
+        .unwrap_or(true)
+}
+
+fn context_shift_keep_tokens(prompt_tokens: usize) -> usize {
+    let configured = std::env::var("AUTOCOMMIT_CTX_KEEP")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(256);
+    configured.min(prompt_tokens)
 }
 
 impl BatchHandle {

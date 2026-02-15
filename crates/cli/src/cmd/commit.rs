@@ -263,7 +263,10 @@ pub fn run(args: &[String]) -> Result<String, String> {
         report
     } else {
         let progress = if rich_interactive {
-            Some(AnalysisProgress::new(&diff_text))
+            Some(AnalysisProgress::new(
+                &diff_text,
+                "Generating commit analysis",
+            ))
         } else {
             None
         };

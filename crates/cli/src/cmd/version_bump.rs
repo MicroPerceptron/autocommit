@@ -173,9 +173,7 @@ fn recommend_inner(
         .iter()
         .any(|path| !is_manifest_path(path) && !is_lockfile_path(path));
     let heuristic_level = suggested_level(report);
-    let recommended_level = embedding_level
-        .map(|level| level.max(heuristic_level))
-        .unwrap_or(heuristic_level);
+    let recommended_level = combine_recommended_level(heuristic_level, embedding_level);
 
     let mut context = load_context(&context_path);
     let candidates = collect_manifest_candidates(&repo_root, &changed_paths);
@@ -239,6 +237,15 @@ fn recommend_inner(
     persist_context(&context_path, &context)?;
     recommendations.sort_by(|a, b| a.manifest_path.cmp(&b.manifest_path));
     Ok(recommendations)
+}
+
+fn combine_recommended_level(heuristic: BumpLevel, embedding: Option<BumpLevel>) -> BumpLevel {
+    // Embeddings are currently good at catching obvious breaking-change signals, but
+    // too noisy for patch-vs-minor distinctions. Keep patch/minor heuristic-driven.
+    match embedding {
+        Some(BumpLevel::Major) => BumpLevel::Major.max(heuristic),
+        _ => heuristic,
+    }
 }
 
 fn build_recommendation(
@@ -394,10 +401,38 @@ fn suggested_level(report: &AnalysisReport) -> BumpLevel {
         return BumpLevel::Major;
     }
 
-    if report
+    let subject = report.commit_message.trim().to_ascii_lowercase();
+    let subject_feature = subject.starts_with("feat(")
+        || subject.starts_with("feat:")
+        || subject.starts_with("feature(")
+        || subject.starts_with("feature:");
+    if subject_feature {
+        return BumpLevel::Minor;
+    }
+
+    let total = report.items.len();
+    let feature_like = report
         .items
         .iter()
-        .any(|item| matches!(item.type_tag, TypeTag::Feat))
+        .filter(|item| {
+            matches!(item.type_tag, TypeTag::Feat)
+                || matches!(item.bucket, autocommit_core::types::ChangeBucket::Feature)
+        })
+        .count();
+    let strong_feature_like = report
+        .items
+        .iter()
+        .filter(|item| item.confidence >= 0.72)
+        .filter(|item| {
+            matches!(item.type_tag, TypeTag::Feat)
+                || matches!(item.bucket, autocommit_core::types::ChangeBucket::Feature)
+        })
+        .count();
+
+    if total > 0
+        && strong_feature_like >= 1
+        && feature_like.saturating_mul(2) >= total
+        && strong_feature_like.saturating_mul(3) >= total
     {
         BumpLevel::Minor
     } else {
@@ -1445,6 +1480,52 @@ diff --git a/Cargo.toml b/Cargo.toml\n";
         };
 
         assert_eq!(suggested_level(&report), BumpLevel::Minor);
+    }
+
+    #[test]
+    fn suggested_level_keeps_patch_for_refactor_subject_with_single_noisy_feature_item() {
+        let report = AnalysisReport {
+            schema_version: "1.0".to_string(),
+            commit_message: "refactor(core): simplify parser".to_string(),
+            summary: "Refactor parser".to_string(),
+            items: vec![autocommit_core::types::ChangeItem {
+                id: "x".to_string(),
+                bucket: autocommit_core::types::ChangeBucket::Patch,
+                type_tag: TypeTag::Feat,
+                title: "Simplify parser".to_string(),
+                intent: "Refactor parsing".to_string(),
+                files: Vec::new(),
+                confidence: 0.65,
+            }],
+            risk: autocommit_core::types::RiskReport {
+                level: "low".to_string(),
+                notes: Vec::new(),
+            },
+            stats: autocommit_core::types::DiffStats::default(),
+            dispatch: autocommit_core::types::DispatchDecision {
+                route: autocommit_core::types::DispatchRoute::DraftOnly,
+                reason_codes: Vec::new(),
+                estimated_cost_tokens: 0,
+            },
+        };
+
+        assert_eq!(suggested_level(&report), BumpLevel::Patch);
+    }
+
+    #[test]
+    fn combine_recommended_level_uses_embedding_only_for_major_escalation() {
+        assert_eq!(
+            combine_recommended_level(BumpLevel::Patch, Some(BumpLevel::Minor)),
+            BumpLevel::Patch
+        );
+        assert_eq!(
+            combine_recommended_level(BumpLevel::Minor, Some(BumpLevel::Patch)),
+            BumpLevel::Minor
+        );
+        assert_eq!(
+            combine_recommended_level(BumpLevel::Patch, Some(BumpLevel::Major)),
+            BumpLevel::Major
+        );
     }
 
     #[test]

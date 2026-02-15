@@ -220,7 +220,7 @@ pub fn run(args: &[String]) -> Result<String, String> {
         .map_err(|err| format!("runtime init failed: {err}"))?;
 
         let progress = if rich_interactive {
-            Some(AnalysisProgress::new(&diff_text))
+            Some(AnalysisProgress::new(&diff_text, "Generating PR analysis"))
         } else {
             None
         };

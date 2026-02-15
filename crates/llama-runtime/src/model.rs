@@ -505,9 +505,19 @@ impl LlmEngine for Engine {
         let generated_commit_candidate = generated
             .as_ref()
             .and_then(|g| normalize_commit_message(&g.commit_message));
+        let generated_summary_candidate = generated
+            .as_ref()
+            .and_then(|g| normalize_reduce_summary(&g.summary));
 
-        let commit_message = synthesize_fallback_commit_message(&items, partials.len());
-        let summary = synthesize_fallback_summary(&items, stats);
+        let fallback_commit_message = synthesize_fallback_commit_message(&items, partials.len());
+        let fallback_summary = synthesize_fallback_summary(&items, stats);
+
+        let commit_message = generated_commit_candidate
+            .clone()
+            .unwrap_or_else(|| fallback_commit_message.clone());
+        let summary = generated_summary_candidate
+            .clone()
+            .unwrap_or_else(|| fallback_summary.clone());
 
         let risk_level = generated
             .as_ref()
@@ -533,12 +543,26 @@ impl LlmEngine for Engine {
                 }
                 notes
             });
-        risk_notes.push("commit_source:composed_partials".to_string());
+        risk_notes.push(if generated_commit_candidate.is_some() {
+            "commit_source:reduce_model".to_string()
+        } else {
+            "commit_source:composed_partials".to_string()
+        });
+        risk_notes.push(if generated_summary_candidate.is_some() {
+            "summary_source:reduce_model".to_string()
+        } else {
+            "summary_source:composed_partials".to_string()
+        });
         if generated.is_some() {
             risk_notes.push(if generated_commit_candidate.is_some() {
                 "reduce_commit_candidate:usable".to_string()
             } else {
                 "reduce_commit_candidate:invalid".to_string()
+            });
+            risk_notes.push(if generated_summary_candidate.is_some() {
+                "reduce_summary_candidate:usable".to_string()
+            } else {
+                "reduce_summary_candidate:invalid".to_string()
             });
         }
         let analyze_fallbacks = partials
@@ -1985,6 +2009,26 @@ fn looks_like_reducer_meta(value: &str) -> bool {
         || (lower.contains("synthesi") && has_any(&["analysis", "analyses", "report", "chunk"]))
 }
 
+fn normalize_reduce_summary(raw: &str) -> Option<String> {
+    let summary = sanitize_sentence(raw).trim().to_string();
+    if summary.is_empty() {
+        return None;
+    }
+    if looks_like_reducer_meta(&summary) {
+        return None;
+    }
+
+    let summary = summary
+        .trim_end_matches(|ch: char| ch == '"' || ch == '\'' || ch == '`')
+        .trim()
+        .to_string();
+    if summary.len() < 8 {
+        return None;
+    }
+
+    Some(summary)
+}
+
 fn normalize_commit_message(raw: &str) -> Option<String> {
     let header = raw.lines().next()?.trim();
     if header.is_empty() {
@@ -2151,6 +2195,21 @@ mod tests {
         let raw = "perf: reduce memory usage in model initialization";
         let normalized = normalize_commit_message(raw).expect("valid commit should be kept");
         assert_eq!(normalized, raw);
+    }
+
+    #[test]
+    fn normalize_reduce_summary_rejects_meta_phrasing() {
+        let raw = "Consolidate 9 partial analyses into one consolidated report.";
+        assert!(normalize_reduce_summary(raw).is_none());
+    }
+
+    #[test]
+    fn normalize_reduce_summary_keeps_plain_change_summary() {
+        let raw = "Improve commit message quality across 4 files.";
+        assert_eq!(
+            normalize_reduce_summary(raw).as_deref(),
+            Some("Improve commit message quality across 4 files.")
+        );
     }
 
     #[test]

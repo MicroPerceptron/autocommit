@@ -20,6 +20,11 @@ fn run(args: Vec<String>) -> Result<(), String> {
             print!("{output}");
             Ok(())
         }
+        Some("clean") => {
+            let output = cmd::clean::run(&args[1..])?;
+            print!("{output}");
+            Ok(())
+        }
         Some("pr") => {
             let output = cmd::pr::run(&args[1..])?;
             print!("{output}");
@@ -36,7 +41,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             Ok(())
         }
         Some("--help") | Some("-h") | None => {
-            println!("autocommit-cli <analyze|commit|explain-dispatch|init|pr> [options]");
+            println!("autocommit-cli <analyze|clean|commit|explain-dispatch|init|pr> [options]");
             Ok(())
         }
         Some(other) => Err(format!("unknown command: {other}")),

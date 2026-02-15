@@ -34,7 +34,7 @@ dependencies = [
 
 [[package]]
 name = "autocommit-cli"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "autocommit-core",
  "dialoguer",
@@ -1314,7 +1314,7 @@ dependencies = [
 
 [[package]]
 name = "llama-sys"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bindgen",
  "cc",

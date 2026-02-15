@@ -1,5 +1,6 @@
 pub mod analyze;
 mod analysis_progress;
+pub mod clean;
 pub mod commit;
 pub mod explain_dispatch;
 mod git;

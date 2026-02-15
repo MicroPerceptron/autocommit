@@ -89,6 +89,10 @@ autocommit_common_config * autocommit_common_config_new(void) {
     cfg->params.n_parallel   = 1;
     cfg->params.n_batch      = 1024;
     cfg->params.n_ubatch     = 256;
+    cfg->params.cache_type_k = GGML_TYPE_Q8_0;
+    cfg->params.cache_type_v = GGML_TYPE_Q8_0;
+    cfg->params.speculative.cache_type_k = GGML_TYPE_Q8_0;
+    cfg->params.speculative.cache_type_v = GGML_TYPE_Q8_0;
     cfg->params.sampling.top_p = 0.90f;
     cfg->params.sampling.temp = 0.20f;
     cfg->params.sampling.min_p = 0.0f;

@@ -17,6 +17,13 @@ fn profile_name() -> &'static str {
     }
 }
 
+fn cmake_parallel_jobs() -> usize {
+    let nproc = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    std::cmp::max(1, nproc.saturating_mul(2) / 3)
+}
+
 fn main() {
     println!("cargo:rerun-if-env-changed=LLAMA_CPP_DIR");
     println!("cargo:rerun-if-changed=src/autocommit_common_bridge.cpp");
@@ -88,12 +95,8 @@ fn main() {
         .arg(&build_dir)
         .arg("--config")
         .arg(profile)
-        .arg("--parallel");
-    if let Ok(jobs) = env::var("CARGO_BUILD_JOBS") {
-        if !jobs.is_empty() {
-            build.arg(jobs);
-        }
-    }
+        .arg("--parallel")
+        .arg(cmake_parallel_jobs().to_string());
     run(&mut build, "build");
 
     let mut install = Command::new("cmake");

@@ -327,13 +327,6 @@ pub fn run(args: &[String]) -> Result<String, String> {
 struct ExistingPr {
     number: u64,
     title: String,
-    url: String,
-    #[serde(rename = "headRefName")]
-    head_ref_name: String,
-    #[serde(rename = "baseRefName")]
-    base_ref_name: String,
-    #[serde(rename = "isDraft")]
-    is_draft: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -357,7 +350,7 @@ fn find_existing_pr(head: Option<&str>, base: Option<&str>) -> Result<Option<Exi
         "--head",
         head,
         "--json",
-        "number,title,url,headRefName,baseRefName,isDraft",
+        "number,title",
     ]);
 
     if let Some(base) = base {
@@ -441,19 +434,41 @@ fn update_pr(number: u64, title: &str, body: &str) -> Result<String, String> {
         .output()
         .map_err(|err| format!("failed to run gh pr edit: {err}"))?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("gh pr edit failed: {}", stderr.trim()));
+    if output.status.success() {
+        let mut msg = String::new();
+        msg.push_str("updated pull request\n");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if !stdout.trim().is_empty() {
+            msg.push_str(stdout.trim());
+            msg.push('\n');
+        }
+        return Ok(msg);
     }
 
-    let mut msg = String::new();
-    msg.push_str("updated pull request\n");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    if !stdout.trim().is_empty() {
-        msg.push_str(stdout.trim());
-        msg.push('\n');
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let fallback = Command::new("gh")
+        .args([
+            "api",
+            "-X",
+            "PATCH",
+            &format!("repos/:owner/:repo/pulls/{number}"),
+            "-f",
+            &format!("title={title}"),
+            "-f",
+            &format!("body={body}"),
+        ])
+        .output()
+        .map_err(|err| format!("failed to run gh api: {err}"))?;
+
+    if !fallback.status.success() {
+        let fallback_err = String::from_utf8_lossy(&fallback.stderr);
+        return Err(format!(
+            "gh pr edit failed: {stderr}; gh api fallback failed: {}",
+            fallback_err.trim()
+        ));
     }
-    Ok(msg)
+
+    Ok("updated pull request (via gh api)\n".to_string())
 }
 
 fn resolve_interactive_mode(interactive_override: Option<bool>) -> Result<bool, String> {

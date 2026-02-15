@@ -599,16 +599,34 @@ fn infer_embedding_bump_level(
     ];
 
     let mut best: Option<(version_bump::BumpLevel, f32)> = None;
+    let mut runner_up: Option<f32> = None;
     for (level, text) in anchors {
         let anchor_embedding = engine.embed(text).ok()?;
         let similarity = cosine_similarity(&signal_embedding, &anchor_embedding)?;
-        best = match best {
-            Some((_, current)) if current >= similarity => best,
-            _ => Some((level, similarity)),
-        };
+        match best {
+            Some((_, current)) if current >= similarity => {
+                if runner_up.map_or(true, |value| similarity > value) {
+                    runner_up = Some(similarity);
+                }
+            }
+            Some((_, current)) => {
+                runner_up = Some(current);
+                best = Some((level, similarity));
+            }
+            None => {
+                best = Some((level, similarity));
+            }
+        }
+    }
+    let (level, score) = best?;
+    let runner = runner_up.unwrap_or(0.0);
+    let margin = score - runner;
+    // Require a modest confidence gap before overriding heuristic levels.
+    if score < 0.55 || margin < 0.05 {
+        return None;
     }
 
-    best.map(|(level, _)| level)
+    Some(level)
 }
 
 fn build_bump_embedding_signal(report: &AnalysisReport) -> String {
@@ -896,7 +914,7 @@ fn compose_version_recommendations_section(
 }
 
 fn format_version_recommendation(rec: &version_bump::VersionRecommendation) -> String {
-    let mut out = format!("[{}] {} / {}", rec.manifest_path, rec.ecosystem, rec.tool);
+    let mut out = format!("[`{}`] {} / {}", rec.manifest_path, rec.ecosystem, rec.tool);
     if let (Some(current), Some(suggested)) = (
         rec.current_version.as_deref(),
         rec.suggested_version.as_deref(),
@@ -973,7 +991,7 @@ fn format_change_item(item: &autocommit_core::types::ChangeItem) -> String {
         String::new()
     };
 
-    format!("[{path}{file_suffix}] {title}{suffix}")
+    format!("[`{path}`{file_suffix}] {title}{suffix}")
 }
 
 fn normalize_change_fragment(raw: &str) -> String {
@@ -1237,10 +1255,10 @@ mod tests {
         let message = compose_commit_message(&sample_report(), &[]);
         assert!(message.starts_with("feat(core): add detailed commit composition\n\n"));
         assert!(message.contains("Compose commit output from chunk-level analyses."));
-        assert!(message.contains("### Changes\n- [crates/cli/src/cmd/commit.rs] Compose final commit body: Include per-file details in commit body"));
+        assert!(message.contains("### Changes\n- [`crates/cli/src/cmd/commit.rs`] Compose final commit body: Include per-file details in commit body"));
         assert!(
             message
-                .contains("- [crates/cli/src/output/text.rs (+1 more)] Refactor output formatting")
+                .contains("- [`crates/cli/src/output/text.rs` (+1 more)] Refactor output formatting")
         );
         assert!(message.contains("### Risk\n- Level: medium"));
         assert!(message.contains("- Generated details were composed from partial analyses."));
@@ -1291,7 +1309,7 @@ mod tests {
         let formatted = format_change_item(&item);
         assert_eq!(
             formatted,
-            "[crates/cli/src/cmd/commit.rs] Commit Message Composition and Creation with Analysis Report: compose commit messages based on an analysis report and create commits with the composed messages"
+            "[`crates/cli/src/cmd/commit.rs`] Commit Message Composition and Creation with Analysis Report: compose commit messages based on an analysis report and create commits with the composed messages"
         );
     }
 
@@ -1310,6 +1328,6 @@ mod tests {
 
         let message = compose_commit_message(&report, &recommendations);
         assert!(message.contains("### Version Bumps"));
-        assert!(message.contains("[Cargo.toml] Rust / Cargo: 0.1.0 -> 0.2.0 (minor)"));
+        assert!(message.contains("[`Cargo.toml`] Rust / Cargo: 0.1.0 -> 0.2.0 (minor)"));
     }
 }

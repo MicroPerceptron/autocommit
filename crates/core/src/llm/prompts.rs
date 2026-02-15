@@ -11,6 +11,7 @@ Format:
 Guidelines:
 - Describe WHAT changed and WHY, not HOW (the diff itself shows how)
 - Infer intent from: log messages, variable names, comments, control flow patterns
+- Wrap file paths, variable names, CLI flags, and config keys in backticks where they appear
 - For bug fixes: "fix: prevent X when Y" not "fix: add null check"
 - For features: "feat: add X for Y" describing capability, not implementation
 - For refactors: "refactor: extract/simplify/reorganize X" with motivation if clear
@@ -25,6 +26,7 @@ pub fn build_analyze_prompt(chunk: &DiffChunk) -> String {
 Return ONLY JSON with keys: summary, bucket, type_tag, title, intent.\n\
 Allowed bucket values: Feature, Patch, Addition, Other.\n\
 Allowed type_tag values: Feat, Fix, Refactor, Docs, Test, Chore, Perf, Style, Mixed.\n\
+Use backticks for file paths, variable names, CLI flags, and config keys in summary/title/intent.\n\
 Path: {}\n\
 Diff:\n```diff\n{}\n```",
         chunk.path, chunk.text
@@ -40,9 +42,11 @@ Return ONLY JSON with this exact shape:\n\
 Rules:\n\
 - commit_message must be a single conventional commit header that describes concrete code changes\n\
 - commit_message must not mention analysis process words like: reduce, reducer, analysis, analyses, report, chunk, or partial\n\
+- do not use backticks in commit_message\n\
 - summary must be one sentence about the code change outcome\n\
 - risk_level must be low, medium, or high\n\
 - risk_notes should be concise and concrete\n\
+- use backticks for file paths, variable names, CLI flags, and config keys in summary and risk_notes\n\
 - absolutely no explanations, no markdown, no <think> tags"
     )
 }

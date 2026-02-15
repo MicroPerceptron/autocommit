@@ -142,6 +142,11 @@ struct Semver {
     patch: u64,
 }
 
+#[derive(Debug, Clone)]
+struct GoModInfo {
+    major: u64,
+}
+
 pub(crate) fn recommend(
     repo: &git::Repo,
     diff_text: &str,
@@ -178,7 +183,17 @@ fn recommend_inner(
     let mut recommendations = Vec::new();
     for (manifest_path, kind) in candidates {
         let absolute = repo_root.join(&manifest_path);
-        let current_version = read_manifest_version(&absolute, kind);
+        let mut current_version = read_manifest_version(&absolute, kind);
+        let go_info = if kind == ManifestKind::GoMod {
+            let info = read_go_mod_info(&absolute);
+            current_version = info
+                .as_ref()
+                .map(|go| format!("v{}", go.major))
+                .or(current_version);
+            info
+        } else {
+            None
+        };
         let previous_version = context
             .manifests
             .get(&manifest_path)
@@ -187,7 +202,17 @@ fn recommend_inner(
         let should_evaluate = source_changed || manifest_changed;
 
         if should_evaluate {
-            if let Some(rec) = build_recommendation(
+            if kind == ManifestKind::GoMod {
+                if let Some(rec) = build_go_mod_recommendation(
+                    &manifest_path,
+                    go_info.as_ref(),
+                    previous_version.as_deref(),
+                    manifest_changed,
+                    recommended_level,
+                ) {
+                    recommendations.push(rec);
+                }
+            } else if let Some(rec) = build_recommendation(
                 &manifest_path,
                 kind,
                 current_version.as_deref(),
@@ -279,6 +304,52 @@ fn build_recommendation(
         });
     }
     None
+}
+
+fn build_go_mod_recommendation(
+    manifest_path: &str,
+    info: Option<&GoModInfo>,
+    previous_version: Option<&str>,
+    manifest_changed: bool,
+    level: BumpLevel,
+) -> Option<VersionRecommendation> {
+    let info = info?;
+    if level != BumpLevel::Major {
+        return None;
+    }
+
+    let previous_major = previous_version
+        .and_then(parse_semver)
+        .map(|semver| semver.major);
+    if let Some(prev) = previous_major {
+        if info.major > prev {
+            return None;
+        }
+    }
+
+    let target_major = if info.major < 2 { 2 } else { info.major + 1 };
+    let suggested = format!("v{target_major}");
+    let current_version = format!("v{}", info.major);
+    let reason = if manifest_changed {
+        format!(
+            "go.mod changed; breaking changes suggest module path bump to /{suggested}"
+        )
+    } else {
+        format!(
+            "breaking changes suggest Go module path bump to /{suggested}"
+        )
+    };
+
+    Some(VersionRecommendation {
+        manifest_path: manifest_path.to_string(),
+        ecosystem: ManifestKind::GoMod.ecosystem(),
+        tool: ManifestKind::GoMod.tool(),
+        current_version: Some(current_version),
+        suggested_version: Some(suggested),
+        level,
+        reason,
+        kind: ManifestKind::GoMod,
+    })
 }
 
 pub(crate) fn apply(
@@ -830,7 +901,12 @@ fn apply_manifest_bump(
             AssignmentStyle::Ini,
         ),
         ManifestKind::SetupPy => replace_setup_py_version(&content, suggested_version),
-        ManifestKind::GoMod => None,
+        ManifestKind::GoMod => {
+            let suggested_major = parse_go_mod_major(suggested_version).ok_or_else(|| {
+                std::io::Error::other("invalid Go module version format")
+            })?;
+            replace_go_mod_module_path(&content, suggested_major)
+        }
         ManifestKind::PomXml => replace_xml_tag_value(&content, "version", suggested_version),
         ManifestKind::Gradle => replace_gradle_version(&content, suggested_version),
         ManifestKind::Gemfile => None,
@@ -1110,6 +1186,108 @@ fn replace_yaml_key_value(content: &str, key: &str, suggested_version: &str) -> 
     Some(join_lines(lines, trailing_newline))
 }
 
+fn read_go_mod_info(path: &Path) -> Option<GoModInfo> {
+    let content = fs::read_to_string(path).ok()?;
+    parse_go_mod_info(&content)
+}
+
+fn parse_go_mod_info(content: &str) -> Option<GoModInfo> {
+    for raw_line in content.lines() {
+        let line = raw_line.trim_start();
+        if line.is_empty() || line.starts_with("//") {
+            continue;
+        }
+        if !line.starts_with("module ") {
+            continue;
+        }
+        let rest = line.trim_start_matches("module ").trim();
+        let (module_path, _) = split_inline_comment(rest);
+        let module_path = module_path.trim();
+        if module_path.is_empty() {
+            return None;
+        }
+        let (_, major, _) = parse_go_mod_path_major(module_path);
+        let major = major.unwrap_or(1);
+        return Some(GoModInfo {
+            major,
+        });
+    }
+    None
+}
+
+fn parse_go_mod_path_major(module_path: &str) -> (&str, Option<u64>, bool) {
+    if let Some((base, suffix)) = module_path.rsplit_once("/v") {
+        if let Ok(major) = suffix.parse::<u64>() {
+            if major >= 2 {
+                return (base, Some(major), true);
+            }
+        }
+    }
+    (module_path, None, false)
+}
+
+fn parse_go_mod_major(value: &str) -> Option<u64> {
+    let trimmed = value.trim().trim_start_matches('v');
+    trimmed.parse::<u64>().ok()
+}
+
+fn replace_go_mod_module_path(content: &str, suggested_major: u64) -> Option<String> {
+    if suggested_major < 2 {
+        return None;
+    }
+
+    let mut changed = false;
+    let trailing_newline = content.ends_with('\n');
+    let lines = content
+        .lines()
+        .map(|line| {
+            if changed {
+                return line.to_string();
+            }
+            let trimmed = line.trim_start();
+            if trimmed.is_empty() || trimmed.starts_with("//") {
+                return line.to_string();
+            }
+            if !trimmed.starts_with("module ") {
+                return line.to_string();
+            }
+
+            let indent_len = line.len().saturating_sub(trimmed.len());
+            let indent = &line[..indent_len];
+            let rest = trimmed.trim_start_matches("module ").trim();
+            let (module_path, comment) = split_inline_comment(rest);
+            let module_path = module_path.trim();
+            let (base, _, has_suffix) = parse_go_mod_path_major(module_path);
+            let new_path = if has_suffix {
+                format!("{base}/v{suggested_major}")
+            } else {
+                format!("{module_path}/v{suggested_major}")
+            };
+
+            changed = true;
+            if comment.is_empty() {
+                format!("{indent}module {new_path}")
+            } else {
+                format!("{indent}module {new_path} {comment}")
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if !changed {
+        return None;
+    }
+    Some(join_lines(lines, trailing_newline))
+}
+
+fn split_inline_comment(value: &str) -> (&str, &str) {
+    if let Some(idx) = value.find("//") {
+        let (left, right) = value.split_at(idx);
+        (left.trim_end(), right.trim_end())
+    } else {
+        (value, "")
+    }
+}
+
 fn join_lines(lines: Vec<String>, trailing_newline: bool) -> String {
     let mut out = lines.join("\n");
     if trailing_newline {
@@ -1340,6 +1518,24 @@ diff --git a/Cargo.toml b/Cargo.toml\n";
             .expect("package bump apply");
         let next = fs::read_to_string(&manifest).expect("read package");
         assert!(next.contains("\"version\": \"1.3.0\""));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn apply_manifest_bump_updates_go_mod_module_path() {
+        let root = create_temp_tree();
+        let manifest = root.join("go.mod");
+        write_file(
+            &root,
+            "go.mod",
+            "module example.com/demo\n\ngo 1.22\n",
+        );
+
+        apply_manifest_bump(&manifest, ManifestKind::GoMod, "v2")
+            .expect("go mod bump apply");
+        let next = fs::read_to_string(&manifest).expect("read go.mod");
+        assert!(next.contains("module example.com/demo/v2"));
 
         let _ = fs::remove_dir_all(&root);
     }

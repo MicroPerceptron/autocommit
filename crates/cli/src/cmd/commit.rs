@@ -3,7 +3,7 @@ use std::io::{IsTerminal, Write};
 use autocommit_core::AnalysisReport;
 use autocommit_core::llm::traits::LlmEngine;
 use autocommit_core::{AnalyzeOptions, CoreError, run as core_run};
-use dialoguer::console::Term;
+use dialoguer::console::{Term, style};
 use dialoguer::{Confirm, Editor, Select, theme::ColorfulTheme};
 use indicatif::{ProgressBar, ProgressStyle};
 
@@ -259,7 +259,7 @@ fn prompt_for_commit_message(initial_message: &str, rich: bool) -> Result<Option
     let options = ["Approve commit", "Edit message", "Cancel"];
 
     loop {
-        println!("\nProposed commit message:\n\n{message}\n");
+        print_commit_preview(&message, true);
         let selection = Select::with_theme(&theme)
             .with_prompt("Commit action")
             .items(options)
@@ -297,7 +297,7 @@ fn prompt_for_commit_message_basic(initial_message: &str) -> Result<Option<Strin
     let mut message = initial_message.trim().to_string();
 
     loop {
-        println!("\nProposed commit message:\n\n{message}\n");
+        print_commit_preview(&message, false);
         println!("Commit action:");
         println!("  [a] Approve commit");
         println!("  [e] Edit message");
@@ -397,6 +397,58 @@ fn looks_like_unimplemented_push_error(err: &CoreError) -> bool {
     err.to_string()
         .to_ascii_lowercase()
         .contains("not implemented")
+}
+
+fn print_commit_preview(message: &str, rich: bool) {
+    if !rich {
+        println!("\nProposed commit message:\n\n{message}\n");
+        return;
+    }
+
+    let mut lines = message.lines();
+    let subject = lines.next().unwrap_or_default();
+
+    println!();
+    println!(
+        "{}",
+        style("Proposed commit message").bold().underlined().cyan()
+    );
+    println!(
+        "{}",
+        style("----------------------------------------").dim()
+    );
+    if !subject.is_empty() {
+        println!("{}", style(subject).bold().green());
+    }
+
+    for line in lines {
+        if line.is_empty() {
+            println!();
+            continue;
+        }
+
+        if line.ends_with(':') {
+            println!("{}", style(line).bold().yellow());
+            continue;
+        }
+
+        if line.starts_with("- [") {
+            println!("{}", style(line).cyan());
+            continue;
+        }
+
+        if line.starts_with("- ") {
+            println!("{}", style(line).blue());
+            continue;
+        }
+
+        println!("{}", style(line).white());
+    }
+    println!(
+        "{}",
+        style("----------------------------------------").dim()
+    );
+    println!();
 }
 
 fn read_line_trimmed() -> Result<String, String> {

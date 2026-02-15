@@ -195,7 +195,7 @@ pub fn run(args: &[String]) -> Result<String, String> {
     .map_err(|err| err.to_string())?;
 
     let diff_hash = report_cache::diff_hash(&diff_text);
-    let cache_key = report_cache::cache_key("commit", runtime_profile.as_str(), &diff_hash, "1.0");
+    let cache_key = report_cache::cache_key("commit", runtime_profile.as_str(), &diff_hash);
     let cache_path = report_cache::cache_path(repo.common_git_dir());
 
     let cached_report = report_cache::read_cached_report(&cache_path, &cache_key);
@@ -1702,7 +1702,7 @@ fn compose_commit_body(
         sections.push(summary.to_string());
     }
 
-    let changes = compose_changes_section(report);
+    let changes = compose_changes_section(report, recommendations);
     if !changes.is_empty() {
         sections.push(changes);
     }
@@ -1787,18 +1787,168 @@ fn normalize_for_compare(value: &str) -> String {
         .join(" ")
 }
 
-fn compose_changes_section(report: &AnalysisReport) -> String {
+fn compose_changes_section(
+    report: &AnalysisReport,
+    recommendations: &[version_bump::VersionRecommendation],
+) -> String {
     if report.items.is_empty() {
         return String::new();
     }
 
+    let has_non_manifest_items = report.items.iter().any(|item| {
+        item.files
+            .first()
+            .map(|file| !is_manifest_or_lockfile_path(&file.path))
+            .unwrap_or(true)
+    });
+
+    let kept_items = report
+        .items
+        .iter()
+        .filter(|item| !should_skip_change_item(item, recommendations, has_non_manifest_items))
+        .collect::<Vec<_>>();
+
+    if kept_items.is_empty() {
+        return String::new();
+    }
+
+    let has_high_signal_items = kept_items
+        .iter()
+        .any(|item| !is_low_information_change_item(item));
+
     let mut out = String::from("### Changes\n");
-    for item in &report.items {
+    let mut count = 0usize;
+    for item in kept_items {
+        if has_high_signal_items && is_low_information_change_item(item) {
+            continue;
+        }
         out.push_str("- ");
         out.push_str(&format_change_item(item));
         out.push('\n');
+        count += 1;
+    }
+    if count == 0 {
+        return String::new();
     }
     out.trim_end().to_string()
+}
+
+fn should_skip_change_item(
+    item: &autocommit_core::types::ChangeItem,
+    recommendations: &[version_bump::VersionRecommendation],
+    has_non_manifest_items: bool,
+) -> bool {
+    let Some(path) = item.files.first().map(|file| file.path.as_str()) else {
+        return false;
+    };
+    let path_lower = path.to_ascii_lowercase();
+
+    if recommendations
+        .iter()
+        .any(|rec| rec.manifest_path.eq_ignore_ascii_case(path))
+    {
+        return true;
+    }
+
+    if has_non_manifest_items && is_lockfile_path(&path_lower) {
+        return true;
+    }
+
+    if has_non_manifest_items && is_manifest_path(&path_lower) && item_mentions_versioning(item) {
+        return true;
+    }
+
+    false
+}
+
+fn is_low_information_change_item(item: &autocommit_core::types::ChangeItem) -> bool {
+    let title = normalize_for_compare(&normalize_change_fragment(item.title.trim()));
+    let intent = normalize_for_compare(&normalize_change_fragment(item.intent.trim()));
+
+    if title.is_empty() {
+        return true;
+    }
+
+    if matches!(
+        title.as_str(),
+        "mixed" | "misc" | "other" | "unknown" | "patch" | "change" | "changes"
+    ) {
+        return true;
+    }
+
+    if title.starts_with("extract simplify reorganize")
+        || title == "extract reorganize"
+        || title == "extract simplify"
+    {
+        return true;
+    }
+
+    if title == "refactor" && (intent.is_empty() || is_low_signal_intent(&intent)) {
+        return true;
+    }
+
+    let words = title.split_whitespace().collect::<Vec<_>>();
+    if words.len() <= 2
+        && words.iter().all(|word| {
+            is_generic_single_word(word)
+                || matches!(
+                    *word,
+                    "mixed" | "other" | "misc" | "refactor" | "patch" | "cleanup" | "internal"
+                )
+        })
+        && (intent.is_empty() || is_low_signal_intent(&intent))
+    {
+        return true;
+    }
+
+    false
+}
+
+fn item_mentions_versioning(item: &autocommit_core::types::ChangeItem) -> bool {
+    let text = format!(
+        "{} {}",
+        item.title.to_ascii_lowercase(),
+        item.intent.to_ascii_lowercase()
+    );
+    [
+        "version",
+        "dependency",
+        "dependencies",
+        "lockfile",
+        "cargo.lock",
+        "package-lock",
+        "go.sum",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+fn is_manifest_or_lockfile_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    is_manifest_path(&lower) || is_lockfile_path(&lower)
+}
+
+fn is_manifest_path(lower_path: &str) -> bool {
+    lower_path.ends_with("cargo.toml")
+        || lower_path.ends_with("package.json")
+        || lower_path.ends_with("pyproject.toml")
+        || lower_path.ends_with("go.mod")
+        || lower_path.ends_with("pom.xml")
+        || lower_path.ends_with("build.gradle")
+        || lower_path.ends_with("build.gradle.kts")
+        || lower_path.ends_with("pubspec.yaml")
+}
+
+fn is_lockfile_path(lower_path: &str) -> bool {
+    lower_path.ends_with("cargo.lock")
+        || lower_path.ends_with("package-lock.json")
+        || lower_path.ends_with("yarn.lock")
+        || lower_path.ends_with("pnpm-lock.yaml")
+        || lower_path.ends_with("poetry.lock")
+        || lower_path.ends_with("pipfile.lock")
+        || lower_path.ends_with("go.sum")
+        || lower_path.ends_with("composer.lock")
+        || lower_path.ends_with("gemfile.lock")
 }
 
 fn compose_version_recommendations_section(
@@ -1880,8 +2030,10 @@ fn format_change_item(item: &autocommit_core::types::ChangeItem) -> String {
 
     let title = normalize_change_fragment(item.title.trim());
     let title = rewrite_low_signal_suffix(&title);
+    let title = strip_redundant_path_suffix(&title, path);
     let title = wrap_code_like_tokens(&title);
     let title = capitalize_first_alpha(&title);
+    let title = rewrite_manifest_noise_title(&title, path);
     let title = clamp_words(&title, 88);
     let title = if title.is_empty() {
         "update file".to_string()
@@ -1891,6 +2043,7 @@ fn format_change_item(item: &autocommit_core::types::ChangeItem) -> String {
 
     let intent = normalize_change_fragment(item.intent.trim());
     let intent = rewrite_low_signal_suffix(&intent);
+    let intent = strip_redundant_path_suffix(&intent, path);
     let intent = wrap_code_like_tokens(&intent);
     let intent = clamp_words(&intent, 132);
 
@@ -1901,6 +2054,51 @@ fn format_change_item(item: &autocommit_core::types::ChangeItem) -> String {
     };
 
     format!("[`{path}`{file_suffix}] {title}{suffix}")
+}
+
+fn strip_redundant_path_suffix(value: &str, path: &str) -> String {
+    let mut out = value.trim().to_string();
+    if out.is_empty() {
+        return out;
+    }
+
+    let lower = out.to_ascii_lowercase();
+    let path_lower = path.to_ascii_lowercase();
+    let in_suffix = format!(" in {path_lower}");
+    if lower.ends_with(&in_suffix) {
+        let keep = out.len().saturating_sub(in_suffix.len());
+        out = out[..keep].trim_end().to_string();
+    } else if lower.ends_with(&path_lower) {
+        let keep = out.len().saturating_sub(path_lower.len());
+        out = out[..keep].trim_end().to_string();
+    }
+
+    if out.eq_ignore_ascii_case(path) {
+        String::new()
+    } else {
+        out
+    }
+}
+
+fn rewrite_manifest_noise_title(title: &str, path: &str) -> String {
+    let lower = title.to_ascii_lowercase();
+    let path_lower = path.to_ascii_lowercase();
+    let mentions_version = lower.contains("version")
+        || lower.contains("dependency")
+        || lower.contains("dependencies")
+        || lower.contains("lockfile");
+
+    if !mentions_version {
+        return title.to_string();
+    }
+
+    if is_lockfile_path(&path_lower) {
+        return "Refresh dependency lockfile".to_string();
+    }
+    if is_manifest_path(&path_lower) {
+        return "Update project version metadata".to_string();
+    }
+    title.to_string()
 }
 
 fn normalize_change_fragment(raw: &str) -> String {
@@ -1967,6 +2165,28 @@ fn normalize_change_fragment(raw: &str) -> String {
         }
     }
 
+    for prefix in [
+        "extract/simplify/reorganize ",
+        "extract, simplify, reorganize ",
+        "extract simplify reorganize ",
+        "extract/reorganize ",
+    ] {
+        if out.to_ascii_lowercase().starts_with(prefix) {
+            out = format!("refactor {}", out[prefix.len()..].trim_start());
+            break;
+        }
+    }
+
+    if matches!(
+        normalize_for_compare(&out).as_str(),
+        "extract simplify reorganize"
+            | "extract reorganize"
+            | "extract simplify"
+            | "refactor extract simplify reorganize"
+    ) {
+        out = "refactor internals".to_string();
+    }
+
     for (from, to) in [
         (" and creates ", " and create "),
         (" and adds ", " and add "),
@@ -2003,6 +2223,12 @@ fn rewrite_low_signal_suffix(raw: &str) -> String {
 
     if matches!(tail.as_str(), "diagnostic" | "diagnostics") {
         return format!("add diagnostics for {head}");
+    }
+    if matches!(
+        tail.as_str(),
+        "extract simplify reorganize" | "extract reorganize"
+    ) {
+        return head.to_string();
     }
     if is_generic_single_word(&tail) {
         return head.to_string();
@@ -2172,6 +2398,19 @@ fn is_low_signal_intent(intent: &str) -> bool {
     let words = normalized.split_whitespace().collect::<Vec<_>>();
     if words.len() == 1 {
         return is_generic_single_word(words[0]);
+    }
+    if matches!(
+        normalized.as_str(),
+        "reorganize implementation"
+            | "reorganize code"
+            | "refactor implementation"
+            | "refactor code"
+            | "internal refactor"
+            | "internal cleanup"
+            | "code cleanup"
+            | "general cleanup"
+    ) {
+        return true;
     }
 
     false
@@ -2392,6 +2631,101 @@ mod tests {
     }
 
     #[test]
+    fn compose_commit_message_skips_manifest_noise_when_bump_section_present() {
+        let mut report = sample_report();
+        report.items = vec![
+            ChangeItem {
+                id: "manifest".to_string(),
+                bucket: ChangeBucket::Patch,
+                type_tag: TypeTag::Feat,
+                title: "Add version number".to_string(),
+                intent: "Update package version".to_string(),
+                files: vec![FileRef {
+                    path: "crates/cli/Cargo.toml".to_string(),
+                    status: FileStatus::Modified,
+                    ranges: Vec::new(),
+                }],
+                confidence: 0.9,
+            },
+            ChangeItem {
+                id: "code".to_string(),
+                bucket: ChangeBucket::Patch,
+                type_tag: TypeTag::Refactor,
+                title: "Refactor model reduction logic".to_string(),
+                intent: "Simplify reduce candidate handling".to_string(),
+                files: vec![FileRef {
+                    path: "crates/llama-runtime/src/model.rs".to_string(),
+                    status: FileStatus::Modified,
+                    ranges: Vec::new(),
+                }],
+                confidence: 0.85,
+            },
+        ];
+
+        let recommendations = vec![version_bump::test_recommendation(
+            "crates/cli/Cargo.toml",
+            "Rust",
+            "Cargo",
+            Some("0.11.1"),
+            Some("0.11.2"),
+            version_bump::BumpLevel::Patch,
+            "manifest changed without an explicit project version bump; suggest patch bump",
+        )];
+
+        let message = compose_commit_message(&report, &recommendations);
+        assert!(message.contains(
+            "### Changes\n- [`crates/llama-runtime/src/model.rs`] Refactor model reduction logic"
+        ));
+        let changes_section = message
+            .split("### Version Bumps")
+            .next()
+            .unwrap_or(message.as_str());
+        assert!(!changes_section.contains("crates/cli/Cargo.toml"));
+        assert!(message.contains("### Version Bumps"));
+    }
+
+    #[test]
+    fn compose_commit_message_skips_low_information_items_when_better_items_exist() {
+        let mut report = sample_report();
+        report.items = vec![
+            ChangeItem {
+                id: "mixed".to_string(),
+                bucket: ChangeBucket::Patch,
+                type_tag: TypeTag::Mixed,
+                title: "Mixed".to_string(),
+                intent: "Patch".to_string(),
+                files: vec![FileRef {
+                    path: "crates/llama-runtime/src/model.rs".to_string(),
+                    status: FileStatus::Modified,
+                    ranges: Vec::new(),
+                }],
+                confidence: 0.5,
+            },
+            ChangeItem {
+                id: "code".to_string(),
+                bucket: ChangeBucket::Patch,
+                type_tag: TypeTag::Refactor,
+                title: "Refactor model reduction logic".to_string(),
+                intent: "Simplify reduce candidate handling".to_string(),
+                files: vec![FileRef {
+                    path: "crates/cli/src/cmd/commit.rs".to_string(),
+                    status: FileStatus::Modified,
+                    ranges: Vec::new(),
+                }],
+                confidence: 0.9,
+            },
+        ];
+
+        let message = compose_commit_message(&report, &[]);
+        let changes_section = message
+            .split("### Risk")
+            .next()
+            .unwrap_or(message.as_str());
+        assert!(changes_section.contains("Refactor model reduction logic"));
+        assert!(!changes_section.contains("Mixed"));
+    }
+
+    #[test]
     fn format_change_item_rewrites_diagnostics_suffix() {
         let item = ChangeItem {
             id: "diag".to_string(),
@@ -2434,6 +2768,76 @@ mod tests {
         assert_eq!(
             formatted,
             "[`crates/cli/src/cmd/report_cache.rs`] Implement hash function for `diff_text`"
+        );
+    }
+
+    #[test]
+    fn format_change_item_rewrites_extract_simplify_reorganize_phrase() {
+        let item = ChangeItem {
+            id: "rewrite".to_string(),
+            bucket: ChangeBucket::Patch,
+            type_tag: TypeTag::Refactor,
+            title: "extract/simplify/reorganize model reduction logic".to_string(),
+            intent: "Reorganize implementation".to_string(),
+            files: vec![FileRef {
+                path: "crates/llama-runtime/src/model.rs".to_string(),
+                status: FileStatus::Modified,
+                ranges: Vec::new(),
+            }],
+            confidence: 0.81,
+        };
+
+        let formatted = format_change_item(&item);
+        assert_eq!(
+            formatted,
+            "[`crates/llama-runtime/src/model.rs`] Refactor model reduction logic"
+        );
+    }
+
+    #[test]
+    fn format_change_item_drops_extract_simplify_reorganize_suffix() {
+        let item = ChangeItem {
+            id: "suffix".to_string(),
+            bucket: ChangeBucket::Patch,
+            type_tag: TypeTag::Refactor,
+            title: "Refactor ReduceModelOutput: Extract/simplify/reorganize".to_string(),
+            intent: "Refactor implementation".to_string(),
+            files: vec![FileRef {
+                path: "crates/llama-runtime/src/model.rs".to_string(),
+                status: FileStatus::Modified,
+                ranges: Vec::new(),
+            }],
+            confidence: 0.8,
+        };
+
+        let formatted = format_change_item(&item);
+        assert_eq!(
+            formatted,
+            "[`crates/llama-runtime/src/model.rs`] Refactor ReduceModelOutput"
+        );
+    }
+
+    #[test]
+    fn format_change_item_removes_redundant_path_suffix() {
+        let item = ChangeItem {
+            id: "path".to_string(),
+            bucket: ChangeBucket::Patch,
+            type_tag: TypeTag::Refactor,
+            title: "Refactor model reduction logic in crates/llama-runtime/src/model.rs"
+                .to_string(),
+            intent: "Refactor implementation in crates/llama-runtime/src/model.rs".to_string(),
+            files: vec![FileRef {
+                path: "crates/llama-runtime/src/model.rs".to_string(),
+                status: FileStatus::Modified,
+                ranges: Vec::new(),
+            }],
+            confidence: 0.82,
+        };
+
+        let formatted = format_change_item(&item);
+        assert_eq!(
+            formatted,
+            "[`crates/llama-runtime/src/model.rs`] Refactor model reduction logic"
         );
     }
 }

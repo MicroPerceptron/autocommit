@@ -435,13 +435,13 @@ fn suggested_level(report: &AnalysisReport) -> BumpLevel {
     let strong_feature_like = report
         .items
         .iter()
-        .filter(|item| item.confidence >= 0.72)
+        .filter(|item| item.confidence >= 0.78)
         .filter(|item| {
             matches!(item.type_tag, TypeTag::Feat)
                 || matches!(item.bucket, autocommit_core::types::ChangeBucket::Feature)
         })
         .count();
-    let feature_phrase_hits = report
+    let strong_feature_phrase_hits = report
         .items
         .iter()
         .filter(|item| {
@@ -450,42 +450,43 @@ fn suggested_level(report: &AnalysisReport) -> BumpLevel {
                 item.title.to_ascii_lowercase(),
                 item.intent.to_ascii_lowercase()
             );
-            contains_feature_signal(&text)
+            contains_strong_feature_signal(&text)
         })
         .count();
-    let subject_or_summary_feature =
-        contains_feature_signal(&subject) || contains_feature_signal(&summary);
+    let summary_or_risk_feature = contains_strong_feature_signal(&summary)
+        || contains_strong_feature_signal(&risk_notes)
+        || contains_feature_signal(&summary)
+        || contains_feature_signal(&risk_notes);
+    let multi_item_feature =
+        feature_like >= 2 && total > 0 && feature_like.saturating_mul(2) >= total;
+    let high_conf_multi_item_feature =
+        strong_feature_like >= 2 && total > 0 && strong_feature_like.saturating_mul(2) >= total;
 
-    if subject_patchy && strong_feature_like == 0 {
-        BumpLevel::Patch
-    } else {
-        let mut score = 0usize;
-        if subject_feature {
-            score += 1;
+    // Conservative default: patch unless there is clear and repeated feature evidence.
+    if subject_patchy && !subject_feature {
+        if high_conf_multi_item_feature
+            && (strong_feature_phrase_hits > 0 || summary_or_risk_feature)
+        {
+            return BumpLevel::Minor;
         }
-        if total > 0 && feature_like.saturating_mul(2) >= total {
-            score += 1;
-        }
-        if total > 0 && strong_feature_like.saturating_mul(2) >= total && strong_feature_like > 0 {
-            score += 1;
-        }
-        if feature_phrase_hits > 0 {
-            score += 1;
-        }
-        if subject_or_summary_feature {
-            score += 1;
-        }
-        if report.stats.files_changed >= 3 && strong_feature_like >= 1 {
-            score += 1;
-        }
-
-        // Require more than a single noisy signal to classify as minor.
-        if score >= 3 {
-            BumpLevel::Minor
-        } else {
-            BumpLevel::Patch
-        }
+        return BumpLevel::Patch;
     }
+
+    if subject_feature {
+        if strong_feature_like >= 1 && (strong_feature_phrase_hits > 0 || summary_or_risk_feature) {
+            return BumpLevel::Minor;
+        }
+        if multi_item_feature && strong_feature_phrase_hits > 0 {
+            return BumpLevel::Minor;
+        }
+        return BumpLevel::Patch;
+    }
+
+    if high_conf_multi_item_feature && (strong_feature_phrase_hits > 0 || summary_or_risk_feature) {
+        return BumpLevel::Minor;
+    }
+
+    BumpLevel::Patch
 }
 
 fn contains_breaking_signal(text: &str) -> bool {
@@ -520,6 +521,37 @@ fn contains_feature_signal(text: &str) -> bool {
         "implement ",
         "expose ",
         "allow ",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+fn contains_strong_feature_signal(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    [
+        "new command",
+        "new subcommand",
+        "new api",
+        "new endpoint",
+        "new flag",
+        "new option",
+        "new workflow",
+        "add command",
+        "add subcommand",
+        "add api",
+        "add endpoint",
+        "add flag",
+        "add option",
+        "add support for",
+        "introduce command",
+        "introduce api",
+        "introduce endpoint",
+        "introduce feature",
+        "support for ",
+        "implements command",
+        "implements api",
+        "expose api",
+        "expose endpoint",
     ]
     .iter()
     .any(|needle| text.contains(needle))
@@ -1676,6 +1708,41 @@ diff --git a/Cargo.toml b/Cargo.toml\n";
         };
 
         assert_eq!(suggested_level(&report), BumpLevel::Minor);
+    }
+
+    #[test]
+    fn suggested_level_keeps_patch_for_single_noisy_feature_signal() {
+        let report = AnalysisReport {
+            schema_version: "1.0".to_string(),
+            commit_message: "refactor(cli): simplify argument parsing".to_string(),
+            summary: "Add support for cleaner parsing internals".to_string(),
+            items: vec![autocommit_core::types::ChangeItem {
+                id: "x".to_string(),
+                bucket: autocommit_core::types::ChangeBucket::Feature,
+                type_tag: TypeTag::Feat,
+                title: "Support cleaner parsing".to_string(),
+                intent: "Refactor parser internals".to_string(),
+                files: Vec::new(),
+                confidence: 0.92,
+            }],
+            risk: autocommit_core::types::RiskReport {
+                level: "low".to_string(),
+                notes: Vec::new(),
+            },
+            stats: autocommit_core::types::DiffStats {
+                files_changed: 1,
+                lines_changed: 42,
+                hunks: 3,
+                binary_files: 0,
+            },
+            dispatch: autocommit_core::types::DispatchDecision {
+                route: autocommit_core::types::DispatchRoute::DraftOnly,
+                reason_codes: Vec::new(),
+                estimated_cost_tokens: 0,
+            },
+        };
+
+        assert_eq!(suggested_level(&report), BumpLevel::Patch);
     }
 
     #[test]

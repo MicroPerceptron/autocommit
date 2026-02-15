@@ -634,16 +634,31 @@ impl LlmEngine for Engine {
         let generated_summary_candidate = generated
             .as_ref()
             .and_then(|g| normalize_reduce_summary(&g.summary));
+        let repaired_commit_candidate = generated
+            .as_ref()
+            .and_then(|g| recover_commit_message_from_reduce(g, &items));
 
         let fallback_commit_message = synthesize_fallback_commit_message(&items, partials.len());
         let fallback_summary = synthesize_fallback_summary(&items, stats);
 
-        let commit_message = generated_commit_candidate
-            .clone()
-            .unwrap_or_else(|| fallback_commit_message.clone());
-        let summary = generated_summary_candidate
-            .clone()
-            .unwrap_or_else(|| fallback_summary.clone());
+        let (commit_message, commit_source) =
+            if let Some(commit) = generated_commit_candidate.clone() {
+                (commit, "reduce_model")
+            } else if let Some(commit) = repaired_commit_candidate.clone() {
+                (commit, "reduce_model_repaired")
+            } else {
+                (fallback_commit_message.clone(), "composed_partials")
+            };
+        let repaired_summary_candidate = generated
+            .as_ref()
+            .and_then(|g| recover_summary_from_reduce(g, &commit_message, stats));
+        let (summary, summary_source) = if let Some(summary) = generated_summary_candidate.clone() {
+            (summary, "reduce_model")
+        } else if let Some(summary) = repaired_summary_candidate.clone() {
+            (summary, "reduce_model_repaired")
+        } else {
+            (fallback_summary.clone(), "composed_partials")
+        };
 
         let risk_level = generated
             .as_ref()
@@ -669,24 +684,20 @@ impl LlmEngine for Engine {
                 }
                 notes
             });
-        risk_notes.push(if generated_commit_candidate.is_some() {
-            "commit_source:reduce_model".to_string()
-        } else {
-            "commit_source:composed_partials".to_string()
-        });
-        risk_notes.push(if generated_summary_candidate.is_some() {
-            "summary_source:reduce_model".to_string()
-        } else {
-            "summary_source:composed_partials".to_string()
-        });
+        risk_notes.push(format!("commit_source:{commit_source}"));
+        risk_notes.push(format!("summary_source:{summary_source}"));
         if generated.is_some() {
             risk_notes.push(if generated_commit_candidate.is_some() {
                 "reduce_commit_candidate:usable".to_string()
+            } else if repaired_commit_candidate.is_some() {
+                "reduce_commit_candidate:repaired".to_string()
             } else {
                 "reduce_commit_candidate:invalid".to_string()
             });
             risk_notes.push(if generated_summary_candidate.is_some() {
                 "reduce_summary_candidate:usable".to_string()
+            } else if repaired_summary_candidate.is_some() {
+                "reduce_summary_candidate:repaired".to_string()
             } else {
                 "reduce_summary_candidate:invalid".to_string()
             });
@@ -741,12 +752,16 @@ impl LlmEngine for Engine {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 struct ReduceModelOutput {
+    #[serde(default, alias = "commit", alias = "message")]
     commit_message: String,
+    #[serde(default, alias = "description")]
     summary: String,
+    #[serde(default, alias = "risk")]
     risk_level: String,
     #[serde(default)]
+    #[serde(alias = "notes")]
     risk_notes: Vec<String>,
 }
 
@@ -820,34 +835,58 @@ fn build_reduce_prompt_plan(
 }
 
 fn reduce_token_budget(stats: &DiffStats, total: usize) -> usize {
-    if stats.lines_changed > 1_500 || total > 24 {
-        224
+    if let Some(override_tokens) = env_budget_override("AUTOCOMMIT_REDUCE_MAX_TOKENS") {
+        return override_tokens.clamp(96, 2_048);
+    }
+
+    if stats.lines_changed > 6_000 || total > 80 {
+        448
+    } else if stats.lines_changed > 3_000 || total > 40 {
+        416
+    } else if stats.lines_changed > 1_500 || total > 24 {
+        384
     } else if stats.lines_changed > 900 || total > 12 {
-        256
+        352
     } else {
         320
     }
 }
 
 fn reduce_item_budget(stats: &DiffStats, total: usize) -> usize {
+    if let Some(override_items) = env_budget_override("AUTOCOMMIT_REDUCE_MAX_ITEMS") {
+        return override_items.clamp(1, 64).min(total.max(1));
+    }
+
     if total <= 6 {
         total
-    } else if stats.lines_changed > 1_500 || total > 24 {
-        8
+    } else if stats.lines_changed > 8_000 || total > 120 {
+        24.min(total)
+    } else if stats.lines_changed > 4_000 || total > 60 {
+        20.min(total)
+    } else if stats.lines_changed > 1_800 || total > 24 {
+        16.min(total)
     } else if stats.lines_changed > 900 || total > 12 {
-        10
+        12.min(total)
     } else {
-        14
+        total.min(12)
     }
 }
 
 fn reduce_char_budget(stats: &DiffStats, total: usize) -> usize {
-    if stats.lines_changed > 1_500 || total > 24 {
-        2_500
+    if let Some(override_chars) = env_budget_override("AUTOCOMMIT_REDUCE_MAX_PROMPT_CHARS") {
+        return override_chars.clamp(2_000, 20_000);
+    }
+
+    if stats.lines_changed > 8_000 || total > 120 {
+        10_000
+    } else if stats.lines_changed > 4_000 || total > 60 {
+        8_500
+    } else if stats.lines_changed > 1_800 || total > 24 {
+        7_000
     } else if stats.lines_changed > 900 || total > 12 {
-        3_000
+        5_600
     } else {
-        4_500
+        4_800
     }
 }
 
@@ -1000,6 +1039,10 @@ fn parse_reduce_output(raw: &str) -> Result<ReduceModelOutput, RuntimeError> {
         }
     }
 
+    if last.is_none() {
+        last = salvage_reduce_output(raw);
+    }
+
     let mut output = last.ok_or_else(|| {
         RuntimeError::Inference(format!(
             "failed to parse reduce JSON output from model: {}",
@@ -1011,15 +1054,9 @@ fn parse_reduce_output(raw: &str) -> Result<ReduceModelOutput, RuntimeError> {
     output.summary = output.summary.trim().to_string();
     output.risk_level = output.risk_level.trim().to_ascii_lowercase();
 
-    if output.commit_message.is_empty() {
+    if output.commit_message.is_empty() && output.summary.is_empty() {
         return Err(RuntimeError::Inference(
-            "reduce output commit_message is empty".to_string(),
-        ));
-    }
-
-    if output.summary.is_empty() {
-        return Err(RuntimeError::Inference(
-            "reduce output summary is empty".to_string(),
+            "reduce output is missing both commit_message and summary".to_string(),
         ));
     }
 
@@ -1029,6 +1066,65 @@ fn parse_reduce_output(raw: &str) -> Result<ReduceModelOutput, RuntimeError> {
 
     output.risk_notes.retain(|note| !note.trim().is_empty());
     Ok(output)
+}
+
+fn salvage_reduce_output(raw: &str) -> Option<ReduceModelOutput> {
+    let mut commit_message: Option<String> = None;
+    let mut summary: Option<String> = None;
+
+    for line in raw.lines() {
+        let cleaned = line
+            .trim()
+            .trim_matches(|ch: char| ch == '"' || ch == '\'' || ch == '`')
+            .trim_start_matches("- ")
+            .trim_start_matches("* ")
+            .trim()
+            .to_string();
+        if cleaned.is_empty() {
+            continue;
+        }
+
+        let lowered = cleaned.to_ascii_lowercase();
+        let normalized_commit = if let Some(rest) = lowered
+            .strip_prefix("commit:")
+            .map(|_| cleaned["commit:".len()..].trim())
+        {
+            normalize_commit_message(rest)
+        } else {
+            normalize_commit_message(&cleaned)
+        };
+        if commit_message.is_none() {
+            if let Some(commit) = normalized_commit {
+                commit_message = Some(commit);
+                continue;
+            }
+        }
+
+        if summary.is_none() {
+            let summary_candidate = if let Some(rest) = lowered
+                .strip_prefix("summary:")
+                .map(|_| cleaned["summary:".len()..].trim())
+            {
+                normalize_reduce_summary(rest)
+            } else {
+                normalize_reduce_summary(&cleaned)
+            };
+            if let Some(candidate) = summary_candidate {
+                summary = Some(candidate);
+            }
+        }
+    }
+
+    if commit_message.is_none() && summary.is_none() {
+        return None;
+    }
+
+    Some(ReduceModelOutput {
+        commit_message: commit_message.unwrap_or_default(),
+        summary: summary.unwrap_or_default(),
+        risk_level: "medium".to_string(),
+        risk_notes: vec!["salvaged_reduce_output".to_string()],
+    })
 }
 
 fn generate_analyze_output(
@@ -1357,23 +1453,31 @@ fn compact_error_note(raw: &str) -> String {
 }
 
 fn analyze_token_budget(chunk: &DiffChunk) -> usize {
+    if let Some(override_tokens) = env_budget_override("AUTOCOMMIT_ANALYZE_MAX_TOKENS") {
+        return override_tokens.clamp(96, 1_024);
+    }
+
     if chunk.estimated_tokens > 3_000 {
-        192
-    } else if chunk.estimated_tokens > 1_500 {
-        224
-    } else {
         256
+    } else if chunk.estimated_tokens > 1_500 {
+        288
+    } else {
+        320
     }
 }
 
 fn build_analyze_prompt_capped(chunk: &DiffChunk) -> String {
-    let max_chars = if chunk.estimated_tokens > 3_000 {
-        3_000
-    } else if chunk.estimated_tokens > 1_500 {
-        4_000
-    } else {
-        6_000
-    };
+    let max_chars = env_budget_override("AUTOCOMMIT_ANALYZE_MAX_PROMPT_CHARS")
+        .map(|v| v.clamp(2_000, 16_000))
+        .unwrap_or_else(|| {
+            if chunk.estimated_tokens > 3_000 {
+                5_000
+            } else if chunk.estimated_tokens > 1_500 {
+                6_500
+            } else {
+                8_000
+            }
+        });
 
     if chunk.text.len() <= max_chars {
         return prompts::build_analyze_prompt(chunk);
@@ -1972,6 +2076,7 @@ fn top_subject_candidates(items: &[ChangeItem], limit: usize) -> Vec<SubjectCand
     let mut candidates = Vec::new();
     for item in items {
         let mut best_for_item: Option<SubjectCandidate> = None;
+        let primary_path = item.files.first().map(|file| file.path.as_str());
         let item_scope = item
             .files
             .first()
@@ -1992,7 +2097,10 @@ fn top_subject_candidates(items: &[ChangeItem], limit: usize) -> Vec<SubjectCand
                 continue;
             }
 
-            let score = item.confidence + bonus + subject_quality_bonus(&candidate_raw);
+            let score = item.confidence
+                + bonus
+                + subject_quality_bonus(&candidate_raw)
+                + subject_context_bonus(&candidate_raw, primary_path);
             if best_for_item
                 .as_ref()
                 .map(|existing| score > existing.score)
@@ -2058,7 +2166,32 @@ fn sanitize_scope(raw: &str) -> Option<String> {
         .collect::<String>()
         .to_ascii_lowercase();
 
-    if scope.is_empty() { None } else { Some(scope) }
+    if scope.is_empty() {
+        return None;
+    }
+
+    if matches!(
+        scope.as_str(),
+        "scope"
+            | "module"
+            | "file"
+            | "files"
+            | "project"
+            | "repo"
+            | "repository"
+            | "code"
+            | "default"
+            | "misc"
+            | "mixed"
+            | "unknown"
+            | "change"
+            | "changes"
+            | "autocommit"
+    ) {
+        return None;
+    }
+
+    Some(scope)
 }
 
 fn subject_quality_bonus(subject: &str) -> f32 {
@@ -2118,9 +2251,87 @@ fn subject_quality_bonus(subject: &str) -> f32 {
     score
 }
 
+fn subject_context_bonus(subject: &str, file_path: Option<&str>) -> f32 {
+    let lower = subject.to_ascii_lowercase();
+    let mut score = 0.0f32;
+
+    if lower == "add version number"
+        || lower == "add version"
+        || lower == "update version"
+        || lower == "version bump"
+        || lower == "bump version"
+    {
+        score -= 0.40;
+    }
+    if lower.contains("update cargo.lock versions")
+        || lower.contains("update cargo lock versions")
+        || lower.contains("update lockfile")
+        || lower.contains("update dependencies")
+    {
+        score -= 0.28;
+    }
+    if lower.contains("version number") {
+        score -= 0.22;
+    }
+
+    if let Some(path) = file_path {
+        let path_lower = path.to_ascii_lowercase();
+        if path_lower.ends_with("cargo.lock")
+            || path_lower.ends_with("package-lock.json")
+            || path_lower.ends_with("yarn.lock")
+            || path_lower.ends_with("pnpm-lock.yaml")
+            || path_lower.ends_with("go.sum")
+            || path_lower.ends_with("composer.lock")
+            || path_lower.ends_with("gemfile.lock")
+        {
+            score -= 0.45;
+        } else if path_lower.ends_with("cargo.toml")
+            || path_lower.ends_with("package.json")
+            || path_lower.ends_with("pyproject.toml")
+            || path_lower.ends_with("go.mod")
+            || path_lower.ends_with("pom.xml")
+            || path_lower.ends_with("build.gradle")
+            || path_lower.ends_with("build.gradle.kts")
+            || path_lower.ends_with("pubspec.yaml")
+        {
+            if lower.contains("version")
+                || lower.contains("dependencies")
+                || lower.contains("dependency")
+            {
+                score -= 0.25;
+            } else {
+                score -= 0.08;
+            }
+        } else if path_lower.contains("/src/") || path_lower.ends_with(".rs") {
+            score += 0.05;
+        }
+    }
+
+    score
+}
+
 fn is_low_information_subject(subject: &str) -> bool {
     let lower = subject.trim().to_ascii_lowercase();
     if lower.is_empty() {
+        return true;
+    }
+    if matches!(
+        lower.as_str(),
+        "add version number"
+            | "add version"
+            | "update version"
+            | "update versions"
+            | "version bump"
+            | "bump version"
+            | "update dependencies"
+            | "mixed"
+    ) {
+        return true;
+    }
+    if lower.starts_with("update cargo.lock")
+        || lower.starts_with("update cargo lock")
+        || lower.starts_with("update lockfile")
+    {
         return true;
     }
 
@@ -2253,6 +2464,18 @@ fn simplify_subject_phrase(subject: &str) -> String {
         }
     }
 
+    for prefix in [
+        "extract/simplify/reorganize ",
+        "extract, simplify, reorganize ",
+        "extract simplify reorganize ",
+        "extract/reorganize ",
+    ] {
+        if out.to_ascii_lowercase().starts_with(prefix) {
+            out = format!("refactor {}", out[prefix.len()..].trim_start());
+            break;
+        }
+    }
+
     for (from, to) in [
         (" and creates ", " and create "),
         (" and adds ", " and add "),
@@ -2306,16 +2529,32 @@ fn decapitalize_first(value: &str) -> String {
 
 fn looks_like_reducer_meta(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
-    let has_any = |terms: &[&str]| terms.iter().any(|term| lower.contains(term));
-    let has_all = |terms: &[&str]| terms.iter().all(|term| lower.contains(term));
+    let tokens = lower
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    let contains_word = |needle: &str| tokens.iter().any(|token| *token == needle);
 
-    has_all(&["partial", "analys"])
-        || has_all(&["chunk", "analys"])
-        || has_all(&["consolidated", "report"])
-        || has_all(&["adaptive", "reducer"])
-        || (lower.contains("reduce")
-            && has_any(&["analysis", "analyses", "report", "chunk", "partial"]))
-        || (lower.contains("synthesi") && has_any(&["analysis", "analyses", "report", "chunk"]))
+    let has_analysis = contains_word("analysis") || contains_word("analyses");
+    let has_report = contains_word("report") || contains_word("reports");
+    let has_chunk = contains_word("chunk") || contains_word("chunks");
+    let has_partial = contains_word("partial") || contains_word("partials");
+    let has_reduce = contains_word("reduce")
+        || contains_word("reducer")
+        || contains_word("reducers")
+        || contains_word("reduction")
+        || contains_word("reductions");
+    let has_synthesis = contains_word("synthesis")
+        || contains_word("synthesize")
+        || contains_word("synthesized")
+        || contains_word("synthesizes");
+
+    (has_partial && has_analysis)
+        || (has_chunk && has_analysis)
+        || (lower.contains("consolidated report"))
+        || (lower.contains("adaptive reducer"))
+        || (has_reduce && (has_analysis || has_report || has_chunk || has_partial))
+        || (has_synthesis && (has_analysis || has_report || has_chunk))
 }
 
 fn normalize_reduce_summary(raw: &str) -> Option<String> {
@@ -2338,6 +2577,86 @@ fn normalize_reduce_summary(raw: &str) -> Option<String> {
     Some(summary)
 }
 
+fn recover_commit_message_from_reduce(
+    generated: &ReduceModelOutput,
+    items: &[ChangeItem],
+) -> Option<String> {
+    let description_candidate = sanitize_commit_subject(&generated.commit_message)
+        .or_else(|| sanitize_commit_subject(&generated.summary))?;
+    if looks_like_reducer_meta(&description_candidate)
+        || is_low_information_subject(&description_candidate)
+    {
+        return None;
+    }
+
+    let (commit_type, scope_from_header) = parse_conventional_commit(&generated.commit_message)
+        .map(|(kind, scope, _)| (kind, scope.and_then(sanitize_scope)))
+        .or_else(|| {
+            parse_type_prefixed_header(&generated.commit_message).map(|(kind, _)| (kind, None))
+        })
+        .or_else(|| parse_type_prefixed_header(&generated.summary).map(|(kind, _)| (kind, None)))
+        .unwrap_or_else(|| {
+            (
+                dominant_type_tag(items).map_or("chore", type_tag_prefix),
+                None,
+            )
+        });
+
+    let description =
+        trim_redundant_commit_type_prefix(commit_type, &decapitalize_first(&description_candidate));
+    if description.is_empty() {
+        return None;
+    }
+    let scope = scope_from_header.or_else(|| dominant_scope(items));
+
+    Some(match scope {
+        Some(scope) => format!("{commit_type}({scope}): {description}"),
+        None => format!("{commit_type}: {description}"),
+    })
+}
+
+fn recover_summary_from_reduce(
+    generated: &ReduceModelOutput,
+    commit_message: &str,
+    stats: &DiffStats,
+) -> Option<String> {
+    if let Some(summary) = normalize_reduce_summary(&generated.summary) {
+        return Some(summary);
+    }
+
+    let cleaned = sanitize_sentence(&generated.summary).trim().to_string();
+    if !cleaned.is_empty() && cleaned.len() >= 8 && !looks_like_reducer_meta(&cleaned) {
+        return Some(ensure_terminal_punctuation(cleaned));
+    }
+
+    summary_from_commit_message(commit_message, stats)
+}
+
+fn summary_from_commit_message(commit_message: &str, stats: &DiffStats) -> Option<String> {
+    let (_, _, desc) = parse_conventional_commit(commit_message)?;
+    let description = desc.trim();
+    if description.is_empty() {
+        return None;
+    }
+
+    let file_count = stats.files_changed.max(1);
+    let noun = if file_count == 1 { "file" } else { "files" };
+    Some(format!(
+        "{} across {file_count} {noun}.",
+        capitalize_first(description)
+    ))
+}
+
+fn ensure_terminal_punctuation(mut value: String) -> String {
+    let trimmed = value.trim_end();
+    if trimmed.ends_with(['.', '!', '?']) {
+        return trimmed.to_string();
+    }
+    value = trimmed.to_string();
+    value.push('.');
+    value
+}
+
 fn normalize_commit_message(raw: &str) -> Option<String> {
     let header = raw.lines().next()?.trim();
     if header.is_empty() {
@@ -2345,28 +2664,52 @@ fn normalize_commit_message(raw: &str) -> Option<String> {
     }
 
     if let Some((kind, scope, desc)) = parse_conventional_commit(header) {
-        if looks_like_reducer_meta(desc) {
+        let normalized_desc = sanitize_commit_subject(desc)?;
+        if looks_like_reducer_meta(&normalized_desc) || is_low_information_subject(&normalized_desc)
+        {
+            return None;
+        }
+        let description =
+            trim_redundant_commit_type_prefix(kind, &decapitalize_first(&normalized_desc));
+        if description.is_empty() {
             return None;
         }
         let mut out = kind.to_string();
-        if let Some(scope) = scope {
+        if let Some(scope) = scope.and_then(sanitize_scope) {
             out.push('(');
-            out.push_str(scope);
+            out.push_str(&scope);
             out.push(')');
         }
         out.push_str(": ");
-        out.push_str(desc);
+        out.push_str(&description);
         return Some(out);
     }
 
     if let Some((kind, desc)) = parse_type_prefixed_header(header) {
-        if looks_like_reducer_meta(desc) {
+        let normalized_desc = sanitize_commit_subject(desc)?;
+        if looks_like_reducer_meta(&normalized_desc) || is_low_information_subject(&normalized_desc)
+        {
             return None;
         }
-        return Some(format!("{kind}(autocommit): {desc}"));
+        let description =
+            trim_redundant_commit_type_prefix(kind, &decapitalize_first(&normalized_desc));
+        if description.is_empty() {
+            return None;
+        }
+        return Some(format!("{kind}(autocommit): {description}"));
     }
 
     None
+}
+
+fn env_budget_override(key: &str) -> Option<usize> {
+    std::env::var(key).ok().and_then(|raw| {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        trimmed.parse::<usize>().ok().filter(|value| *value > 0)
+    })
 }
 
 fn parse_conventional_commit(header: &str) -> Option<(&'static str, Option<&str>, &str)> {
@@ -2507,6 +2850,20 @@ mod tests {
     }
 
     #[test]
+    fn normalize_commit_message_rewrites_extract_simplify_reorganize_subject() {
+        let raw = "refactor: extract/simplify/reorganize model reduction logic";
+        let normalized = normalize_commit_message(raw).expect("commit should normalize");
+        assert_eq!(normalized, "refactor: model reduction logic");
+    }
+
+    #[test]
+    fn normalize_commit_message_drops_placeholder_scope() {
+        let raw = "feat(scope): add cache key with no version";
+        let normalized = normalize_commit_message(raw).expect("commit should normalize");
+        assert_eq!(normalized, "feat: add cache key with no version");
+    }
+
+    #[test]
     fn normalize_reduce_summary_rejects_meta_phrasing() {
         let raw = "Consolidate 9 partial analyses into one consolidated report.";
         assert!(normalize_reduce_summary(raw).is_none());
@@ -2519,6 +2876,109 @@ mod tests {
             normalize_reduce_summary(raw).as_deref(),
             Some("Improve commit message quality across 4 files.")
         );
+    }
+
+    #[test]
+    fn normalize_reduce_summary_allows_non_meta_reduce_wording() {
+        let raw = "Preserve valid commit text when reduce JSON is partially malformed.";
+        assert_eq!(
+            normalize_reduce_summary(raw).as_deref(),
+            Some("Preserve valid commit text when reduce JSON is partially malformed.")
+        );
+    }
+
+    #[test]
+    fn parse_reduce_output_keeps_commit_when_summary_missing() {
+        let raw = r#"{"commit_message":"refactor(cli): tighten reduce output acceptance","risk_level":"low"}"#;
+        let parsed = parse_reduce_output(raw).expect("reduce parse should keep commit");
+        assert_eq!(
+            normalize_commit_message(&parsed.commit_message).as_deref(),
+            Some("refactor(cli): tighten reduce output acceptance")
+        );
+        assert!(parsed.summary.is_empty());
+    }
+
+    #[test]
+    fn parse_reduce_output_salvages_freeform_commit_and_summary() {
+        let raw = "\
+Commit: feat(core): preserve valid reduce commit output
+Summary: Preserve valid commit text when reduce JSON is partially malformed.
+";
+        let parsed = parse_reduce_output(raw).expect("freeform reduce output should salvage");
+        assert_eq!(
+            normalize_commit_message(&parsed.commit_message).as_deref(),
+            Some("feat(core): preserve valid reduce commit output")
+        );
+        assert_eq!(
+            normalize_reduce_summary(&parsed.summary).as_deref(),
+            Some("Preserve valid commit text when reduce JSON is partially malformed.")
+        );
+    }
+
+    #[test]
+    fn recover_commit_message_from_reduce_repairs_non_conventional_subject() {
+        let generated = ReduceModelOutput {
+            commit_message: "extract/simplify/reorganize model reduction logic".to_string(),
+            summary: String::new(),
+            risk_level: "low".to_string(),
+            risk_notes: Vec::new(),
+        };
+        let items = vec![sample_item(
+            TypeTag::Refactor,
+            "Refactor model reduction logic",
+            "Refactor model reduction logic",
+            "crates/llama-runtime/src/model.rs",
+            0.9,
+        )];
+
+        let repaired =
+            recover_commit_message_from_reduce(&generated, &items).expect("should repair commit");
+        assert_eq!(repaired, "refactor(llama-runtime): model reduction logic");
+    }
+
+    #[test]
+    fn recover_commit_message_from_reduce_ignores_placeholder_scope() {
+        let generated = ReduceModelOutput {
+            commit_message: "feat(scope): add cache key with no version".to_string(),
+            summary: String::new(),
+            risk_level: "low".to_string(),
+            risk_notes: Vec::new(),
+        };
+        let items = vec![sample_item(
+            TypeTag::Feat,
+            "Add cache key with no version",
+            "Share cache keys between commands",
+            "crates/cli/src/cmd/report_cache.rs",
+            0.88,
+        )];
+
+        let repaired =
+            recover_commit_message_from_reduce(&generated, &items).expect("should repair commit");
+        assert_eq!(repaired, "feat(cli): add cache key with no version");
+    }
+
+    #[test]
+    fn recover_summary_from_reduce_uses_commit_when_summary_is_meta() {
+        let generated = ReduceModelOutput {
+            commit_message: "refactor(llama-runtime): model reduction logic".to_string(),
+            summary: "Consolidate partial analyses into one report".to_string(),
+            risk_level: "medium".to_string(),
+            risk_notes: Vec::new(),
+        };
+        let stats = DiffStats {
+            files_changed: 3,
+            lines_changed: 120,
+            hunks: 10,
+            binary_files: 0,
+        };
+
+        let summary = recover_summary_from_reduce(
+            &generated,
+            "refactor(llama-runtime): model reduction logic",
+            &stats,
+        )
+        .expect("should recover summary");
+        assert_eq!(summary, "Model reduction logic across 3 files.");
     }
 
     #[test]
@@ -2643,6 +3103,29 @@ mod tests {
 
         let commit = synthesize_fallback_commit_message(&items, 2);
         assert_eq!(commit, "feat(core): build reduce prompt");
+    }
+
+    #[test]
+    fn commit_synthesis_downranks_manifest_version_noise() {
+        let items = vec![
+            sample_item(
+                TypeTag::Feat,
+                "Add version number",
+                "Update package version",
+                "crates/llama-runtime/Cargo.toml",
+                0.95,
+            ),
+            sample_item(
+                TypeTag::Refactor,
+                "Refactor model reduction logic",
+                "Simplify reduce candidate handling",
+                "crates/llama-runtime/src/model.rs",
+                0.82,
+            ),
+        ];
+
+        let commit = synthesize_fallback_commit_message(&items, 2);
+        assert_eq!(commit, "refactor(llama-runtime): model reduction logic");
     }
 
     #[test]

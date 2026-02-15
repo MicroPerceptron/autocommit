@@ -94,7 +94,7 @@ pub fn run(args: &[String]) -> Result<String, String> {
     }
 
     let diff_hash = report_cache::diff_hash(&diff_text);
-    let cache_key = report_cache::cache_key("analyze", runtime_profile.as_str(), &diff_hash, "1.0");
+    let cache_key = report_cache::cache_key("analyze", runtime_profile.as_str(), &diff_hash);
     let cache_path = git::Repo::discover()
         .ok()
         .map(|repo| report_cache::cache_path(repo.common_git_dir()));

@@ -128,7 +128,7 @@ pub fn run(args: &[String]) -> Result<String, String> {
     .map_err(|err| err.to_string())?;
 
     let diff_hash = report_cache::diff_hash(&diff_text);
-    let cache_key = report_cache::cache_key("pr", runtime_profile.as_str(), &diff_hash, "1.0");
+    let cache_key = report_cache::cache_key("pr", runtime_profile.as_str(), &diff_hash);
     let cache_path = report_cache::cache_path(repo.common_git_dir());
     let cached_report = report_cache::read_cached_report(&cache_path, &cache_key);
 

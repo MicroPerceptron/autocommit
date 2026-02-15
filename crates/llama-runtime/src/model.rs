@@ -1474,15 +1474,19 @@ fn top_subject_candidates(items: &[ChangeItem], limit: usize) -> Vec<SubjectCand
             .first()
             .and_then(|file| scope_from_path(&file.path));
 
-        for (raw, bonus) in [(&item.title, 0.05f32), (&item.intent, 0.0f32)] {
-            let Some(candidate) = sanitize_commit_subject(raw) else {
+        for (raw, bonus) in [(&item.title, 0.02f32), (&item.intent, 0.0f32)] {
+            let Some(candidate_raw) = sanitize_commit_subject(raw) else {
                 continue;
             };
-            if looks_like_reducer_meta(&candidate) {
+            if looks_like_reducer_meta(&candidate_raw) {
+                continue;
+            }
+            let candidate = clamp_chars(&candidate_raw, 72);
+            if candidate.is_empty() {
                 continue;
             }
 
-            let score = item.confidence + bonus + subject_quality_bonus(&candidate);
+            let score = item.confidence + bonus + subject_quality_bonus(&candidate_raw);
             if best_for_item
                 .as_ref()
                 .map(|existing| score > existing.score)
@@ -1557,6 +1561,8 @@ fn subject_quality_bonus(subject: &str) -> f32 {
 
     if lower.starts_with("add ")
         || lower.starts_with("build ")
+        || lower.starts_with("compose ")
+        || lower.starts_with("consolidate ")
         || lower.starts_with("fix ")
         || lower.starts_with("refactor ")
         || lower.starts_with("update ")
@@ -1589,6 +1595,15 @@ fn subject_quality_bonus(subject: &str) -> f32 {
     if lower.contains("misc") || lower.contains("various") {
         score -= 0.20;
     }
+    if lower.starts_with("implement a feature that ")
+        || lower.starts_with("implement feature that ")
+        || lower.starts_with("add a feature that ")
+        || lower.starts_with("add feature that ")
+        || lower.starts_with("create a feature that ")
+        || lower.starts_with("create feature that ")
+    {
+        score -= 0.25;
+    }
 
     score
 }
@@ -1608,12 +1623,13 @@ fn sanitize_commit_subject(raw: &str) -> Option<String> {
         .trim()
         .trim_end_matches(['.', ';', ','])
         .to_string();
+    subject = simplify_subject_phrase(&subject);
 
     if subject.is_empty() {
         return None;
     }
 
-    Some(clamp_chars(&subject, 72))
+    Some(subject)
 }
 
 fn default_commit_subject(commit_type: &str, partial_count: usize) -> String {
@@ -1630,11 +1646,87 @@ fn default_commit_subject(commit_type: &str, partial_count: usize) -> String {
 }
 
 fn clamp_chars(value: &str, max_chars: usize) -> String {
-    let mut out = String::new();
-    for ch in value.chars().take(max_chars) {
-        out.push(ch);
+    let value = value.trim();
+    if value.chars().count() <= max_chars {
+        return value.to_string();
     }
-    out.trim().to_string()
+
+    let mut out = String::new();
+    for token in value.split_whitespace() {
+        let next = if out.is_empty() {
+            token.to_string()
+        } else {
+            format!("{out} {token}")
+        };
+        if next.chars().count() > max_chars {
+            break;
+        }
+        out = next;
+    }
+
+    if !out.is_empty() {
+        return out;
+    }
+
+    value.chars().take(max_chars).collect::<String>().trim().to_string()
+}
+
+fn simplify_subject_phrase(subject: &str) -> String {
+    let mut out = subject.trim().to_string();
+    if out.is_empty() {
+        return out;
+    }
+
+    for prefix in [
+        "implement a feature that ",
+        "implement feature that ",
+        "add a feature that ",
+        "add feature that ",
+        "create a feature that ",
+        "create feature that ",
+    ] {
+        if out.to_ascii_lowercase().starts_with(prefix) {
+            out = out[prefix.len()..].trim_start().to_string();
+            break;
+        }
+    }
+
+    for (from, to) in [
+        ("composes ", "compose "),
+        ("creates ", "create "),
+        ("adds ", "add "),
+        ("builds ", "build "),
+        ("updates ", "update "),
+        ("fixes ", "fix "),
+        ("refactors ", "refactor "),
+        ("improves ", "improve "),
+        ("supports ", "support "),
+        ("prevents ", "prevent "),
+        ("guards ", "guard "),
+        ("implements ", "implement "),
+    ] {
+        if out.to_ascii_lowercase().starts_with(from) {
+            out = format!("{to}{}", out[from.len()..].trim_start());
+            break;
+        }
+    }
+
+    for (from, to) in [
+        (" and creates ", " and create "),
+        (" and adds ", " and add "),
+        (" and builds ", " and build "),
+        (" and updates ", " and update "),
+        (" and fixes ", " and fix "),
+        (" and refactors ", " and refactor "),
+        (" and improves ", " and improve "),
+        (" and supports ", " and support "),
+        (" and prevents ", " and prevent "),
+        (" and guards ", " and guard "),
+    ] {
+        out = out.replace(from, to);
+    }
+
+    out
 }
 
 fn capitalize_first(value: &str) -> String {
@@ -1678,7 +1770,6 @@ fn looks_like_reducer_meta(value: &str) -> bool {
     has_all(&["partial", "analys"])
         || has_all(&["chunk", "analys"])
         || has_all(&["consolidated", "report"])
-        || has_all(&["analysis", "report"])
         || has_all(&["adaptive", "reducer"])
         || (lower.contains("reduce")
             && has_any(&["analysis", "analyses", "report", "chunk", "partial"]))

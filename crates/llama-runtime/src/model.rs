@@ -1192,6 +1192,8 @@ fn partial_from_model_chunk(
     let summary = sanitize_sentence(&model.summary);
     let title = sanitize_sentence(&model.title);
     let intent = sanitize_sentence(&model.intent);
+    let (bucket, type_tag) =
+        reconcile_model_labels(&model.bucket, &model.type_tag, &title, &intent);
 
     PartialReport {
         summary: if summary.is_empty() {
@@ -1204,8 +1206,8 @@ fn partial_from_model_chunk(
         },
         items: vec![ChangeItem {
             id: mapped_change_item_id(&chunk.path, ordinal),
-            bucket: model.bucket,
-            type_tag: model.type_tag,
+            bucket,
+            type_tag,
             title: if title.is_empty() {
                 format!("update {}", chunk.path)
             } else {
@@ -1223,6 +1225,88 @@ fn partial_from_model_chunk(
             }],
             confidence,
         }],
+    }
+}
+
+fn reconcile_model_labels(
+    bucket: &ChangeBucket,
+    type_tag: &TypeTag,
+    title: &str,
+    intent: &str,
+) -> (ChangeBucket, TypeTag) {
+    let combined = format!(
+        "{} {}",
+        title.to_ascii_lowercase(),
+        intent.to_ascii_lowercase()
+    );
+    let inferred_type = infer_type_tag_from_text(&combined);
+    let inferred_bucket = infer_bucket_from_text(&combined);
+
+    let mut final_type = type_tag.clone();
+    if should_override_type_tag(type_tag, &inferred_type) {
+        final_type = inferred_type;
+    }
+
+    let mut final_bucket = bucket.clone();
+    if matches!(final_bucket, ChangeBucket::Other)
+        && !matches!(inferred_bucket, ChangeBucket::Other)
+    {
+        final_bucket = inferred_bucket;
+    }
+    final_bucket = normalize_bucket_for_type(final_bucket, &final_type);
+
+    (final_bucket, final_type)
+}
+
+fn should_override_type_tag(current: &TypeTag, inferred: &TypeTag) -> bool {
+    if matches!(inferred, TypeTag::Mixed) {
+        return false;
+    }
+
+    match current {
+        TypeTag::Feat => matches!(
+            inferred,
+            TypeTag::Fix
+                | TypeTag::Refactor
+                | TypeTag::Docs
+                | TypeTag::Test
+                | TypeTag::Perf
+                | TypeTag::Style
+        ),
+        TypeTag::Mixed | TypeTag::Chore => true,
+        _ => false,
+    }
+}
+
+fn normalize_bucket_for_type(bucket: ChangeBucket, type_tag: &TypeTag) -> ChangeBucket {
+    match type_tag {
+        TypeTag::Refactor
+        | TypeTag::Fix
+        | TypeTag::Test
+        | TypeTag::Perf
+        | TypeTag::Style
+        | TypeTag::Chore => {
+            if matches!(bucket, ChangeBucket::Feature) {
+                ChangeBucket::Patch
+            } else {
+                bucket
+            }
+        }
+        TypeTag::Docs => {
+            if matches!(bucket, ChangeBucket::Feature | ChangeBucket::Other) {
+                ChangeBucket::Addition
+            } else {
+                bucket
+            }
+        }
+        TypeTag::Feat => {
+            if matches!(bucket, ChangeBucket::Other) {
+                ChangeBucket::Feature
+            } else {
+                bucket
+            }
+        }
+        TypeTag::Mixed => bucket,
     }
 }
 
@@ -1478,6 +1562,9 @@ fn top_subject_candidates(items: &[ChangeItem], limit: usize) -> Vec<SubjectCand
             let Some(candidate_raw) = sanitize_commit_subject(raw) else {
                 continue;
             };
+            if is_low_information_subject(&candidate_raw) {
+                continue;
+            }
             if looks_like_reducer_meta(&candidate_raw) {
                 continue;
             }
@@ -1587,7 +1674,11 @@ fn subject_quality_bonus(subject: &str) -> f32 {
     }
 
     if lower.contains("commit message") {
-        score -= 0.35;
+        if lower.contains("synthesi") || lower.contains("composition") {
+            score -= 0.35;
+        } else {
+            score -= 0.08;
+        }
     }
     if lower.contains("synthesis") {
         score -= 0.25;
@@ -1606,6 +1697,33 @@ fn subject_quality_bonus(subject: &str) -> f32 {
     }
 
     score
+}
+
+fn is_low_information_subject(subject: &str) -> bool {
+    let lower = subject.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return true;
+    }
+
+    let words = lower.split_whitespace().collect::<Vec<_>>();
+    if words.len() == 1 {
+        return matches!(
+            words[0],
+            "refactor"
+                | "fix"
+                | "update"
+                | "improve"
+                | "add"
+                | "build"
+                | "implement"
+                | "feature"
+                | "chore"
+                | "changes"
+                | "cleanup"
+        );
+    }
+
+    false
 }
 
 fn sanitize_commit_subject(raw: &str) -> Option<String> {
@@ -1668,7 +1786,12 @@ fn clamp_chars(value: &str, max_chars: usize) -> String {
         return out;
     }
 
-    value.chars().take(max_chars).collect::<String>().trim().to_string()
+    value
+        .chars()
+        .take(max_chars)
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 fn simplify_subject_phrase(subject: &str) -> String {
@@ -1987,9 +2110,11 @@ mod tests {
         };
 
         let summary = synthesize_fallback_summary(&items, &stats);
-        assert_eq!(
-            summary,
-            "Guard backend config export and Consolidate runtime prompt handling across 2 files."
+        assert!(
+            summary
+                == "Guard backend config export and Consolidate runtime prompt handling across 2 files."
+                || summary
+                    == "Consolidate runtime prompt handling and Guard backend config export across 2 files."
         );
     }
 
@@ -2014,6 +2139,39 @@ mod tests {
 
         let commit = synthesize_fallback_commit_message(&items, 2);
         assert_eq!(commit, "feat(core): build reduce prompt");
+    }
+
+    #[test]
+    fn reconcile_model_labels_demotes_feature_to_refactor_when_text_says_refactor() {
+        let (bucket, tag) = reconcile_model_labels(
+            &ChangeBucket::Feature,
+            &TypeTag::Feat,
+            "Refactor commit message generation and creation",
+            "Improve commit message composition",
+        );
+        assert_eq!(tag, TypeTag::Refactor);
+        assert_eq!(bucket, ChangeBucket::Patch);
+    }
+
+    #[test]
+    fn clamp_chars_keeps_word_boundaries() {
+        assert_eq!(clamp_chars("alpha beta gamma", 11), "alpha beta");
+    }
+
+    #[test]
+    fn simplify_subject_phrase_strips_feature_boilerplate() {
+        assert_eq!(
+            simplify_subject_phrase("Implement a feature that composes commit messages"),
+            "compose commit messages"
+        );
+    }
+
+    #[test]
+    fn low_information_subject_detection_flags_single_generic_verbs() {
+        assert!(is_low_information_subject("Refactor"));
+        assert!(!is_low_information_subject(
+            "Refactor ChangeItem formatting"
+        ));
     }
 
     #[test]

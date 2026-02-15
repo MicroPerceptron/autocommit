@@ -294,15 +294,148 @@ fn format_change_item(item: &autocommit_core::types::ChangeItem) -> String {
         String::new()
     };
 
-    let title = item.title.trim();
-    let intent = item.intent.trim();
-    let suffix = if intent.is_empty() || intent.eq_ignore_ascii_case(title) {
-        String::new()
+    let title = normalize_change_fragment(item.title.trim());
+    let title = clamp_words(&title, 88);
+    let title = if title.is_empty() {
+        "update file".to_string()
     } else {
+        title
+    };
+
+    let intent = normalize_change_fragment(item.intent.trim());
+    let intent = clamp_words(&intent, 132);
+
+    let suffix = if should_include_intent_detail(&title, &intent) {
         format!(": {intent}")
+    } else {
+        String::new()
     };
 
     format!("[{path}{file_suffix}] {title}{suffix}")
+}
+
+fn normalize_change_fragment(raw: &str) -> String {
+    let mut out = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    out = out
+        .trim_matches(|ch: char| ch == '"' || ch == '\'' || ch == '`')
+        .trim()
+        .trim_end_matches(['.', ';', ','])
+        .to_string();
+    if out.is_empty() {
+        return out;
+    }
+
+    for prefix in [
+        "implement a feature that ",
+        "implement feature that ",
+        "add a feature that ",
+        "add feature that ",
+        "create a feature that ",
+        "create feature that ",
+    ] {
+        if out.to_ascii_lowercase().starts_with(prefix) {
+            out = out[prefix.len()..].trim_start().to_string();
+            break;
+        }
+    }
+
+    for (from, to) in [
+        ("composes ", "compose "),
+        ("creates ", "create "),
+        ("adds ", "add "),
+        ("builds ", "build "),
+        ("updates ", "update "),
+        ("fixes ", "fix "),
+        ("refactors ", "refactor "),
+        ("improves ", "improve "),
+        ("supports ", "support "),
+        ("prevents ", "prevent "),
+        ("guards ", "guard "),
+        ("implements ", "implement "),
+    ] {
+        if out.to_ascii_lowercase().starts_with(from) {
+            out = format!("{to}{}", out[from.len()..].trim_start());
+            break;
+        }
+    }
+
+    for (from, to) in [
+        (" and creates ", " and create "),
+        (" and adds ", " and add "),
+        (" and builds ", " and build "),
+        (" and updates ", " and update "),
+        (" and fixes ", " and fix "),
+        (" and refactors ", " and refactor "),
+        (" and improves ", " and improve "),
+        (" and supports ", " and support "),
+        (" and prevents ", " and prevent "),
+        (" and guards ", " and guard "),
+    ] {
+        out = out.replace(from, to);
+    }
+
+    out
+}
+
+fn clamp_words(value: &str, max_chars: usize) -> String {
+    let value = value.trim();
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+
+    let mut out = String::new();
+    for token in value.split_whitespace() {
+        let next = if out.is_empty() {
+            token.to_string()
+        } else {
+            format!("{out} {token}")
+        };
+        if next.chars().count() > max_chars {
+            break;
+        }
+        out = next;
+    }
+
+    if out.is_empty() {
+        value
+            .chars()
+            .take(max_chars)
+            .collect::<String>()
+            .trim()
+            .to_string()
+    } else {
+        out
+    }
+}
+
+fn should_include_intent_detail(title: &str, intent: &str) -> bool {
+    let title = title.trim();
+    let intent = intent.trim();
+    if title.is_empty() || intent.is_empty() {
+        return false;
+    }
+    if title.eq_ignore_ascii_case(intent) {
+        return false;
+    }
+
+    let title_lower = title.to_ascii_lowercase();
+    let intent_lower = intent.to_ascii_lowercase();
+    if intent_lower.contains(&title_lower) || title_lower.contains(&intent_lower) {
+        return false;
+    }
+
+    let title_words = title_lower.split_whitespace().collect::<Vec<_>>();
+    let intent_words = intent_lower.split_whitespace().collect::<Vec<_>>();
+    let shared_prefix = title_words
+        .iter()
+        .zip(intent_words.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+    if shared_prefix >= 3 {
+        return false;
+    }
+
+    true
 }
 
 fn looks_like_internal_risk_tag(note: &str) -> bool {
@@ -482,5 +615,28 @@ mod tests {
 
         let message = compose_commit_message(&report);
         assert_eq!(message, "feat(core): add detailed commit composition");
+    }
+
+    #[test]
+    fn format_change_item_collapses_boilerplate_and_redundant_intent() {
+        let item = ChangeItem {
+            id: "c".to_string(),
+            bucket: ChangeBucket::Feature,
+            type_tag: TypeTag::Feat,
+            title: "Commit Message Composition and Creation with Analysis Report".to_string(),
+            intent: "Implement a feature that composes commit messages based on an analysis report and creates commits with the composed messages.".to_string(),
+            files: vec![FileRef {
+                path: "crates/cli/src/cmd/commit.rs".to_string(),
+                status: FileStatus::Modified,
+                ranges: Vec::new(),
+            }],
+            confidence: 0.8,
+        };
+
+        let formatted = format_change_item(&item);
+        assert_eq!(
+            formatted,
+            "[crates/cli/src/cmd/commit.rs] Commit Message Composition and Creation with Analysis Report: compose commit messages based on an analysis report and create commits with the composed messages"
+        );
     }
 }

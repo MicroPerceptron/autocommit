@@ -1,5 +1,6 @@
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use autocommit_core::CoreError;
 use gix::bstr::{BStr, BString, ByteSlice};
@@ -129,9 +130,34 @@ impl Repo {
     }
 
     pub(crate) fn push(&self) -> Result<(), CoreError> {
-        Err(CoreError::Io(
-            "push is not implemented for the pure-gix backend in this build".to_string(),
-        ))
+        let repo_root = self.repo_root();
+        let output = Command::new("git")
+            .arg("push")
+            .current_dir(&repo_root)
+            .output()
+            .map_err(|err| CoreError::Io(format!("failed to run git push: {err}")))?;
+
+        if output.status.success() {
+            return Ok(());
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let mut detail = String::new();
+        if !stderr.is_empty() {
+            detail.push_str(&stderr);
+        }
+        if !stdout.is_empty() {
+            if !detail.is_empty() {
+                detail.push_str("; ");
+            }
+            detail.push_str(&stdout);
+        }
+        if detail.is_empty() {
+            detail.push_str("unknown error");
+        }
+
+        Err(CoreError::Io(format!("git push failed: {detail}")))
     }
 
     fn tree_id_for_index(&self) -> Result<gix::hash::ObjectId, CoreError> {

@@ -1,6 +1,7 @@
 pub mod analyze;
 pub mod commit;
 pub mod explain_dispatch;
+mod git;
 pub mod init;
 #[cfg(feature = "llama-native")]
 pub mod repo_cache;

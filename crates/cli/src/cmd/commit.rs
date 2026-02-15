@@ -1,9 +1,8 @@
-use std::process::Command;
-
 use autocommit_core::AnalysisReport;
 use autocommit_core::llm::traits::LlmEngine;
 use autocommit_core::{AnalyzeOptions, CoreError, run as core_run};
 
+use crate::cmd::git;
 #[cfg(feature = "llama-native")]
 use crate::cmd::repo_cache;
 use crate::output;
@@ -83,7 +82,9 @@ pub fn run(args: &[String]) -> Result<String, String> {
         }
     }
 
-    let diff_text = prepare_diff(staged_only, dry_run).map_err(|err| err.to_string())?;
+    let repo = git::Repo::discover().map_err(|err| err.to_string())?;
+
+    let diff_text = prepare_diff(&repo, staged_only, dry_run).map_err(|err| err.to_string())?;
 
     #[cfg(feature = "llama-native")]
     let generation_state = repo_paths.map(|paths| paths.generation_state);
@@ -114,10 +115,10 @@ pub fn run(args: &[String]) -> Result<String, String> {
     }
 
     let composed_message = compose_commit_message(&report);
-    commit_with_message(&composed_message, no_verify).map_err(|err| err.to_string())?;
+    commit_with_message(&repo, &composed_message, no_verify).map_err(|err| err.to_string())?;
 
     if push {
-        run_git(&["push"]).map_err(|err| err.to_string())?;
+        repo.push().map_err(|err| err.to_string())?;
     }
 
     if json {
@@ -130,9 +131,9 @@ pub fn run(args: &[String]) -> Result<String, String> {
     }
 }
 
-fn prepare_diff(staged_only: bool, dry_run: bool) -> Result<String, CoreError> {
+fn prepare_diff(repo: &git::Repo, staged_only: bool, dry_run: bool) -> Result<String, CoreError> {
     if staged_only {
-        let staged = run_git(&["diff", "--cached"])?;
+        let staged = repo.diff_cached()?;
         if staged.trim().is_empty() {
             return Err(CoreError::InvalidDiff(
                 "no staged changes to commit".to_string(),
@@ -142,8 +143,8 @@ fn prepare_diff(staged_only: bool, dry_run: bool) -> Result<String, CoreError> {
     }
 
     if dry_run {
-        let staged = run_git(&["diff", "--cached"])?;
-        let unstaged = run_git(&["diff"])?;
+        let staged = repo.diff_cached()?;
+        let unstaged = repo.diff_worktree()?;
         let combined = concat_diffs(&staged, &unstaged);
         if combined.trim().is_empty() {
             return Err(CoreError::InvalidDiff(
@@ -153,8 +154,8 @@ fn prepare_diff(staged_only: bool, dry_run: bool) -> Result<String, CoreError> {
         return Ok(combined);
     }
 
-    run_git(&["add", "-A"])?;
-    let staged = run_git(&["diff", "--cached"])?;
+    repo.add_all()?;
+    let staged = repo.diff_cached()?;
     if staged.trim().is_empty() {
         return Err(CoreError::InvalidDiff(
             "no changes staged after git add -A".to_string(),
@@ -178,7 +179,7 @@ fn concat_diffs(staged: &str, unstaged: &str) -> String {
     combined
 }
 
-fn commit_with_message(message: &str, no_verify: bool) -> Result<(), CoreError> {
+fn commit_with_message(repo: &git::Repo, message: &str, no_verify: bool) -> Result<(), CoreError> {
     let mut lines = message.lines();
     let subject = lines.next().unwrap_or_default().trim();
     if subject.is_empty() {
@@ -190,15 +191,8 @@ fn commit_with_message(message: &str, no_verify: bool) -> Result<(), CoreError> 
     let body = lines.collect::<Vec<_>>().join("\n");
     let body = body.trim();
 
-    let mut args = vec!["commit", "-m", subject];
-    if !body.is_empty() {
-        args.push("-m");
-        args.push(body);
-    }
-    if no_verify {
-        args.push("--no-verify");
-    }
-    run_git(&args)?;
+    let body = (!body.is_empty()).then_some(body);
+    repo.commit(subject, body, no_verify)?;
     Ok(())
 }
 
@@ -444,23 +438,6 @@ fn looks_like_internal_risk_tag(note: &str) -> bool {
         && lower
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, ':' | '_' | '-' | '/'))
-}
-
-fn run_git(args: &[&str]) -> Result<String, CoreError> {
-    let output = Command::new("git")
-        .args(args)
-        .output()
-        .map_err(|err| CoreError::Io(format!("failed to run git {}: {err}", args.join(" "))))?;
-
-    if !output.status.success() {
-        return Err(CoreError::Io(format!(
-            "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 #[cfg(not(feature = "llama-native"))]

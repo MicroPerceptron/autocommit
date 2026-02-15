@@ -1,10 +1,10 @@
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 
 use autocommit_core::llm::traits::LlmEngine;
 use autocommit_core::{AnalyzeOptions, CoreError, run as core_run};
 
+use crate::cmd::git;
 #[cfg(feature = "llama-native")]
 use crate::cmd::repo_cache;
 use crate::output;
@@ -117,8 +117,9 @@ fn load_diff(diff_file: Option<&str>) -> Result<String, CoreError> {
 }
 
 fn read_git_diff() -> Result<String, CoreError> {
-    let staged = run_git(&["diff", "--cached"])?;
-    let unstaged = run_git(&["diff"])?;
+    let repo = git::Repo::discover()?;
+    let staged = repo.diff_cached()?;
+    let unstaged = repo.diff_worktree()?;
     let mut combined = String::new();
 
     if !staged.trim().is_empty() {
@@ -139,23 +140,6 @@ fn read_git_diff() -> Result<String, CoreError> {
     }
 
     Ok(combined)
-}
-
-fn run_git(args: &[&str]) -> Result<String, CoreError> {
-    let output = Command::new("git")
-        .args(args)
-        .output()
-        .map_err(|err| CoreError::Io(format!("failed to run git {}: {err}", args.join(" "))))?;
-
-    if !output.status.success() {
-        return Err(CoreError::Io(format!(
-            "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 #[cfg(not(feature = "llama-native"))]

@@ -263,6 +263,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c66adef5e4d836ad08bf424dce5e3eb18f51544eee702860419295120dd48811"
 dependencies = [
  "gix-actor",
+ "gix-command",
  "gix-commitgraph",
  "gix-config",
  "gix-date",

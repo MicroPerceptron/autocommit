@@ -129,13 +129,21 @@ pub fn run(args: &[String]) -> Result<String, String> {
         core_run(engine.as_ref(), &diff_text, &AnalyzeOptions::default())
     })
     .map_err(|err| format!("analysis failed: {err}"))?;
-    let version_recommendations = version_bump::recommend(&repo, &diff_text, &report);
+    let embedding_bump_level = infer_embedding_bump_level(engine.as_ref(), &diff_text, &report);
+    let version_recommendations =
+        version_bump::recommend(&repo, &diff_text, &report, embedding_bump_level);
     let approved_version_recommendations = resolve_version_bump_recommendations(
         &version_recommendations,
         interactive,
         rich_interactive,
         assume_yes,
     )?;
+
+    if !dry_run && !approved_version_recommendations.is_empty() {
+        run_step(rich_interactive, "Applying version bumps", || {
+            apply_approved_version_bumps(&repo, staged_only, &approved_version_recommendations)
+        })?;
+    }
 
     if dry_run {
         if json {
@@ -545,6 +553,115 @@ fn commit_with_message(
     Ok(())
 }
 
+fn apply_approved_version_bumps(
+    repo: &git::Repo,
+    staged_only: bool,
+    recommendations: &[version_bump::VersionRecommendation],
+) -> Result<(), String> {
+    if recommendations.is_empty() {
+        return Ok(());
+    }
+    if staged_only {
+        return Err(
+            "approved version bumps cannot be auto-applied with --staged; rerun without --staged"
+                .to_string(),
+        );
+    }
+
+    version_bump::apply(repo, recommendations)?;
+    Ok(())
+}
+
+fn infer_embedding_bump_level(
+    engine: &dyn LlmEngine,
+    _diff_text: &str,
+    report: &AnalysisReport,
+) -> Option<version_bump::BumpLevel> {
+    let signal = build_bump_embedding_signal(report);
+    let signal_embedding = engine.embed(&signal).ok()?;
+    if signal_embedding.is_empty() {
+        return None;
+    }
+
+    let anchors = [
+        (
+            version_bump::BumpLevel::Patch,
+            "Patch release: backward-compatible bug fixes, documentation updates, refactors that keep public behavior stable.",
+        ),
+        (
+            version_bump::BumpLevel::Minor,
+            "Minor release: backward-compatible new functionality, new commands, new APIs, new features without breaking existing usage.",
+        ),
+        (
+            version_bump::BumpLevel::Major,
+            "Major release: breaking changes, incompatible API changes, removed behavior, required migration steps for users.",
+        ),
+    ];
+
+    let mut best: Option<(version_bump::BumpLevel, f32)> = None;
+    for (level, text) in anchors {
+        let anchor_embedding = engine.embed(text).ok()?;
+        let similarity = cosine_similarity(&signal_embedding, &anchor_embedding)?;
+        best = match best {
+            Some((_, current)) if current >= similarity => best,
+            _ => Some((level, similarity)),
+        };
+    }
+
+    best.map(|(level, _)| level)
+}
+
+fn build_bump_embedding_signal(report: &AnalysisReport) -> String {
+    let subject = report.commit_message.trim();
+    let summary = report.summary.trim();
+    let risk = clamp_text(&report.risk.notes.join(" "), 160);
+    let item_text = report
+        .items
+        .iter()
+        .take(8)
+        .map(|item| format!("{} {}", item.title.trim(), item.intent.trim()))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let item_text = clamp_text(&item_text, 420);
+
+    let signal = format!("subject: {subject}\nsummary: {summary}\nrisk: {risk}\nitems: {item_text}");
+    clamp_text(&signal, 760)
+}
+
+fn clamp_text(value: &str, max_chars: usize) -> String {
+    value
+        .chars()
+        .take(max_chars)
+        .collect::<String>()
+        .replace('\n', " ")
+}
+
+fn cosine_similarity(a: &[f32], b: &[f32]) -> Option<f32> {
+    if a.is_empty() || b.is_empty() {
+        return None;
+    }
+    let len = a.len().min(b.len());
+    if len == 0 {
+        return None;
+    }
+
+    let mut dot = 0.0f32;
+    let mut norm_a = 0.0f32;
+    let mut norm_b = 0.0f32;
+    for idx in 0..len {
+        let av = a[idx];
+        let bv = b[idx];
+        dot += av * bv;
+        norm_a += av * av;
+        norm_b += bv * bv;
+    }
+    if norm_a <= f32::EPSILON || norm_b <= f32::EPSILON {
+        return None;
+    }
+
+    Some(dot / (norm_a.sqrt() * norm_b.sqrt()))
+}
+
 fn compose_commit_message(
     report: &AnalysisReport,
     recommendations: &[version_bump::VersionRecommendation],
@@ -591,7 +708,7 @@ fn prompt_version_bump_recommendations_rich(
     let theme = ColorfulTheme::default();
     let term = Term::stderr();
     let options = [
-        "Approve and include in commit message",
+        "Approve, apply, and include in commit message",
         "Skip for this commit",
     ];
 
@@ -635,7 +752,7 @@ fn prompt_version_bump_recommendations_basic(
     }
 
     loop {
-        print!("Include these in commit message? [Y/n]: ");
+        print!("Apply these version bumps and include them in commit message? [Y/n]: ");
         std::io::stdout()
             .flush()
             .map_err(|err| format!("failed to flush prompt output: {err}"))?;
@@ -769,7 +886,7 @@ fn compose_version_recommendations_section(
         return String::new();
     }
 
-    let mut out = String::from("### Version Bump Recommendations\n");
+    let mut out = String::from("### Version Bumps\n");
     for rec in recommendations {
         out.push_str("- ");
         out.push_str(&format_version_recommendation(rec));
@@ -1181,18 +1298,18 @@ mod tests {
     #[test]
     fn compose_commit_message_includes_version_bump_recommendations_section() {
         let report = sample_report();
-        let recommendations = vec![version_bump::VersionRecommendation {
-            manifest_path: "Cargo.toml".to_string(),
-            ecosystem: "Rust",
-            tool: "Cargo",
-            current_version: Some("0.1.0".to_string()),
-            suggested_version: Some("0.2.0".to_string()),
-            level: version_bump::BumpLevel::Minor,
-            reason: "code changes detected; suggest a minor project version bump".to_string(),
-        }];
+        let recommendations = vec![version_bump::test_recommendation(
+            "Cargo.toml",
+            "Rust",
+            "Cargo",
+            Some("0.1.0"),
+            Some("0.2.0"),
+            version_bump::BumpLevel::Minor,
+            "code changes detected; suggest a minor project version bump",
+        )];
 
         let message = compose_commit_message(&report, &recommendations);
-        assert!(message.contains("### Version Bump Recommendations"));
+        assert!(message.contains("### Version Bumps"));
         assert!(message.contains("[Cargo.toml] Rust / Cargo: 0.1.0 -> 0.2.0 (minor)"));
     }
 }

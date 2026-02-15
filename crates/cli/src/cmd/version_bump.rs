@@ -39,6 +39,29 @@ pub(crate) struct VersionRecommendation {
     pub(crate) suggested_version: Option<String>,
     pub(crate) level: BumpLevel,
     pub(crate) reason: String,
+    kind: ManifestKind,
+}
+
+#[cfg(test)]
+pub(crate) fn test_recommendation(
+    manifest_path: &str,
+    ecosystem: &'static str,
+    tool: &'static str,
+    current_version: Option<&str>,
+    suggested_version: Option<&str>,
+    level: BumpLevel,
+    reason: &str,
+) -> VersionRecommendation {
+    VersionRecommendation {
+        manifest_path: manifest_path.to_string(),
+        ecosystem,
+        tool,
+        current_version: current_version.map(ToOwned::to_owned),
+        suggested_version: suggested_version.map(ToOwned::to_owned),
+        level,
+        reason: reason.to_string(),
+        kind: ManifestKind::CargoToml,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,14 +146,16 @@ pub(crate) fn recommend(
     repo: &git::Repo,
     diff_text: &str,
     report: &AnalysisReport,
+    embedding_level: Option<BumpLevel>,
 ) -> Vec<VersionRecommendation> {
-    recommend_inner(repo, diff_text, report).unwrap_or_default()
+    recommend_inner(repo, diff_text, report, embedding_level).unwrap_or_default()
 }
 
 fn recommend_inner(
     repo: &git::Repo,
     diff_text: &str,
     report: &AnalysisReport,
+    embedding_level: Option<BumpLevel>,
 ) -> Result<Vec<VersionRecommendation>, std::io::Error> {
     let repo_root = repo.repo_root();
     let context_path = repo
@@ -142,7 +167,10 @@ fn recommend_inner(
     let source_changed = changed_paths
         .iter()
         .any(|path| !is_manifest_path(path) && !is_lockfile_path(path));
-    let recommended_level = suggested_level(report);
+    let heuristic_level = suggested_level(report);
+    let recommended_level = embedding_level
+        .map(|level| level.max(heuristic_level))
+        .unwrap_or(heuristic_level);
 
     let mut context = load_context(&context_path);
     let candidates = collect_manifest_candidates(&repo_root, &changed_paths);
@@ -221,6 +249,7 @@ fn build_recommendation(
                     level.as_str(),
                     level.as_str()
                 ),
+                kind,
             });
         }
     }
@@ -246,21 +275,43 @@ fn build_recommendation(
             suggested_version: Some(suggested),
             level,
             reason,
+            kind,
         });
     }
+    None
+}
 
-    Some(VersionRecommendation {
-        manifest_path: manifest_path.to_string(),
-        ecosystem: kind.ecosystem(),
-        tool: kind.tool(),
-        current_version: current_version.map(ToOwned::to_owned),
-        suggested_version: None,
-        level,
-        reason: format!(
-            "no in-file project version found; tag the next release with a {} semver bump",
-            level.as_str()
-        ),
-    })
+pub(crate) fn apply(
+    repo: &git::Repo,
+    recommendations: &[VersionRecommendation],
+) -> Result<Vec<String>, String> {
+    if recommendations.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let root = repo.repo_root();
+    let mut touched = Vec::new();
+
+    for rec in recommendations {
+        let suggested = rec.suggested_version.as_deref().ok_or_else(|| {
+            format!(
+                "missing suggested version for {}, cannot apply bump",
+                rec.manifest_path
+            )
+        })?;
+        let manifest_path = root.join(&rec.manifest_path);
+        apply_manifest_bump(&manifest_path, rec.kind, suggested).map_err(|err| {
+            format!(
+                "failed to bump {} to {}: {}",
+                rec.manifest_path, suggested, err
+            )
+        })?;
+        touched.push(rec.manifest_path.clone());
+    }
+
+    touched.sort();
+    touched.dedup();
+    Ok(touched)
 }
 
 fn suggested_level(report: &AnalysisReport) -> BumpLevel {
@@ -687,7 +738,7 @@ fn read_python_setup_version(content: &str) -> Option<String> {
 fn read_yaml_key_value(content: &str, key: &str) -> Option<String> {
     for raw_line in content.lines() {
         let line = raw_line.trim();
-        if let Some(value) = parse_key_value_line(line, key) {
+        if let Some(value) = parse_yaml_key_value_line(line, key) {
             return Some(value);
         }
     }
@@ -714,6 +765,357 @@ fn parse_key_value_line(line: &str, key: &str) -> Option<String> {
     } else {
         Some(value.to_string())
     }
+}
+
+fn parse_yaml_key_value_line(line: &str, key: &str) -> Option<String> {
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    let (lhs, rhs) = line.split_once(':')?;
+    if lhs.trim() != key {
+        return None;
+    }
+
+    let value = rhs
+        .trim()
+        .trim_end_matches(',')
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn apply_manifest_bump(
+    manifest_path: &Path,
+    kind: ManifestKind,
+    suggested_version: &str,
+) -> Result<(), std::io::Error> {
+    let content = fs::read_to_string(manifest_path)?;
+    let updated = match kind {
+        ManifestKind::CargoToml => replace_toml_key_in_section(
+            &content,
+            "package",
+            "version",
+            suggested_version,
+            AssignmentStyle::Toml,
+        ),
+        ManifestKind::PackageJson | ManifestKind::ComposerJson => {
+            replace_json_version(&content, suggested_version)
+        }
+        ManifestKind::PyprojectToml => replace_toml_key_in_section(
+            &content,
+            "project",
+            "version",
+            suggested_version,
+            AssignmentStyle::Toml,
+        )
+        .or_else(|| {
+            replace_toml_key_in_section(
+                &content,
+                "tool.poetry",
+                "version",
+                suggested_version,
+                AssignmentStyle::Toml,
+            )
+        }),
+        ManifestKind::SetupCfg => replace_toml_key_in_section(
+            &content,
+            "metadata",
+            "version",
+            suggested_version,
+            AssignmentStyle::Ini,
+        ),
+        ManifestKind::SetupPy => replace_setup_py_version(&content, suggested_version),
+        ManifestKind::GoMod => None,
+        ManifestKind::PomXml => replace_xml_tag_value(&content, "version", suggested_version),
+        ManifestKind::Gradle => replace_gradle_version(&content, suggested_version),
+        ManifestKind::Gemfile => None,
+        ManifestKind::Gemspec => replace_gemspec_version(&content, suggested_version),
+        ManifestKind::MixExs => replace_mix_version(&content, suggested_version),
+        ManifestKind::PackageSwift => None,
+        ManifestKind::Csproj => replace_xml_tag_value(&content, "Version", suggested_version),
+        ManifestKind::PubspecYaml => replace_yaml_key_value(&content, "version", suggested_version),
+    }
+    .ok_or_else(|| {
+        std::io::Error::other("could not locate a writable in-file version field for this manifest")
+    })?;
+
+    fs::write(manifest_path, updated)
+}
+
+#[derive(Clone, Copy)]
+enum AssignmentStyle {
+    Toml,
+    Ini,
+}
+
+fn replace_toml_key_in_section(
+    content: &str,
+    section: &str,
+    key: &str,
+    suggested_version: &str,
+    style: AssignmentStyle,
+) -> Option<String> {
+    let mut current_section: Option<String> = None;
+    let mut changed = false;
+    let mut lines = Vec::new();
+    let trailing_newline = content.ends_with('\n');
+
+    for raw_line in content.lines() {
+        let line = raw_line;
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            let section_name = trimmed.trim_start_matches('[').trim_end_matches(']');
+            current_section = Some(section_name.to_string());
+            lines.push(line.to_string());
+            continue;
+        }
+
+        if current_section.as_deref() == Some(section) {
+            if let Some(next) = replace_assignment_line(line, key, suggested_version, style) {
+                lines.push(next);
+                changed = true;
+                continue;
+            }
+        }
+        lines.push(line.to_string());
+    }
+
+    if !changed {
+        return None;
+    }
+
+    Some(join_lines(lines, trailing_newline))
+}
+
+fn replace_assignment_line(
+    line: &str,
+    key: &str,
+    suggested_version: &str,
+    style: AssignmentStyle,
+) -> Option<String> {
+    let trimmed = line.trim_start();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.starts_with('#') || trimmed.starts_with(';') {
+        return None;
+    }
+    if !trimmed.starts_with(key) {
+        return None;
+    }
+
+    let rest = &trimmed[key.len()..];
+    let mut rest_chars = rest.chars();
+    let first = rest_chars.next()?;
+    let valid_sep = first.is_ascii_whitespace()
+        || matches!(
+            (style, first),
+            (AssignmentStyle::Toml, '=') | (AssignmentStyle::Ini, '=')
+        );
+    if !valid_sep {
+        return None;
+    }
+
+    let indent_len = line.len().saturating_sub(trimmed.len());
+    let indent = &line[..indent_len];
+    Some(format!("{indent}{key} = \"{suggested_version}\""))
+}
+
+fn replace_json_version(content: &str, suggested_version: &str) -> Option<String> {
+    let mut value = serde_json::from_str::<serde_json::Value>(content).ok()?;
+    let object = value.as_object_mut()?;
+    object.insert(
+        "version".to_string(),
+        serde_json::Value::String(suggested_version.to_string()),
+    );
+    serde_json::to_string_pretty(&value).ok()
+}
+
+fn replace_xml_tag_value(content: &str, tag: &str, suggested_version: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = content.find(&open)?;
+    let value_start = start + open.len();
+    let rest = &content[value_start..];
+    let value_end_rel = rest.find(&close)?;
+    let value_end = value_start + value_end_rel;
+
+    let mut updated = String::with_capacity(content.len() + suggested_version.len());
+    updated.push_str(&content[..value_start]);
+    updated.push_str(suggested_version);
+    updated.push_str(&content[value_end..]);
+    Some(updated)
+}
+
+fn replace_gradle_version(content: &str, suggested_version: &str) -> Option<String> {
+    let mut changed = false;
+    let trailing_newline = content.ends_with('\n');
+    let lines = content
+        .lines()
+        .map(|line| {
+            if changed {
+                return line.to_string();
+            }
+
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("version") && trimmed.contains('=') {
+                let indent_len = line.len().saturating_sub(trimmed.len());
+                let indent = &line[..indent_len];
+                changed = true;
+                format!("{indent}version = \"{suggested_version}\"")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if !changed {
+        return None;
+    }
+    Some(join_lines(lines, trailing_newline))
+}
+
+fn replace_gemspec_version(content: &str, suggested_version: &str) -> Option<String> {
+    let mut changed = false;
+    let trailing_newline = content.ends_with('\n');
+    let lines = content
+        .lines()
+        .map(|line| {
+            if changed {
+                return line.to_string();
+            }
+            let trimmed = line.trim_start();
+            if !trimmed.contains(".version") || !trimmed.contains('=') {
+                return line.to_string();
+            }
+
+            let indent_len = line.len().saturating_sub(trimmed.len());
+            let indent = &line[..indent_len];
+            let lhs = trimmed.split_once('=').map(|(lhs, _)| lhs.trim()).unwrap_or("");
+            if lhs.is_empty() {
+                return line.to_string();
+            }
+            changed = true;
+            format!("{indent}{lhs} = \"{suggested_version}\"")
+        })
+        .collect::<Vec<_>>();
+
+    if !changed {
+        return None;
+    }
+    Some(join_lines(lines, trailing_newline))
+}
+
+fn replace_mix_version(content: &str, suggested_version: &str) -> Option<String> {
+    let mut changed = false;
+    let trailing_newline = content.ends_with('\n');
+    let lines = content
+        .lines()
+        .map(|line| {
+            if changed {
+                return line.to_string();
+            }
+            let Some(marker) = line.find("version:") else {
+                return line.to_string();
+            };
+
+            let prefix = &line[..marker];
+            let rest = &line[marker + "version:".len()..];
+            let suffix = rest
+                .find(',')
+                .map(|idx| &rest[idx..])
+                .unwrap_or("");
+            changed = true;
+            format!("{prefix}version: \"{suggested_version}\"{suffix}")
+        })
+        .collect::<Vec<_>>();
+
+    if !changed {
+        return None;
+    }
+    Some(join_lines(lines, trailing_newline))
+}
+
+fn replace_setup_py_version(content: &str, suggested_version: &str) -> Option<String> {
+    let mut changed = false;
+    let trailing_newline = content.ends_with('\n');
+    let lines = content
+        .lines()
+        .map(|line| {
+            if changed {
+                return line.to_string();
+            }
+            let Some(marker) = line.find("version=") else {
+                return line.to_string();
+            };
+
+            let prefix = &line[..marker + "version=".len()];
+            let rest = &line[marker + "version=".len()..];
+            let suffix_start = rest.find(',').or_else(|| rest.find(')')).unwrap_or(rest.len());
+            let suffix = &rest[suffix_start..];
+            changed = true;
+            format!("{prefix}\"{suggested_version}\"{suffix}")
+        })
+        .collect::<Vec<_>>();
+
+    if !changed {
+        return None;
+    }
+    Some(join_lines(lines, trailing_newline))
+}
+
+fn replace_yaml_key_value(content: &str, key: &str, suggested_version: &str) -> Option<String> {
+    let mut changed = false;
+    let trailing_newline = content.ends_with('\n');
+    let lines = content
+        .lines()
+        .map(|line| {
+            if changed {
+                return line.to_string();
+            }
+            let trimmed = line.trim_start();
+            if trimmed.starts_with('#') {
+                return line.to_string();
+            }
+            let Some((lhs, rhs)) = trimmed.split_once(':') else {
+                return line.to_string();
+            };
+            if lhs.trim() != key {
+                return line.to_string();
+            }
+
+            let indent_len = line.len().saturating_sub(trimmed.len());
+            let indent = &line[..indent_len];
+            let comment = rhs
+                .find('#')
+                .map(|idx| rhs[idx..].trim_end())
+                .unwrap_or("");
+            changed = true;
+            if comment.is_empty() {
+                format!("{indent}{key}: {suggested_version}")
+            } else {
+                format!("{indent}{key}: {suggested_version} {comment}")
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if !changed {
+        return None;
+    }
+    Some(join_lines(lines, trailing_newline))
+}
+
+fn join_lines(lines: Vec<String>, trailing_newline: bool) -> String {
+    let mut out = lines.join("\n");
+    if trailing_newline {
+        out.push('\n');
+    }
+    out
 }
 
 fn load_context(path: &Path) -> VersionContext {
@@ -902,6 +1304,42 @@ diff --git a/Cargo.toml b/Cargo.toml\n";
         assert!(candidates.contains_key("apps/web/package.json"));
         assert!(candidates.contains_key("crates/core/Cargo.toml"));
         assert!(!candidates.contains_key("Cargo.toml"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn apply_manifest_bump_updates_cargo_toml_version() {
+        let root = create_temp_tree();
+        let manifest = root.join("Cargo.toml");
+        write_file(
+            &root,
+            "Cargo.toml",
+            "[package]\nname = \"demo\"\nversion = \"0.4.0\"\n",
+        );
+
+        apply_manifest_bump(&manifest, ManifestKind::CargoToml, "0.5.0")
+            .expect("cargo bump apply");
+        let next = fs::read_to_string(&manifest).expect("read cargo");
+        assert!(next.contains("version = \"0.5.0\""));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn apply_manifest_bump_updates_package_json_version() {
+        let root = create_temp_tree();
+        let manifest = root.join("package.json");
+        write_file(
+            &root,
+            "package.json",
+            "{\n  \"name\": \"demo\",\n  \"version\": \"1.2.3\"\n}\n",
+        );
+
+        apply_manifest_bump(&manifest, ManifestKind::PackageJson, "1.3.0")
+            .expect("package bump apply");
+        let next = fs::read_to_string(&manifest).expect("read package");
+        assert!(next.contains("\"version\": \"1.3.0\""));
 
         let _ = fs::remove_dir_all(&root);
     }

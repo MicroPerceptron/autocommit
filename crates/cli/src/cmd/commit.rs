@@ -427,7 +427,7 @@ fn print_commit_preview(message: &str, rich: bool) {
             continue;
         }
 
-        if line.ends_with(':') {
+        if line.starts_with("### ") || line.ends_with(':') {
             println!("{}", style(line).bold().yellow());
             continue;
         }
@@ -645,7 +645,7 @@ fn compose_changes_section(report: &AnalysisReport) -> String {
         return String::new();
     }
 
-    let mut out = String::from("Changes:\n");
+    let mut out = String::from("### Changes\n");
     for item in &report.items {
         out.push_str("- ");
         out.push_str(&format_change_item(item));
@@ -668,13 +668,12 @@ fn compose_risk_section(report: &AnalysisReport) -> String {
         return String::new();
     }
 
-    let mut out = String::new();
+    let mut out = String::from("### Risk\n");
     if !level.is_empty() {
-        out.push_str(&format!("Risk: {level}\n"));
+        out.push_str(&format!("- Level: {level}\n"));
     }
 
     if !notes.is_empty() {
-        out.push_str("Risk Notes:\n");
         for note in notes {
             out.push_str("- ");
             out.push_str(note);
@@ -978,16 +977,13 @@ mod tests {
         let message = compose_commit_message(&sample_report());
         assert!(message.starts_with("feat(core): add detailed commit composition\n\n"));
         assert!(message.contains("Compose commit output from chunk-level analyses."));
-        assert!(message.contains("Changes:\n- [crates/cli/src/cmd/commit.rs] Compose final commit body: Include per-file details in commit body"));
+        assert!(message.contains("### Changes\n- [crates/cli/src/cmd/commit.rs] Compose final commit body: Include per-file details in commit body"));
         assert!(
             message
                 .contains("- [crates/cli/src/output/text.rs (+1 more)] Refactor output formatting")
         );
-        assert!(message.contains("Risk: medium"));
-        assert!(
-            message
-                .contains("Risk Notes:\n- Generated details were composed from partial analyses.")
-        );
+        assert!(message.contains("### Risk\n- Level: medium"));
+        assert!(message.contains("- Generated details were composed from partial analyses."));
         assert!(!message.contains("dispatch:DraftThenReduce"));
     }
 

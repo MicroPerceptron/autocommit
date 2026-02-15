@@ -4,6 +4,9 @@ use std::path::Path;
 use autocommit_core::llm::traits::LlmEngine;
 use autocommit_core::{AnalyzeOptions, CoreError, run as core_run};
 
+use crate::cmd::{git, report_cache};
+#[cfg(feature = "llama-native")]
+use crate::cmd::repo_cache;
 use crate::output;
 
 #[cfg(not(feature = "llama-native"))]
@@ -15,6 +18,13 @@ use autocommit_core::types::{
 pub fn run(args: &[String]) -> Result<String, String> {
     let mut json = false;
     let mut diff_file: Option<String> = None;
+    let mut model_path: Option<String> = None;
+    #[cfg(feature = "llama-native")]
+    let mut runtime_profile = "auto".to_string();
+    #[cfg(feature = "llama-native")]
+    let mut runtime_profile_overridden = false;
+    #[cfg(not(feature = "llama-native"))]
+    let runtime_profile = "mock".to_string();
 
     let mut i = 0;
     while i < args.len() {
@@ -27,16 +37,89 @@ pub fn run(args: &[String]) -> Result<String, String> {
                 diff_file = Some(path.clone());
                 i += 1;
             }
+            "--model-path" => {
+                let path = args
+                    .get(i + 1)
+                    .ok_or_else(|| "--model-path requires a path".to_string())?;
+                model_path = Some(path.clone());
+                i += 1;
+            }
+            "--profile" => {
+                let profile = args
+                    .get(i + 1)
+                    .ok_or_else(|| "--profile requires a value".to_string())?;
+                #[cfg(feature = "llama-native")]
+                {
+                    runtime_profile = profile.clone();
+                    runtime_profile_overridden = true;
+                }
+                #[cfg(not(feature = "llama-native"))]
+                {
+                    let _ = profile;
+                }
+                i += 1;
+            }
             flag => return Err(format!("unknown analyze option: {flag}")),
         }
         i += 1;
     }
 
+    #[cfg(feature = "llama-native")]
+    let repo_paths = repo_cache::maybe_discover_repo_kv_paths();
+
+    #[cfg(feature = "llama-native")]
+    if model_path.is_none() || !runtime_profile_overridden {
+        if let Some(metadata) = repo_paths.as_ref().and_then(repo_cache::read_metadata) {
+            if model_path.is_none() {
+                model_path = metadata.model_path;
+            }
+            if !runtime_profile_overridden && !metadata.profile.trim().is_empty() {
+                runtime_profile = metadata.profile;
+            }
+        }
+    }
+
+    if let Some(path) = model_path {
+        // SAFETY: this CLI is single-threaded for command setup and sets env before runtime init.
+        unsafe {
+            std::env::set_var("AUTOCOMMIT_EMBED_MODEL", path);
+        }
+    }
+
     let diff_text = load_diff(diff_file.as_deref()).map_err(|err| err.to_string())?;
+    if let Ok(repo) = git::Repo::discover() {
+        if let Some(cache_dir) = repo
+            .common_git_dir()
+            .join("autocommit/kv/partials")
+            .to_str()
+        {
+            unsafe {
+                std::env::set_var("AUTOCOMMIT_PARTIAL_CACHE_DIR", cache_dir);
+            }
+        }
+    }
+
+    let diff_hash = report_cache::diff_hash(&diff_text);
+    let cache_key = report_cache::cache_key("analyze", runtime_profile.as_str(), &diff_hash, "1.0");
+    let cache_path = git::Repo::discover()
+        .ok()
+        .map(|repo| report_cache::cache_path(repo.common_git_dir()));
+    if let Some(cache_path) = cache_path.as_ref() {
+        if let Some(report) = report_cache::read_cached_report(cache_path, &cache_key) {
+            return if json {
+                output::json::to_pretty_json(&report).map_err(|err| err.to_string())
+            } else {
+                Ok(output::text::render_report(&report))
+            };
+        }
+    }
+
+    #[cfg(feature = "llama-native")]
+    let generation_state = repo_paths.map(|paths| paths.generation_state);
 
     #[cfg(feature = "llama-native")]
     let engine: Box<dyn LlmEngine> = Box::new(
-        llama_runtime::Engine::new("default")
+        llama_runtime::Engine::new_with_generation_cache(&runtime_profile, generation_state)
             .map_err(|err| format!("runtime init failed: {err}"))?,
     );
 
@@ -45,6 +128,9 @@ pub fn run(args: &[String]) -> Result<String, String> {
 
     let report = core_run(engine.as_ref(), &diff_text, &AnalyzeOptions::default())
         .map_err(|err| format!("analysis failed: {err}"))?;
+    if let Some(cache_path) = cache_path.as_ref() {
+        let _ = report_cache::write_cached_report(cache_path, &cache_key, &report);
+    }
 
     if json {
         output::json::to_pretty_json(&report).map_err(|err| err.to_string())
@@ -58,7 +144,33 @@ fn load_diff(diff_file: Option<&str>) -> Result<String, CoreError> {
         return Ok(fs::read_to_string(Path::new(path))?);
     }
 
-    Ok("diff --git a/src/lib.rs b/src/lib.rs\n@@ -1,1 +1,2 @@\n-pub fn old() {}\n+pub fn new() {}\n+pub fn newer() {}\n".to_string())
+    read_git_diff()
+}
+
+fn read_git_diff() -> Result<String, CoreError> {
+    let repo = git::Repo::discover()?;
+    let staged = repo.diff_cached()?;
+    let unstaged = repo.diff_worktree()?;
+    let mut combined = String::new();
+
+    if !staged.trim().is_empty() {
+        combined.push_str(&staged);
+        if !combined.ends_with('\n') {
+            combined.push('\n');
+        }
+    }
+
+    if !unstaged.trim().is_empty() {
+        combined.push_str(&unstaged);
+    }
+
+    if combined.trim().is_empty() {
+        return Err(CoreError::InvalidDiff(
+            "no working tree or staged diff to analyze".to_string(),
+        ));
+    }
+
+    Ok(combined)
 }
 
 #[cfg(not(feature = "llama-native"))]

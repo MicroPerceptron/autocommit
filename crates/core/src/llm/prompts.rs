@@ -1,14 +1,54 @@
 use crate::types::DiffChunk;
 
+pub const SYSTEM_PROMPT: &str = r#"You are a git commit message generator. Given a diff, output a descriptive commit message.
+
+Format:
+- First line: type(scope): short description
+- Types: feat, fix, refactor, docs, test, chore, perf, style
+- Scope: primary module/file affected (optional)
+- Blank line, then bullet points for details if non-trivial
+
+Guidelines:
+- Describe WHAT changed and WHY, not HOW (the diff itself shows how)
+- Infer intent from: log messages, variable names, comments, control flow patterns
+- Wrap file paths, variable names, CLI flags, and config keys in backticks where they appear
+- For bug fixes: "fix: prevent X when Y" not "fix: add null check"
+- For features: "feat: add X for Y" describing capability, not implementation
+- For refactors: "refactor: extract/simplify/reorganize X" with motivation if clear
+- For diagnostics/debugging: "fix/chore: add diagnostic for X"
+- Multiple related changes: summarize the theme, then list key parts
+- Unrelated changes: indicate mixed scope clearly
+"#;
+
 pub fn build_analyze_prompt(chunk: &DiffChunk) -> String {
     format!(
-        "Analyze this diff chunk and summarize intent.\\nPath: {}\\n\\n{}",
+        "Task: Analyze one diff chunk.\n\
+Return ONLY JSON with keys: summary, bucket, type_tag, title, intent.\n\
+Allowed bucket values: Feature, Patch, Addition, Other.\n\
+Allowed type_tag values: Feat, Fix, Refactor, Docs, Test, Chore, Perf, Style, Mixed.\n\
+Use backticks for file paths, variable names, CLI flags, and config keys in summary/title/intent.\n\
+Path: {}\n\
+Diff:\n```diff\n{}\n```",
         chunk.path, chunk.text
     )
 }
 
 pub fn build_reduce_prompt(partial_count: usize) -> String {
-    format!("Reduce {partial_count} partial analyses into one structured commit report.")
+    format!(
+        "/no_think\n\
+Task: Produce final commit metadata from {partial_count} chunk summaries.\n\
+Return ONLY JSON with this exact shape:\n\
+{{\"commit_message\":\"...\",\"summary\":\"...\",\"risk_level\":\"low|medium|high\",\"risk_notes\":[\"...\"]}}\n\
+Rules:\n\
+- commit_message must be a single conventional commit header that describes concrete code changes\n\
+- commit_message must not mention analysis process words like: reduce, reducer, analysis, analyses, report, chunk, or partial\n\
+- do not use backticks in commit_message\n\
+- summary must be one sentence about the code change outcome\n\
+- risk_level must be low, medium, or high\n\
+- risk_notes should be concise and concrete\n\
+- use backticks for file paths, variable names, CLI flags, and config keys in summary and risk_notes\n\
+- absolutely no explanations, no markdown, no <think> tags"
+    )
 }
 
 pub fn build_embedding_prompt(chunks: &[DiffChunk], max_chars: usize) -> String {

@@ -17,8 +17,17 @@ fn profile_name() -> &'static str {
     }
 }
 
+fn cmake_parallel_jobs() -> usize {
+    let nproc = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    std::cmp::max(1, nproc.saturating_mul(2) / 3)
+}
+
 fn main() {
     println!("cargo:rerun-if-env-changed=LLAMA_CPP_DIR");
+    println!("cargo:rerun-if-changed=src/autocommit_common_bridge.cpp");
+    println!("cargo:rerun-if-changed=src/autocommit_common_bridge.h");
 
     let manifest_dir =
         PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("missing CARGO_MANIFEST_DIR"));
@@ -66,11 +75,18 @@ fn main() {
             install_dir.to_string_lossy()
         ))
         .arg("-DBUILD_SHARED_LIBS=OFF")
-        .arg("-DLLAMA_BUILD_COMMON=OFF")
+        .arg("-DLLAMA_BUILD_COMMON=ON")
         .arg("-DLLAMA_BUILD_TESTS=OFF")
         .arg("-DLLAMA_BUILD_EXAMPLES=OFF")
         .arg("-DLLAMA_BUILD_TOOLS=OFF")
         .arg("-DLLAMA_BUILD_SERVER=OFF");
+    if cfg!(target_os = "macos") {
+        let deployment_target = env::var("MACOSX_DEPLOYMENT_TARGET")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "11.0".to_string());
+        configure.arg(format!("-DCMAKE_OSX_DEPLOYMENT_TARGET={deployment_target}"));
+    }
     run(&mut configure, "configure");
 
     let mut build = Command::new("cmake");
@@ -79,12 +95,8 @@ fn main() {
         .arg(&build_dir)
         .arg("--config")
         .arg(profile)
-        .arg("--parallel");
-    if let Ok(jobs) = env::var("CARGO_BUILD_JOBS") {
-        if !jobs.is_empty() {
-            build.arg(jobs);
-        }
-    }
+        .arg("--parallel")
+        .arg(cmake_parallel_jobs().to_string());
     run(&mut build, "build");
 
     let mut install = Command::new("cmake");
@@ -95,6 +107,8 @@ fn main() {
         .arg(profile);
     run(&mut install, "install");
 
+    build_common_bridge(&source_dir, &manifest_dir);
+    emit_common_link_deps(&build_dir);
     emit_link_search_paths(&install_dir);
 
     println!(
@@ -130,6 +144,14 @@ fn generate_bindings(source_dir: &Path, out_dir: &Path) {
         ))
         .clang_arg(format!("-I{}", ggml_include.to_string_lossy()))
         .allowlist_function("^llama_.*")
+        .allowlist_function("^ggml_backend_load_all$")
+        .allowlist_function("^ggml_backend_reg_count$")
+        .allowlist_function("^ggml_backend_dev_count$")
+        .allowlist_function("^ggml_backend_dev_get$")
+        .allowlist_function("^ggml_backend_dev_type$")
+        .allowlist_function("^ggml_backend_dev_name$")
+        .allowlist_function("^ggml_backend_dev_description$")
+        .allowlist_function("^ggml_backend_dev_memory$")
         .allowlist_type("^llama_.*")
         .allowlist_var("^LLAMA_.*")
         .allowlist_type("^ggml_.*")
@@ -190,5 +212,48 @@ fn emit_link_libs_from_dir(dir: &Path) {
         if !lib_name.is_empty() {
             println!("cargo:rustc-link-lib=static={lib_name}");
         }
+    }
+}
+
+fn build_common_bridge(source_dir: &Path, manifest_dir: &Path) {
+    let bridge_cpp = manifest_dir
+        .join("src")
+        .join("autocommit_common_bridge.cpp");
+    let common_dir = source_dir.join("common");
+    let include_dir = source_dir.join("include");
+    let ggml_include = source_dir.join("ggml").join("include");
+    let vendor_dir = source_dir.join("vendor");
+
+    cc::Build::new()
+        .cpp(true)
+        .file(&bridge_cpp)
+        .include(&common_dir)
+        .include(&include_dir)
+        .include(&ggml_include)
+        .include(&vendor_dir)
+        .flag_if_supported("-std=c++17")
+        .flag_if_supported("-Wno-unused-function")
+        .compile("autocommit_common_bridge");
+}
+
+fn emit_common_link_deps(build_dir: &Path) {
+    let common_dir = build_dir.join("common");
+    let common_lib = common_dir.join("libcommon.a");
+    if common_lib.exists() {
+        println!(
+            "cargo:rustc-link-search=native={}",
+            common_dir.to_string_lossy()
+        );
+        println!("cargo:rustc-link-lib=static=common");
+    }
+
+    let httplib_dir = build_dir.join("vendor").join("cpp-httplib");
+    let httplib_lib = httplib_dir.join("libcpp-httplib.a");
+    if httplib_lib.exists() {
+        println!(
+            "cargo:rustc-link-search=native={}",
+            httplib_dir.to_string_lossy()
+        );
+        println!("cargo:rustc-link-lib=static=cpp-httplib");
     }
 }

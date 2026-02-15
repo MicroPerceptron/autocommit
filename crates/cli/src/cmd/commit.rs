@@ -1,6 +1,11 @@
+use std::io::{IsTerminal, Write};
+
 use autocommit_core::AnalysisReport;
 use autocommit_core::llm::traits::LlmEngine;
 use autocommit_core::{AnalyzeOptions, CoreError, run as core_run};
+use dialoguer::console::Term;
+use dialoguer::{Confirm, Editor, Select, theme::ColorfulTheme};
+use indicatif::{ProgressBar, ProgressStyle};
 
 use crate::cmd::git;
 #[cfg(feature = "llama-native")]
@@ -19,6 +24,8 @@ pub fn run(args: &[String]) -> Result<String, String> {
     let mut dry_run = false;
     let mut json = false;
     let mut no_verify = false;
+    let mut interactive_override: Option<bool> = None;
+    let mut assume_yes = false;
     let mut model_path: Option<String> = None;
     #[cfg(feature = "llama-native")]
     let mut runtime_profile = "auto".to_string();
@@ -33,6 +40,9 @@ pub fn run(args: &[String]) -> Result<String, String> {
             "--dry-run" => dry_run = true,
             "--json" => json = true,
             "--no-verify" => no_verify = true,
+            "--interactive" => interactive_override = Some(true),
+            "--no-interactive" => interactive_override = Some(false),
+            "--yes" | "-y" => assume_yes = true,
             "--model-path" => {
                 let path = args
                     .get(i + 1)
@@ -60,6 +70,9 @@ pub fn run(args: &[String]) -> Result<String, String> {
         i += 1;
     }
 
+    let interactive = resolve_interactive_mode(interactive_override, json)?;
+    let rich_interactive = interactive && Term::stderr().is_term();
+
     #[cfg(feature = "llama-native")]
     let repo_paths = repo_cache::maybe_discover_repo_kv_paths();
 
@@ -82,24 +95,40 @@ pub fn run(args: &[String]) -> Result<String, String> {
         }
     }
 
-    let repo = git::Repo::discover().map_err(|err| err.to_string())?;
+    let repo = run_step(
+        rich_interactive,
+        "Discovering repository",
+        git::Repo::discover,
+    )
+    .map_err(|err| err.to_string())?;
 
-    let diff_text = prepare_diff(&repo, staged_only, dry_run).map_err(|err| err.to_string())?;
+    let diff_text = run_step(rich_interactive, "Collecting staged/worktree diff", || {
+        prepare_diff(&repo, staged_only, dry_run)
+    })
+    .map_err(|err| err.to_string())?;
 
     #[cfg(feature = "llama-native")]
     let generation_state = repo_paths.map(|paths| paths.generation_state);
 
     #[cfg(feature = "llama-native")]
-    let engine: Box<dyn LlmEngine> = Box::new(
-        llama_runtime::Engine::new_with_generation_cache(&runtime_profile, generation_state)
-            .map_err(|err| format!("runtime init failed: {err}"))?,
-    );
+    let engine: Box<dyn LlmEngine> =
+        run_step(rich_interactive, "Initializing llama runtime", || {
+            llama_runtime::Engine::new_with_generation_cache(&runtime_profile, generation_state)
+                .map(|engine| Box::new(engine) as Box<dyn LlmEngine>)
+        })
+        .map_err(|err| format!("runtime init failed: {err}"))?;
 
     #[cfg(not(feature = "llama-native"))]
-    let engine: Box<dyn LlmEngine> = Box::new(MockEngine);
+    let engine: Box<dyn LlmEngine> =
+        run_step(rich_interactive, "Initializing analysis engine", || {
+            Ok::<Box<dyn LlmEngine>, CoreError>(Box::new(MockEngine))
+        })
+        .map_err(|err| format!("runtime init failed: {err}"))?;
 
-    let report = core_run(engine.as_ref(), &diff_text, &AnalyzeOptions::default())
-        .map_err(|err| format!("analysis failed: {err}"))?;
+    let report = run_step(rich_interactive, "Generating commit analysis", || {
+        core_run(engine.as_ref(), &diff_text, &AnalyzeOptions::default())
+    })
+    .map_err(|err| format!("analysis failed: {err}"))?;
 
     if dry_run {
         if json {
@@ -115,20 +144,270 @@ pub fn run(args: &[String]) -> Result<String, String> {
     }
 
     let composed_message = compose_commit_message(&report);
-    commit_with_message(&repo, &composed_message, no_verify).map_err(|err| err.to_string())?;
+    let final_message = if interactive && !assume_yes {
+        match prompt_for_commit_message(&composed_message, rich_interactive)? {
+            Some(message) => message,
+            None => return Ok("commit canceled by user\n".to_string()),
+        }
+    } else {
+        composed_message
+    };
 
-    if push {
-        repo.push().map_err(|err| err.to_string())?;
+    run_step(rich_interactive, "Creating commit", || {
+        commit_with_message(&repo, &final_message, staged_only, no_verify)
+    })
+    .map_err(|err| err.to_string())?;
+
+    let should_push = if interactive && !assume_yes {
+        prompt_should_push(push, rich_interactive)?
+    } else {
+        push
+    };
+
+    let mut push_note: Option<String> = None;
+    if should_push {
+        push_note = push_with_feedback(rich_interactive, &repo).map_err(|err| err.to_string())?;
     }
 
     if json {
         output::json::to_pretty_json(&report).map_err(|err| err.to_string())
     } else {
-        Ok(format!(
-            "created commit with message:\n{}\n",
-            composed_message
-        ))
+        let mut out = String::new();
+        out.push_str("created commit with message:\n");
+        out.push_str(&final_message);
+        out.push('\n');
+        if let Some(note) = push_note {
+            out.push_str(&note);
+            out.push('\n');
+        }
+        Ok(out)
     }
+}
+
+fn resolve_interactive_mode(
+    interactive_override: Option<bool>,
+    json: bool,
+) -> Result<bool, String> {
+    if json {
+        if interactive_override == Some(true) {
+            return Err("--interactive cannot be combined with --json".to_string());
+        }
+        return Ok(false);
+    }
+
+    let stdin_tty = std::io::stdin().is_terminal();
+    let stderr_tty = Term::stderr().is_term();
+    match interactive_override {
+        Some(true) => {
+            if !stdin_tty && !stderr_tty {
+                return Err(
+                    "interactive mode requested but no terminal is attached to stdin/stderr"
+                        .to_string(),
+                );
+            }
+            Ok(true)
+        }
+        Some(false) => Ok(false),
+        None => Ok(stderr_tty),
+    }
+}
+
+fn run_step<T, E, F>(interactive: bool, label: &str, action: F) -> Result<T, E>
+where
+    E: std::fmt::Display,
+    F: FnOnce() -> Result<T, E>,
+{
+    let progress = if interactive {
+        let progress = ProgressBar::new_spinner();
+        progress.set_style(spinner_style());
+        progress.set_message(label.to_string());
+        progress.enable_steady_tick(std::time::Duration::from_millis(80));
+        Some(progress)
+    } else {
+        None
+    };
+
+    let result = action();
+    if let Some(progress) = progress {
+        match &result {
+            Ok(_) => progress.finish_with_message(format!("[ok] {label}")),
+            Err(err) => progress.abandon_with_message(format!("[error] {label}: {err}")),
+        }
+    }
+
+    result
+}
+
+fn spinner_style() -> ProgressStyle {
+    ProgressStyle::with_template("{spinner} {msg}")
+        .unwrap_or_else(|_| ProgressStyle::default_spinner())
+        .tick_strings(&["-", "\\", "|", "/"])
+}
+
+fn prompt_for_commit_message(initial_message: &str, rich: bool) -> Result<Option<String>, String> {
+    let mut message = initial_message.trim().to_string();
+    if message.is_empty() {
+        return Err("generated commit subject is empty".to_string());
+    }
+
+    if !rich {
+        return prompt_for_commit_message_basic(&message);
+    }
+
+    let term = Term::stderr();
+    let theme = ColorfulTheme::default();
+    let options = ["Approve commit", "Edit message", "Cancel"];
+
+    loop {
+        println!("\nProposed commit message:\n\n{message}\n");
+        let selection = Select::with_theme(&theme)
+            .with_prompt("Commit action")
+            .items(options)
+            .default(0)
+            .interact_on_opt(&term)
+            .map_err(|err| format!("failed to read commit action: {err}"))?;
+
+        match selection {
+            Some(0) => return Ok(Some(message)),
+            Some(1) => {
+                let edited = Editor::new()
+                    .extension(".gitcommit")
+                    .edit(&message)
+                    .map_err(|err| format!("failed to open commit editor: {err}"))?;
+
+                let Some(next_message) = edited else {
+                    continue;
+                };
+
+                let trimmed = next_message.trim();
+                if trimmed.is_empty() {
+                    println!("commit message cannot be empty");
+                    continue;
+                }
+
+                message = trimmed.to_string();
+            }
+            Some(2) | None => return Ok(None),
+            Some(_) => return Err("invalid commit action selection".to_string()),
+        }
+    }
+}
+
+fn prompt_for_commit_message_basic(initial_message: &str) -> Result<Option<String>, String> {
+    let mut message = initial_message.trim().to_string();
+
+    loop {
+        println!("\nProposed commit message:\n\n{message}\n");
+        println!("Commit action:");
+        println!("  [a] Approve commit");
+        println!("  [e] Edit message");
+        println!("  [c] Cancel");
+        print!("Select action [a/e/c]: ");
+        std::io::stdout()
+            .flush()
+            .map_err(|err| format!("failed to flush prompt output: {err}"))?;
+
+        let choice = read_line_trimmed()?;
+        match choice.as_str() {
+            "a" | "A" => return Ok(Some(message)),
+            "e" | "E" => {
+                let edited = Editor::new()
+                    .extension(".gitcommit")
+                    .edit(&message)
+                    .map_err(|err| format!("failed to open commit editor: {err}"))?;
+
+                let Some(next_message) = edited else {
+                    continue;
+                };
+
+                let trimmed = next_message.trim();
+                if trimmed.is_empty() {
+                    println!("commit message cannot be empty");
+                    continue;
+                }
+                message = trimmed.to_string();
+            }
+            "c" | "C" => return Ok(None),
+            _ => println!("invalid choice, enter a, e, or c"),
+        }
+    }
+}
+
+fn prompt_should_push(default: bool, rich: bool) -> Result<bool, String> {
+    if rich {
+        return Confirm::with_theme(&ColorfulTheme::default())
+            .with_prompt("Push commit to remote now?")
+            .default(default)
+            .interact_on(&Term::stderr())
+            .map_err(|err| format!("failed to read push confirmation: {err}"));
+    }
+
+    let default_hint = if default { "Y/n" } else { "y/N" };
+    loop {
+        print!("Push commit to remote now? [{default_hint}]: ");
+        std::io::stdout()
+            .flush()
+            .map_err(|err| format!("failed to flush prompt output: {err}"))?;
+        let value = read_line_trimmed()?;
+        if value.is_empty() {
+            return Ok(default);
+        }
+
+        match value.to_ascii_lowercase().as_str() {
+            "y" | "yes" => return Ok(true),
+            "n" | "no" => return Ok(false),
+            _ => println!("invalid choice, enter y or n"),
+        }
+    }
+}
+
+fn push_with_feedback(interactive: bool, repo: &git::Repo) -> Result<Option<String>, CoreError> {
+    if !interactive {
+        return match repo.push() {
+            Ok(()) => Ok(None),
+            Err(err) if looks_like_unimplemented_push_error(&err) => {
+                Ok(Some(format!("push skipped: {err}")))
+            }
+            Err(err) => Err(err),
+        };
+    }
+
+    let progress = ProgressBar::new_spinner();
+    progress.set_style(spinner_style());
+    progress.set_message("Pushing commit".to_string());
+    progress.enable_steady_tick(std::time::Duration::from_millis(80));
+
+    match repo.push() {
+        Ok(()) => {
+            progress.finish_with_message("[ok] Pushing commit");
+            Ok(None)
+        }
+        Err(err) if looks_like_unimplemented_push_error(&err) => {
+            progress.finish_with_message("[skip] Pushing commit (not available in this build)");
+            Ok(Some(format!("push skipped: {err}")))
+        }
+        Err(err) => {
+            progress.abandon_with_message(format!("[error] Pushing commit: {err}"));
+            Err(err)
+        }
+    }
+}
+
+fn looks_like_unimplemented_push_error(err: &CoreError) -> bool {
+    err.to_string()
+        .to_ascii_lowercase()
+        .contains("not implemented")
+}
+
+fn read_line_trimmed() -> Result<String, String> {
+    let mut buffer = String::new();
+    let read = std::io::stdin()
+        .read_line(&mut buffer)
+        .map_err(|err| format!("failed to read prompt input: {err}"))?;
+    if read == 0 {
+        return Err("interactive input was closed".to_string());
+    }
+    Ok(buffer.trim().to_string())
 }
 
 fn prepare_diff(repo: &git::Repo, staged_only: bool, dry_run: bool) -> Result<String, CoreError> {
@@ -154,15 +433,16 @@ fn prepare_diff(repo: &git::Repo, staged_only: bool, dry_run: bool) -> Result<St
         return Ok(combined);
     }
 
-    repo.add_all()?;
     let staged = repo.diff_cached()?;
-    if staged.trim().is_empty() {
+    let unstaged = repo.diff_worktree()?;
+    let combined = concat_diffs(&staged, &unstaged);
+    if combined.trim().is_empty() {
         return Err(CoreError::InvalidDiff(
-            "no changes staged after git add -A".to_string(),
+            "no changes in working tree".to_string(),
         ));
     }
 
-    Ok(staged)
+    Ok(combined)
 }
 
 fn concat_diffs(staged: &str, unstaged: &str) -> String {
@@ -179,7 +459,12 @@ fn concat_diffs(staged: &str, unstaged: &str) -> String {
     combined
 }
 
-fn commit_with_message(repo: &git::Repo, message: &str, no_verify: bool) -> Result<(), CoreError> {
+fn commit_with_message(
+    repo: &git::Repo,
+    message: &str,
+    staged_only: bool,
+    no_verify: bool,
+) -> Result<(), CoreError> {
     let mut lines = message.lines();
     let subject = lines.next().unwrap_or_default().trim();
     if subject.is_empty() {
@@ -191,8 +476,13 @@ fn commit_with_message(repo: &git::Repo, message: &str, no_verify: bool) -> Resu
     let body = lines.collect::<Vec<_>>().join("\n");
     let body = body.trim();
 
-    let body = (!body.is_empty()).then_some(body);
-    repo.commit(subject, body, no_verify)?;
+    let full_message = if body.is_empty() {
+        subject.to_string()
+    } else {
+        format!("{subject}\n\n{body}")
+    };
+
+    repo.commit(&full_message, staged_only, no_verify)?;
     Ok(())
 }
 

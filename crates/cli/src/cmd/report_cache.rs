@@ -6,7 +6,7 @@ use autocommit_core::AnalysisReport;
 use serde::{Deserialize, Serialize};
 
 const CACHE_SCHEMA_VERSION: u32 = 1;
-const CACHE_KEY_VERSION: &str = "2.0";
+const CACHE_KEY_VERSION: &str = "2.2";
 const CACHE_DIR: &str = "autocommit/kv";
 const REPORT_CACHE_FILE: &str = "report_cache.json";
 

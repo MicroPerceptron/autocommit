@@ -185,10 +185,13 @@ impl LoadedRuntime {
         }
 
         let model = Arc::clone(&self.model);
+        let generation_state_path = self.generation_state_path.clone();
+        let generation_ctx = self.generation_ctx()?;
+        let context_window_tokens = generation_ctx.context_window_tokens();
         let prompts = chunks
             .iter()
             .map(|chunk| {
-                let prompt = build_analyze_prompt_capped(chunk);
+                let prompt = build_analyze_prompt_capped(chunk, context_window_tokens);
                 model
                     .apply_chat_template(Some(prompts::SYSTEM_PROMPT), &prompt)
                     .unwrap_or_else(|| {
@@ -200,10 +203,10 @@ impl LoadedRuntime {
                     })
             })
             .collect::<Vec<_>>();
-        let budgets = chunks.iter().map(analyze_token_budget).collect::<Vec<_>>();
-        let generation_state_path = self.generation_state_path.clone();
-
-        let generation_ctx = self.generation_ctx()?;
+        let budgets = chunks
+            .iter()
+            .map(|chunk| analyze_token_budget(chunk, context_window_tokens))
+            .collect::<Vec<_>>();
         let mut out: Vec<PartialReport> = chunks
             .iter()
             .enumerate()
@@ -803,6 +806,17 @@ fn build_reduce_prompt_plan(
         decision.route,
         decision.reason_codes.join(",")
     ));
+    if let Some(theme) = reduce_dominant_theme(partials) {
+        prompt.push_str(&format!("- dominant_theme={theme}\n"));
+    }
+    let scope_distribution = reduce_scope_distribution(partials, 4);
+    if !scope_distribution.is_empty() {
+        prompt.push_str(&format!("- scope_distribution={scope_distribution}\n"));
+    }
+    let type_distribution = reduce_type_distribution(partials);
+    if !type_distribution.is_empty() {
+        prompt.push_str(&format!("- type_distribution={type_distribution}\n"));
+    }
     prompt.push_str("Representative items:\n");
 
     let mut sampled = 0usize;
@@ -839,17 +853,8 @@ fn reduce_token_budget(stats: &DiffStats, total: usize) -> usize {
         return override_tokens.clamp(96, 2_048);
     }
 
-    if stats.lines_changed > 6_000 || total > 80 {
-        448
-    } else if stats.lines_changed > 3_000 || total > 40 {
-        416
-    } else if stats.lines_changed > 1_500 || total > 24 {
-        384
-    } else if stats.lines_changed > 900 || total > 12 {
-        352
-    } else {
-        320
-    }
+    let complexity = reduce_complexity(stats, total);
+    blend_budget(320, 448, complexity)
 }
 
 fn reduce_item_budget(stats: &DiffStats, total: usize) -> usize {
@@ -857,19 +862,8 @@ fn reduce_item_budget(stats: &DiffStats, total: usize) -> usize {
         return override_items.clamp(1, 64).min(total.max(1));
     }
 
-    if total <= 6 {
-        total
-    } else if stats.lines_changed > 8_000 || total > 120 {
-        24.min(total)
-    } else if stats.lines_changed > 4_000 || total > 60 {
-        20.min(total)
-    } else if stats.lines_changed > 1_800 || total > 24 {
-        16.min(total)
-    } else if stats.lines_changed > 900 || total > 12 {
-        12.min(total)
-    } else {
-        total.min(12)
-    }
+    let complexity = reduce_complexity(stats, total);
+    blend_budget(12, 24, complexity).min(total)
 }
 
 fn reduce_char_budget(stats: &DiffStats, total: usize) -> usize {
@@ -877,17 +871,22 @@ fn reduce_char_budget(stats: &DiffStats, total: usize) -> usize {
         return override_chars.clamp(2_000, 20_000);
     }
 
-    if stats.lines_changed > 8_000 || total > 120 {
-        10_000
-    } else if stats.lines_changed > 4_000 || total > 60 {
-        8_500
-    } else if stats.lines_changed > 1_800 || total > 24 {
-        7_000
-    } else if stats.lines_changed > 900 || total > 12 {
-        5_600
-    } else {
-        4_800
-    }
+    let complexity = reduce_complexity(stats, total);
+    blend_budget(4_800, 10_000, complexity)
+}
+
+fn reduce_complexity(stats: &DiffStats, total: usize) -> f32 {
+    let lines = (stats.lines_changed as f32 / 8_000.0).clamp(0.0, 1.0);
+    let chunks = (total as f32 / 96.0).clamp(0.0, 1.0);
+    let hunks = (stats.hunks as f32 / 160.0).clamp(0.0, 1.0);
+    ((lines * 0.6) + (chunks * 0.3) + (hunks * 0.1)).sqrt()
+}
+
+fn blend_budget(low: usize, high: usize, factor: f32) -> usize {
+    let factor = factor.clamp(0.0, 1.0);
+    let span = high.saturating_sub(low) as f32;
+    let value = low as f32 + span * factor;
+    value.round() as usize
 }
 
 fn sampled_indices(partials: &[PartialReport], max_items: usize) -> Vec<usize> {
@@ -950,7 +949,6 @@ fn sampled_indices(partials: &[PartialReport], max_items: usize) -> Vec<usize> {
         }
     }
 
-    selected.sort_unstable();
     selected
 }
 
@@ -991,6 +989,7 @@ fn reduce_partial_scope_key(partial: &PartialReport) -> String {
 fn format_partial_for_reduce(partial: &PartialReport) -> String {
     let summary = compact_reduce_text(&partial.summary, 220);
     if let Some(item) = partial.items.first() {
+        let scope = reduce_partial_scope_key(partial);
         let file_paths = item
             .files
             .iter()
@@ -1000,12 +999,100 @@ fn format_partial_for_reduce(partial: &PartialReport) -> String {
             .join("|");
         let title = compact_reduce_text(&item.title, 120);
         format!(
-            "bucket={:?} type={:?} title={} files={} confidence={:.2} summary={}",
-            item.bucket, item.type_tag, title, file_paths, item.confidence, summary
+            "scope={} bucket={:?} type={:?} title={} files={} confidence={:.2} summary={}",
+            scope, item.bucket, item.type_tag, title, file_paths, item.confidence, summary
         )
     } else {
         summary
     }
+}
+
+fn reduce_dominant_theme(partials: &[PartialReport]) -> Option<String> {
+    let type_distribution = reduce_type_distribution(partials);
+    let dominant_type = type_distribution
+        .split(',')
+        .next()
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string();
+    let scope_distribution = reduce_scope_distribution(partials, 1);
+    let dominant_scope = scope_distribution
+        .split(',')
+        .next()
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string();
+    if dominant_type.is_empty() && dominant_scope.is_empty() {
+        return None;
+    }
+    if dominant_type.is_empty() {
+        return Some(dominant_scope.to_string());
+    }
+    if dominant_scope.is_empty() {
+        return Some(dominant_type.to_string());
+    }
+    Some(format!("{dominant_type} in {dominant_scope}"))
+}
+
+fn reduce_scope_distribution(partials: &[PartialReport], max_scopes: usize) -> String {
+    if max_scopes == 0 {
+        return String::new();
+    }
+
+    let mut counts = std::collections::BTreeMap::<String, f32>::new();
+    for partial in partials {
+        let scope = reduce_partial_scope_key(partial);
+        let weight = partial
+            .items
+            .first()
+            .map(|item| item.confidence.clamp(0.05, 1.0))
+            .unwrap_or(0.1);
+        *counts.entry(scope).or_insert(0.0) += weight;
+    }
+
+    render_distribution(counts, max_scopes)
+}
+
+fn reduce_type_distribution(partials: &[PartialReport]) -> String {
+    let mut counts = std::collections::BTreeMap::<String, f32>::new();
+    for partial in partials {
+        let Some(item) = partial.items.first() else {
+            continue;
+        };
+        let weight = item.confidence.clamp(0.05, 1.0);
+        *counts
+            .entry(type_tag_prefix(item.type_tag.clone()).to_string())
+            .or_insert(0.0) += weight;
+    }
+
+    render_distribution(counts, 4)
+}
+
+fn render_distribution(
+    counts: std::collections::BTreeMap<String, f32>,
+    max_items: usize,
+) -> String {
+    if counts.is_empty() || max_items == 0 {
+        return String::new();
+    }
+
+    let total = counts.values().sum::<f32>().max(f32::EPSILON);
+    let mut ranked = counts.into_iter().collect::<Vec<_>>();
+    ranked.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+
+    ranked
+        .into_iter()
+        .take(max_items)
+        .map(|(label, score)| {
+            let pct = (score / total) * 100.0;
+            format!("{label}:{pct:.0}%")
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn compact_reduce_text(value: &str, max_chars: usize) -> String {
@@ -1452,32 +1539,21 @@ fn compact_error_note(raw: &str) -> String {
     out
 }
 
-fn analyze_token_budget(chunk: &DiffChunk) -> usize {
+fn analyze_token_budget(chunk: &DiffChunk, context_window_tokens: usize) -> usize {
     if let Some(override_tokens) = env_budget_override("AUTOCOMMIT_ANALYZE_MAX_TOKENS") {
         return override_tokens.clamp(96, 1_024);
     }
 
-    if chunk.estimated_tokens > 3_000 {
-        256
-    } else if chunk.estimated_tokens > 1_500 {
-        288
-    } else {
-        320
-    }
+    let density = (chunk.estimated_tokens as f32 / 4_000.0)
+        .clamp(0.0, 1.0)
+        .sqrt();
+    let context_bonus = ((context_window_tokens as f32 - 2_048.0) / 4_096.0).clamp(0.0, 1.0);
+    let base = 344.0 - (72.0 * density) + (24.0 * context_bonus);
+    base.round().clamp(224.0, 384.0) as usize
 }
 
-fn build_analyze_prompt_capped(chunk: &DiffChunk) -> String {
-    let max_chars = env_budget_override("AUTOCOMMIT_ANALYZE_MAX_PROMPT_CHARS")
-        .map(|v| v.clamp(2_000, 16_000))
-        .unwrap_or_else(|| {
-            if chunk.estimated_tokens > 3_000 {
-                5_000
-            } else if chunk.estimated_tokens > 1_500 {
-                6_500
-            } else {
-                8_000
-            }
-        });
+fn build_analyze_prompt_capped(chunk: &DiffChunk, context_window_tokens: usize) -> String {
+    let max_chars = analyze_char_budget(chunk, context_window_tokens);
 
     if chunk.text.len() <= max_chars {
         return prompts::build_analyze_prompt(chunk);
@@ -1496,58 +1572,271 @@ Diff:\n```diff\n{}\n```",
     )
 }
 
+fn analyze_char_budget(chunk: &DiffChunk, context_window_tokens: usize) -> usize {
+    if let Some(override_chars) = env_budget_override("AUTOCOMMIT_ANALYZE_MAX_PROMPT_CHARS") {
+        return override_chars.clamp(2_000, 16_000);
+    }
+
+    let context_cap = context_window_tokens.saturating_mul(3).clamp(2_400, 18_000);
+    let density = (chunk.estimated_tokens as f32 / 6_000.0)
+        .clamp(0.0, 1.0)
+        .sqrt();
+    let raw = 8_600.0 - (3_000.0 * density);
+    let contextual = raw.min((context_cap as f32) * 0.92);
+    contextual.round().clamp(3_600.0, context_cap as f32) as usize
+}
+
 fn compact_diff_for_prompt(text: &str, max_chars: usize) -> String {
     if text.len() <= max_chars {
         return text.to_string();
     }
 
     let lines = text.lines().collect::<Vec<_>>();
+    if lines.is_empty() {
+        return String::new();
+    }
     let mut used = vec![false; lines.len()];
     let mut out = String::with_capacity(max_chars + 128);
     let mut header_lines = 0usize;
     let mut change_lines = 0usize;
+    let mut semantic_lines = 0usize;
 
     for (idx, line) in lines.iter().copied().enumerate() {
-        if is_structural_diff_line(line) {
-            if !push_line_with_limit(&mut out, line, max_chars) {
+        if is_file_header_line(line) {
+            if !push_line_index_with_limit(&mut out, &lines, &mut used, idx, max_chars) {
                 break;
             }
-            used[idx] = true;
             header_lines += 1;
         }
     }
 
-    for (idx, line) in lines.iter().copied().enumerate() {
-        if used[idx] || !is_change_line(line) {
-            continue;
+    let hunk_ranges = extract_hunk_ranges(&lines);
+    let selected_hunks = if hunk_ranges.is_empty() {
+        vec![0usize]
+    } else {
+        let max_hunks = (max_chars / 900).clamp(2, 10);
+        sample_stratified_indices(hunk_ranges.len(), max_hunks)
+    };
+
+    let mut scoped_hunks = Vec::with_capacity(selected_hunks.len());
+    if hunk_ranges.is_empty() {
+        scoped_hunks.push((0usize, lines.len()));
+    } else {
+        for idx in selected_hunks {
+            if let Some(range) = hunk_ranges.get(idx).copied() {
+                scoped_hunks.push(range);
+            }
         }
-        if !push_line_with_limit(&mut out, line, max_chars) {
-            break;
-        }
-        used[idx] = true;
-        change_lines += 1;
     }
 
-    for (idx, line) in lines.iter().copied().enumerate() {
-        if used[idx] || !is_semantic_context_line(line) {
-            continue;
+    for (start, _) in scoped_hunks.iter().copied() {
+        if start < lines.len()
+            && lines[start].starts_with("@@ ")
+            && push_line_index_with_limit(&mut out, &lines, &mut used, start, max_chars)
+        {
+            header_lines += 1;
         }
-        if !push_line_with_limit(&mut out, line, max_chars) {
-            break;
+    }
+
+    let per_hunk_change_budget = ((max_chars / scoped_hunks.len().max(1)) / 95).clamp(4, 16);
+    for (start, end) in scoped_hunks.iter().copied() {
+        let candidates = (start..end)
+            .filter(|&idx| is_change_line(lines[idx]))
+            .collect::<Vec<_>>();
+        for relative_idx in sample_stratified_indices(candidates.len(), per_hunk_change_budget) {
+            let idx = candidates[relative_idx];
+            if !push_line_index_with_limit(&mut out, &lines, &mut used, idx, max_chars) {
+                break;
+            }
+            change_lines += 1;
         }
-        used[idx] = true;
+    }
+
+    let mut change_buckets = scoped_hunks
+        .iter()
+        .map(|(start, end)| {
+            (*start..*end)
+                .filter(|&idx| is_change_line(lines[idx]))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    change_lines += round_robin_fill(&mut out, &lines, &mut used, &mut change_buckets, max_chars);
+
+    let per_hunk_semantic_budget = ((max_chars / scoped_hunks.len().max(1)) / 260).clamp(1, 4);
+    for (start, end) in scoped_hunks.iter().copied() {
+        let candidates = (start..end)
+            .filter(|&idx| is_semantic_context_line(lines[idx]))
+            .collect::<Vec<_>>();
+        for relative_idx in sample_stratified_indices(candidates.len(), per_hunk_semantic_budget) {
+            let idx = candidates[relative_idx];
+            if !push_line_index_with_limit(&mut out, &lines, &mut used, idx, max_chars) {
+                break;
+            }
+            semantic_lines += 1;
+        }
+    }
+
+    if out.len() < max_chars / 2 {
+        let mut semantic_buckets = scoped_hunks
+            .iter()
+            .map(|(start, end)| {
+                (*start..*end)
+                    .filter(|&idx| is_semantic_context_line(lines[idx]))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        semantic_lines += round_robin_fill(
+            &mut out,
+            &lines,
+            &mut used,
+            &mut semantic_buckets,
+            max_chars,
+        );
     }
 
     if out.len() < max_chars / 3 {
         out.clear();
+        used.fill(false);
+        header_lines = 0;
+        change_lines = 0;
+        semantic_lines = 0;
         append_head_tail_with_limit(text, &mut out, max_chars);
+        for line in out.lines() {
+            if is_file_header_line(line) || line.starts_with("@@ ") {
+                header_lines += 1;
+            } else if is_change_line(line) {
+                change_lines += 1;
+            } else if is_semantic_context_line(line) {
+                semantic_lines += 1;
+            }
+        }
     }
 
     out.push_str(&format!(
-        "\n... [diff truncated for budget; kept {} headers and {} change lines]",
-        header_lines, change_lines
+        "\n... [diff truncated for budget; kept {} headers, {} change lines, {} semantic lines]",
+        header_lines, change_lines, semantic_lines
     ));
     out
+}
+
+fn extract_hunk_ranges(lines: &[&str]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut current_start: Option<usize> = None;
+
+    for (idx, line) in lines.iter().copied().enumerate() {
+        if line.starts_with("@@ ") {
+            if let Some(start) = current_start.replace(idx) {
+                out.push((start, idx));
+            }
+        } else if line.starts_with("diff --git ") {
+            if let Some(start) = current_start.take() {
+                out.push((start, idx));
+            }
+        }
+    }
+
+    if let Some(start) = current_start {
+        out.push((start, lines.len()));
+    }
+
+    out
+}
+
+fn sample_stratified_indices(total: usize, limit: usize) -> Vec<usize> {
+    if total == 0 || limit == 0 {
+        return Vec::new();
+    }
+    if total <= limit {
+        return (0..total).collect();
+    }
+    if limit == 1 {
+        return vec![0];
+    }
+
+    let mut selected = std::collections::BTreeSet::new();
+    let last = total.saturating_sub(1);
+    let denom = limit.saturating_sub(1);
+
+    for slot in 0..limit {
+        let numerator = slot.saturating_mul(last);
+        let idx = (numerator + (denom / 2)) / denom;
+        selected.insert(idx.min(last));
+    }
+
+    let mut next = 0usize;
+    while selected.len() < limit {
+        if selected.insert(next) {
+            next = next.saturating_add(1);
+            continue;
+        }
+        next = next.saturating_add(1);
+    }
+
+    selected.into_iter().collect()
+}
+
+fn round_robin_fill(
+    out: &mut String,
+    lines: &[&str],
+    used: &mut [bool],
+    buckets: &mut [Vec<usize>],
+    max_chars: usize,
+) -> usize {
+    if buckets.is_empty() {
+        return 0;
+    }
+
+    let mut cursors = vec![0usize; buckets.len()];
+    let mut added = 0usize;
+
+    loop {
+        let mut progressed = false;
+        for (bucket_idx, bucket) in buckets.iter().enumerate() {
+            let cursor = &mut cursors[bucket_idx];
+            while *cursor < bucket.len() && used[bucket[*cursor]] {
+                *cursor += 1;
+            }
+            if *cursor >= bucket.len() {
+                continue;
+            }
+
+            let idx = bucket[*cursor];
+            if !push_line_index_with_limit(out, lines, used, idx, max_chars) {
+                return added;
+            }
+            *cursor += 1;
+            added += 1;
+            progressed = true;
+        }
+        if !progressed {
+            break;
+        }
+    }
+    added
+}
+
+fn push_line_index_with_limit(
+    out: &mut String,
+    lines: &[&str],
+    used: &mut [bool],
+    idx: usize,
+    max_chars: usize,
+) -> bool {
+    if idx >= lines.len() || used[idx] {
+        return true;
+    }
+    if !push_line_with_limit(out, lines[idx], max_chars) {
+        return false;
+    }
+    used[idx] = true;
+    true
+}
+
+fn is_file_header_line(line: &str) -> bool {
+    line.starts_with("diff --git ")
+        || line.starts_with("index ")
+        || line.starts_with("--- ")
+        || line.starts_with("+++ ")
 }
 
 fn push_line_with_limit(out: &mut String, line: &str, max_chars: usize) -> bool {
@@ -1580,14 +1869,6 @@ fn append_head_tail_with_limit(text: &str, out: &mut String, max_chars: usize) {
             return;
         }
     }
-}
-
-fn is_structural_diff_line(line: &str) -> bool {
-    line.starts_with("diff --git ")
-        || line.starts_with("index ")
-        || line.starts_with("--- ")
-        || line.starts_with("+++ ")
-        || line.starts_with("@@ ")
 }
 
 fn is_change_line(line: &str) -> bool {
@@ -1895,6 +2176,96 @@ fn type_tag_prefix(tag: TypeTag) -> &'static str {
         TypeTag::Docs => "docs",
         TypeTag::Test => "test",
         TypeTag::Chore | TypeTag::Perf | TypeTag::Style | TypeTag::Mixed => "chore",
+    }
+}
+
+fn dominant_commit_type_by_confidence(items: &[ChangeItem]) -> Option<&'static str> {
+    let mut feat = 0.0f32;
+    let mut fix = 0.0f32;
+    let mut refactor = 0.0f32;
+    let mut docs = 0.0f32;
+    let mut test = 0.0f32;
+    let mut chore = 0.0f32;
+
+    for item in items {
+        let weight = item.confidence.clamp(0.05, 1.0);
+        match item.type_tag {
+            TypeTag::Feat => feat += weight,
+            TypeTag::Fix => fix += weight,
+            TypeTag::Refactor => refactor += weight,
+            TypeTag::Docs => docs += weight,
+            TypeTag::Test => test += weight,
+            TypeTag::Chore | TypeTag::Perf | TypeTag::Style | TypeTag::Mixed => chore += weight,
+        }
+    }
+
+    let ranked = [
+        (feat, "feat"),
+        (fix, "fix"),
+        (refactor, "refactor"),
+        (docs, "docs"),
+        (test, "test"),
+        (chore, "chore"),
+    ];
+
+    ranked
+        .into_iter()
+        .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
+        .and_then(|(weight, kind)| {
+            if weight > f32::EPSILON {
+                Some(kind)
+            } else {
+                None
+            }
+        })
+}
+
+fn reconcile_commit_type_with_items(
+    candidate_type: &'static str,
+    items: &[ChangeItem],
+) -> &'static str {
+    let dominant_type = dominant_commit_type_by_confidence(items)
+        .or_else(|| dominant_type_tag(items).map(type_tag_prefix))
+        .unwrap_or("chore");
+    if dominant_type == candidate_type || items.is_empty() {
+        return candidate_type;
+    }
+
+    let mut total_weight = 0.0f32;
+    let mut candidate_weight = 0.0f32;
+    let mut dominant_weight = 0.0f32;
+
+    for item in items {
+        let weight = item.confidence.clamp(0.05, 1.0);
+        total_weight += weight;
+
+        let item_type = type_tag_prefix(item.type_tag.clone());
+        if item_type == candidate_type {
+            candidate_weight += weight;
+        }
+        if item_type == dominant_type {
+            dominant_weight += weight;
+        }
+    }
+
+    if total_weight <= f32::EPSILON {
+        return dominant_type;
+    }
+
+    let candidate_ratio = candidate_weight / total_weight;
+    let dominant_ratio = dominant_weight / total_weight;
+    if candidate_ratio >= 0.45 {
+        return candidate_type;
+    }
+
+    if candidate_type == "feat" && candidate_ratio < 0.34 {
+        return dominant_type;
+    }
+
+    if dominant_ratio >= candidate_ratio + 0.2 {
+        dominant_type
+    } else {
+        candidate_type
     }
 }
 
@@ -2589,25 +2960,33 @@ fn recover_commit_message_from_reduce(
         return None;
     }
 
-    let (commit_type, scope_from_header) = parse_conventional_commit(&generated.commit_message)
-        .map(|(kind, scope, _)| (kind, scope.and_then(sanitize_scope)))
-        .or_else(|| {
-            parse_type_prefixed_header(&generated.commit_message).map(|(kind, _)| (kind, None))
-        })
-        .or_else(|| parse_type_prefixed_header(&generated.summary).map(|(kind, _)| (kind, None)))
-        .unwrap_or_else(|| {
-            (
-                dominant_type_tag(items).map_or("chore", type_tag_prefix),
-                None,
-            )
-        });
+    let (commit_type_candidate, scope_from_header) =
+        parse_conventional_commit(&generated.commit_message)
+            .map(|(kind, scope, _)| (kind, scope.and_then(sanitize_scope)))
+            .or_else(|| {
+                parse_type_prefixed_header(&generated.commit_message).map(|(kind, _)| (kind, None))
+            })
+            .or_else(|| {
+                parse_type_prefixed_header(&generated.summary).map(|(kind, _)| (kind, None))
+            })
+            .unwrap_or_else(|| {
+                (
+                    dominant_type_tag(items).map_or("chore", type_tag_prefix),
+                    None,
+                )
+            });
+    let commit_type = reconcile_commit_type_with_items(commit_type_candidate, items);
 
     let description =
         trim_redundant_commit_type_prefix(commit_type, &decapitalize_first(&description_candidate));
     if description.is_empty() {
         return None;
     }
-    let scope = scope_from_header.or_else(|| dominant_scope(items));
+    let scope = if commit_type != commit_type_candidate {
+        dominant_scope(items).or(scope_from_header)
+    } else {
+        scope_from_header.or_else(|| dominant_scope(items))
+    };
 
     Some(match scope {
         Some(scope) => format!("{commit_type}({scope}): {description}"),
@@ -2955,6 +3334,36 @@ Summary: Preserve valid commit text when reduce JSON is partially malformed.
         let repaired =
             recover_commit_message_from_reduce(&generated, &items).expect("should repair commit");
         assert_eq!(repaired, "feat(cli): add cache key with no version");
+    }
+
+    #[test]
+    fn recover_commit_message_from_reduce_reconciles_misaligned_type() {
+        let generated = ReduceModelOutput {
+            commit_message: "feat(cli): improve model reduction stability".to_string(),
+            summary: String::new(),
+            risk_level: "low".to_string(),
+            risk_notes: Vec::new(),
+        };
+        let items = vec![
+            sample_item(
+                TypeTag::Refactor,
+                "Refactor model reduction logic",
+                "Refactor model reduction flow",
+                "crates/llama-runtime/src/model.rs",
+                0.93,
+            ),
+            sample_item(
+                TypeTag::Fix,
+                "Fix reduce item sampling",
+                "Fix change-line sampling behavior",
+                "crates/llama-runtime/src/model.rs",
+                0.81,
+            ),
+        ];
+
+        let repaired = recover_commit_message_from_reduce(&generated, &items)
+            .expect("should reconcile commit type");
+        assert!(repaired.starts_with("refactor(llama-runtime):"));
     }
 
     #[test]

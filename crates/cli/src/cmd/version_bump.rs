@@ -263,12 +263,14 @@ fn build_recommendation(
 
     if let (Some(previous), Some(current)) = (previous_semver, current_semver) {
         if current > previous {
-            if let Some(actual) = bump_distance(previous, current) {
+            let actual = bump_distance(previous, current);
+            if let Some(actual) = actual {
                 if actual >= level {
                     return None;
                 }
             }
             let suggested = previous.bump(level).to_string();
+            let actual_level = actual.unwrap_or(BumpLevel::Patch);
             return Some(VersionRecommendation {
                 manifest_path: manifest_path.to_string(),
                 ecosystem: kind.ecosystem(),
@@ -277,9 +279,9 @@ fn build_recommendation(
                 suggested_version: Some(suggested),
                 level,
                 reason: format!(
-                    "version bumped, but {} changes usually merit at least a {} bump",
+                    "version bumped by {}, but detected changes suggest at least a {} bump",
+                    actual_level.as_str(),
                     level.as_str(),
-                    level.as_str()
                 ),
                 kind,
             });
@@ -1759,6 +1761,25 @@ diff --git a/Cargo.toml b/Cargo.toml\n";
             combine_recommended_level(BumpLevel::Patch, Some(BumpLevel::Major)),
             BumpLevel::Major
         );
+    }
+
+    #[test]
+    fn build_recommendation_reports_actual_vs_suggested_bump_distance() {
+        let rec = build_recommendation(
+            "crates/cli/Cargo.toml",
+            ManifestKind::CargoToml,
+            Some("1.0.1"),
+            Some("1.0.0"),
+            true,
+            BumpLevel::Minor,
+        )
+        .expect("recommendation should be produced");
+
+        assert_eq!(
+            rec.reason,
+            "version bumped by patch, but detected changes suggest at least a minor bump"
+        );
+        assert_eq!(rec.suggested_version.as_deref(), Some("1.1.0"));
     }
 
     #[test]

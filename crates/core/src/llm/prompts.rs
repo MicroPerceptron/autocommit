@@ -42,6 +42,8 @@ Return ONLY JSON with this exact shape:\n\
 Rules:\n\
 - commit_message must be a single conventional commit header that describes concrete code changes\n\
 - commit_message must not mention analysis process words like: reduce, reducer, analysis, analyses, report, chunk, or partial\n\
+- commit_message should reflect the dominant weighted theme (scope + change type), not a single minor edit\n\
+- if scopes/types conflict, prefer the majority pattern shown in scope_distribution and type_distribution\n\
 - do not use backticks in commit_message\n\
 - summary must be one sentence about the code change outcome\n\
 - risk_level must be low, medium, or high\n\

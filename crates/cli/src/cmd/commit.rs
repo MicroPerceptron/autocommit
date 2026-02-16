@@ -2394,6 +2394,9 @@ fn is_low_signal_intent(intent: &str) -> bool {
     if normalized.is_empty() {
         return true;
     }
+    if is_placeholder_phrase(&normalized) {
+        return true;
+    }
 
     let words = normalized.split_whitespace().collect::<Vec<_>>();
     if words.len() == 1 {
@@ -2414,6 +2417,23 @@ fn is_low_signal_intent(intent: &str) -> bool {
     }
 
     false
+}
+
+fn is_placeholder_phrase(normalized: &str) -> bool {
+    matches!(
+        normalized,
+        "none"
+            | "null"
+            | "nil"
+            | "na"
+            | "n a"
+            | "n a none"
+            | "not applicable"
+            | "unknown"
+            | "unspecified"
+            | "tbd"
+            | "todo"
+    )
 }
 
 fn looks_like_internal_risk_tag(note: &str) -> bool {
@@ -2717,10 +2737,7 @@ mod tests {
         ];
 
         let message = compose_commit_message(&report, &[]);
-        let changes_section = message
-            .split("### Risk")
-            .next()
-            .unwrap_or(message.as_str());
+        let changes_section = message.split("### Risk").next().unwrap_or(message.as_str());
         assert!(changes_section.contains("Refactor model reduction logic"));
         assert!(!changes_section.contains("Mixed"));
     }
@@ -2768,6 +2785,29 @@ mod tests {
         assert_eq!(
             formatted,
             "[`crates/cli/src/cmd/report_cache.rs`] Implement hash function for `diff_text`"
+        );
+    }
+
+    #[test]
+    fn format_change_item_omits_placeholder_intent_detail() {
+        let item = ChangeItem {
+            id: "placeholder-intent".to_string(),
+            bucket: ChangeBucket::Patch,
+            type_tag: TypeTag::Refactor,
+            title: "Add context window tokens method".to_string(),
+            intent: "None".to_string(),
+            files: vec![FileRef {
+                path: "crates/llama-runtime/src/context_handle.rs".to_string(),
+                status: FileStatus::Modified,
+                ranges: Vec::new(),
+            }],
+            confidence: 0.84,
+        };
+
+        let formatted = format_change_item(&item);
+        assert_eq!(
+            formatted,
+            "[`crates/llama-runtime/src/context_handle.rs`] Add context window tokens method"
         );
     }
 

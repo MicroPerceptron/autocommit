@@ -31,6 +31,8 @@ enum CommandName {
     Commit,
     /// Remove persisted per-repo KV generation cache
     Clean,
+    /// View and edit per-repo runtime and policy config
+    Config,
     /// Explain dispatch routing for a sample change profile
     ExplainDispatch,
     /// Initialize per-repo runtime cache and settings
@@ -102,6 +104,11 @@ fn run(args: Vec<String>) -> Result<(), String> {
         }
         Some(CommandName::Clean) => {
             let output = cmd::clean::run(&cli.args)?;
+            print!("{output}");
+            Ok(())
+        }
+        Some(CommandName::Config) => {
+            let output = cmd::config::run(&cli.args)?;
             print!("{output}");
             Ok(())
         }

@@ -3,6 +3,7 @@ pub mod analyze;
 pub mod clean;
 pub mod commit;
 mod commit_policy;
+pub mod config;
 pub mod explain_dispatch;
 mod git;
 pub mod init;

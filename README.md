@@ -33,9 +33,11 @@
 
 1. Initialize repository cache and model/runtime config:
    - `autocommit-cli init`
-2. Generate and review a commit:
+2. Review or update repository config later:
+   - `autocommit-cli config`
+3. Generate and review a commit:
    - `autocommit-cli commit`
-3. Generate and review a pull request:
+4. Generate and review a pull request:
    - `autocommit-cli pr`
 
 For non-interactive runs, use `--yes` and explicit flags (for example `--base`, `--push`).
@@ -50,6 +52,8 @@ For non-interactive runs, use `--yes` and explicit flags (for example `--base`, 
   - Generate PR title/body and create or update PRs.
 - `autocommit-cli init`
   - Initialize per-repo cache, model config, and commit policy defaults.
+- `autocommit-cli config`
+  - View and update per-repo model/profile/cache settings and commit policy.
 - `autocommit-cli clean`
   - Remove persisted generation KV cache for the current repo.
 - `autocommit-cli explain-dispatch`

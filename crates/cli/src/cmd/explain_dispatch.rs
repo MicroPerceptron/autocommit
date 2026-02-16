@@ -1,4 +1,5 @@
 use autocommit_core::diff::features::DiffFeatures;
+use autocommit_core::dispatch::embedding_gate::EmbeddingHint;
 use autocommit_core::dispatch::policy;
 use clap::Parser;
 
@@ -17,7 +18,13 @@ pub fn run(args: &[String]) -> String {
         risky_paths: 0,
     };
 
-    let decision = policy::decide(&sample, Some(0.81));
+    let decision = policy::decide(
+        &sample,
+        Some(EmbeddingHint {
+            draft_similarity: 0.41,
+            full_similarity: 0.81,
+        }),
+    );
     format!(
         "route={:?} reasons={} estimated_tokens={}\n",
         decision.route,

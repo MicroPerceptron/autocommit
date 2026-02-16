@@ -14,7 +14,7 @@ pub fn score(features: &DiffFeatures) -> HeuristicScore {
         + features.risky_paths as f32 * 0.7;
 
     let risky = features.risky_paths > 0 || features.binary_files > 0;
-    let borderline = (150..=900).contains(&features.lines_changed);
+    let borderline = (151..=900).contains(&features.lines_changed);
 
     HeuristicScore {
         complexity,

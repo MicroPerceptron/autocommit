@@ -20,13 +20,22 @@ Guidelines:
 - Unrelated changes: indicate mixed scope clearly
 "#;
 
+pub const DISPATCH_DRAFT_ANCHOR: &str = "Small, low-risk diff limited to a few files with straightforward behavior updates, docs, or tests and no high-impact migration or workflow changes.";
+pub const DISPATCH_FULL_ANCHOR: &str = "Large or risky diff with cross-cutting code changes, migrations, workflow updates, manifests, and potentially high-impact behavior changes that need full analysis.";
+
 pub fn build_analyze_prompt(chunk: &DiffChunk) -> String {
     format!(
-        "Task: Analyze one diff chunk.\n\
+        "/no_think\n\
+Task: Analyze one diff chunk.\n\
 Return ONLY JSON with keys: summary, bucket, type_tag, title, intent.\n\
 Allowed bucket values: Feature, Patch, Addition, Other.\n\
 Allowed type_tag values: Feat, Fix, Refactor, Docs, Test, Chore, Perf, Style, Mixed.\n\
+summary: <= 18 words, concrete change outcome.\n\
+title: <= 10 words, action-first phrase.\n\
+intent: <= 16 words, concise rationale phrase (not a long sentence).\n\
+Do not end `summary`, `title`, or `intent` with dangling filler words.\n\
 Use backticks for file paths, variable names, CLI flags, and config keys in summary/title/intent.\n\
+No markdown, no prose outside JSON.\n\
 Path: {}\n\
 Diff:\n```diff\n{}\n```",
         chunk.path, chunk.text

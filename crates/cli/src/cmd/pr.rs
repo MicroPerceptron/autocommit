@@ -1186,7 +1186,8 @@ fn format_change_item(item: &autocommit_core::types::ChangeItem) -> String {
     };
 
     let title = normalize_change_fragment(item.title.trim());
-    let title = clamp_words(&title, 88);
+    let (title, _) = clamp_words(&title, 120);
+    let title = rebalance_backticks(&title);
     let title = if title.is_empty() {
         "update file".to_string()
     } else {
@@ -1194,9 +1195,13 @@ fn format_change_item(item: &autocommit_core::types::ChangeItem) -> String {
     };
 
     let intent = normalize_change_fragment(item.intent.trim());
-    let intent = clamp_words(&intent, 132);
+    let (intent, intent_truncated) = clamp_words(&intent, 132);
+    let intent = rebalance_backticks(&intent);
 
-    let suffix = if should_include_intent_detail(&title, &intent) {
+    let suffix = if !intent_truncated
+        && !ends_with_dangling_joiner(&intent)
+        && should_include_intent_detail(&title, &intent)
+    {
         format!(": {intent}")
     } else {
         String::new()
@@ -1268,10 +1273,10 @@ fn normalize_change_fragment(raw: &str) -> String {
     out
 }
 
-fn clamp_words(value: &str, max_chars: usize) -> String {
+fn clamp_words(value: &str, max_chars: usize) -> (String, bool) {
     let value = value.trim();
     if value.chars().count() <= max_chars {
-        return value.to_string();
+        return (value.to_string(), false);
     }
 
     let mut out = String::new();
@@ -1287,7 +1292,7 @@ fn clamp_words(value: &str, max_chars: usize) -> String {
         out = next;
     }
 
-    if out.is_empty() {
+    let clamped = if out.is_empty() {
         value
             .chars()
             .take(max_chars)
@@ -1296,6 +1301,59 @@ fn clamp_words(value: &str, max_chars: usize) -> String {
             .to_string()
     } else {
         out
+    };
+    (clamped, true)
+}
+
+fn ends_with_dangling_joiner(value: &str) -> bool {
+    let cleaned = value
+        .trim()
+        .trim_end_matches(|ch: char| matches!(ch, '.' | ',' | ';' | ':' | '!' | '?'))
+        .to_ascii_lowercase();
+    if cleaned.is_empty() {
+        return false;
+    }
+
+    let cleaned = cleaned.trim_end_matches(|ch: char| !ch.is_ascii_alphanumeric());
+    let word_count = cleaned.split_whitespace().count();
+    if word_count < 3 {
+        return false;
+    }
+
+    if ["based on", "as a", "in order", "such as", "up to"]
+        .iter()
+        .any(|suffix| cleaned.ends_with(suffix))
+    {
+        return true;
+    }
+
+    matches!(
+        cleaned.split_whitespace().last().unwrap_or_default(),
+        "a" | "an"
+            | "the"
+            | "to"
+            | "for"
+            | "with"
+            | "without"
+            | "from"
+            | "into"
+            | "on"
+            | "in"
+            | "of"
+            | "and"
+            | "or"
+            | "but"
+            | "via"
+            | "by"
+            | "based"
+    )
+}
+
+fn rebalance_backticks(value: &str) -> String {
+    if value.matches('`').count() % 2 == 0 {
+        value.to_string()
+    } else {
+        value.replace('`', "")
     }
 }
 

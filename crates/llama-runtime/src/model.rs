@@ -1224,11 +1224,14 @@ fn generate_analyze_output(
         Ok(raw) => match parse_analyze_output(&raw) {
             Ok(parsed) => Ok(parsed),
             Err(parse_err) => {
-                let retry_raw =
-                    generation_ctx.generate_text(prompt, None, max_tokens.saturating_add(64))?;
+                let retry_raw = generation_ctx.generate_text(
+                    prompt,
+                    Some(grammar::ANALYZE_GBNF),
+                    max_tokens.saturating_add(96),
+                )?;
                 parse_analyze_output(&retry_raw).map_err(|retry_err| {
                     RuntimeError::Inference(format!(
-                        "analyze parse failed with and without grammar: primary={parse_err}; retry={retry_err}"
+                        "analyze parse failed with grammar: primary={parse_err}; retry={retry_err}"
                     ))
                 })
             }
@@ -1238,11 +1241,14 @@ fn generate_analyze_output(
                 .to_string()
                 .contains("grammar rejected all sampled candidates")
             {
-                let retry_raw =
-                    generation_ctx.generate_text(prompt, None, max_tokens.saturating_add(64))?;
+                let retry_raw = generation_ctx.generate_text(
+                    prompt,
+                    Some(grammar::ANALYZE_GBNF),
+                    max_tokens.saturating_add(96),
+                )?;
                 parse_analyze_output(&retry_raw).map_err(|retry_err| {
                     RuntimeError::Inference(format!(
-                        "analyze grammar pass failed ({err}); unconstrained retry parse failed ({retry_err})"
+                        "analyze grammar pass failed ({err}); grammar retry parse failed ({retry_err})"
                     ))
                 })
             } else {
@@ -1290,8 +1296,71 @@ fn parse_analyze_output(raw: &str) -> Result<AnalyzeModelOutput, RuntimeError> {
     if output.intent.is_empty() {
         output.intent = output.title.clone();
     }
+    if analyze_output_has_dangling_fragment(&output) {
+        return Err(RuntimeError::Inference(
+            "analyze output has dangling fragment likely caused by token truncation".to_string(),
+        ));
+    }
 
     Ok(output)
+}
+
+fn analyze_output_has_dangling_fragment(output: &AnalyzeModelOutput) -> bool {
+    ends_with_dangling_joiner(&output.intent)
+        || ends_with_dangling_joiner(&output.summary)
+        || ends_with_dangling_joiner(&output.title)
+}
+
+fn ends_with_dangling_joiner(value: &str) -> bool {
+    let cleaned = sanitize_sentence(value).trim().to_ascii_lowercase();
+    if cleaned.is_empty() {
+        return false;
+    }
+
+    let cleaned = cleaned.trim_end_matches(|ch: char| {
+        matches!(
+            ch,
+            '.' | ',' | ';' | ':' | '!' | '?' | '"' | '\'' | ')' | ']' | '}'
+        )
+    });
+    let word_count = cleaned.split_whitespace().count();
+    if word_count < 3 {
+        return false;
+    }
+
+    let dangling_two_word_suffixes = ["based on", "as a", "such as", "in order", "up to"];
+    if dangling_two_word_suffixes
+        .iter()
+        .any(|suffix| cleaned.ends_with(suffix))
+    {
+        return true;
+    }
+
+    let last = cleaned
+        .split_whitespace()
+        .last()
+        .unwrap_or_default()
+        .trim_matches(|ch: char| !ch.is_ascii_alphanumeric());
+    matches!(
+        last,
+        "a" | "an"
+            | "the"
+            | "to"
+            | "for"
+            | "with"
+            | "without"
+            | "from"
+            | "into"
+            | "on"
+            | "in"
+            | "of"
+            | "and"
+            | "or"
+            | "but"
+            | "via"
+            | "by"
+            | "based"
+    )
 }
 
 fn salvage_analyze_output(raw: &str) -> Option<AnalyzeModelOutput> {
@@ -1562,10 +1631,16 @@ fn build_analyze_prompt_capped(chunk: &DiffChunk, context_window_tokens: usize) 
     let truncated = compact_diff_for_prompt(&chunk.text, max_chars);
 
     format!(
-        "Task: Analyze one diff chunk.\n\
+        "/no_think\n\
+Task: Analyze one diff chunk.\n\
 Return ONLY JSON with keys: summary, bucket, type_tag, title, intent.\n\
 Allowed bucket values: Feature, Patch, Addition, Other.\n\
 Allowed type_tag values: Feat, Fix, Refactor, Docs, Test, Chore, Perf, Style, Mixed.\n\
+summary: <= 18 words, concrete change outcome.\n\
+title: <= 10 words, action-first phrase.\n\
+intent: <= 16 words, concise rationale phrase (not a long sentence).\n\
+Do not end `summary`, `title`, or `intent` with dangling filler words.\n\
+No markdown, no prose outside JSON.\n\
 Path: {}\n\
 Diff:\n```diff\n{}\n```",
         chunk.path, truncated
@@ -3213,6 +3288,26 @@ mod tests {
             err.to_string()
                 .contains("failed to parse analyze JSON output")
         );
+    }
+
+    #[test]
+    fn parse_analyze_output_rejects_dangling_fragment() {
+        let raw = r#"{"summary":"Route embeddings based on cosine similarity","bucket":"Patch","type_tag":"Refactor","title":"Update embedding gate","intent":"Determine dispatch route based on the"}"#;
+        let err = parse_analyze_output(raw).expect_err("dangling fragment should fail");
+        assert!(
+            err.to_string()
+                .contains("analyze output has dangling fragment")
+        );
+    }
+
+    #[test]
+    fn ends_with_dangling_joiner_detects_common_cutoff_suffixes() {
+        assert!(ends_with_dangling_joiner(
+            "Determine dispatch route based on the"
+        ));
+        assert!(!ends_with_dangling_joiner(
+            "Determine dispatch route using cosine similarity."
+        ));
     }
 
     #[test]

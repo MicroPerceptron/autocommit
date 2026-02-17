@@ -227,6 +227,14 @@ impl ContextHandle {
         self.seq_capacity
     }
 
+    pub(crate) fn context_window_tokens(&self) -> usize {
+        let n_ctx_seq = unsafe {
+            // SAFETY: pure context metadata query.
+            ffi::llama_n_ctx_seq(self.ptr)
+        } as usize;
+        n_ctx_seq.max(1)
+    }
+
     pub(crate) fn set_session_tokens(&mut self, tokens: Vec<ffi::llama_token>) {
         if self.mode == ContextMode::Generation {
             self.session_tokens = tokens;

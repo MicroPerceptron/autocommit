@@ -17,7 +17,25 @@ pub mod bridge {
         pub fn autocommit_common_config_free(cfg: *mut c_void);
 
         pub fn autocommit_common_config_set_model_path(cfg: *mut c_void, path: *const c_char);
+        pub fn autocommit_common_config_set_hf_repo(cfg: *mut c_void, repo: *const c_char);
+        pub fn autocommit_common_config_set_cache_dir(cfg: *mut c_void, dir: *const c_char);
         pub fn autocommit_common_config_set_n_parallel(cfg: *mut c_void, n_parallel: i32);
+        pub fn autocommit_common_config_resolve_model_path(
+            cfg: *mut c_void,
+            out_path: *mut c_char,
+            out_path_len: usize,
+            err: *mut c_char,
+            err_len: usize,
+        ) -> c_int;
+        pub fn autocommit_common_config_list_cached_models(
+            cfg: *mut c_void,
+            out_models: *mut c_char,
+            out_models_len: usize,
+            out_cache_dir: *mut c_char,
+            out_cache_dir_len: usize,
+            err: *mut c_char,
+            err_len: usize,
+        ) -> c_int;
 
         pub fn autocommit_common_config_apply_env(
             cfg: *mut c_void,

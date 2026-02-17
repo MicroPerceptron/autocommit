@@ -1,22 +1,25 @@
+#[cfg(feature = "llama-native")]
 use std::io::IsTerminal;
+#[cfg(feature = "llama-native")]
 use std::path::Path;
 
-use dialoguer::Confirm;
+use clap::Parser;
+#[cfg(feature = "llama-native")]
 use dialoguer::console::Term;
+#[cfg(feature = "llama-native")]
 use dialoguer::theme::ColorfulTheme;
+#[cfg(feature = "llama-native")]
+use dialoguer::Confirm;
 
 #[cfg(feature = "llama-native")]
 use crate::cmd::repo_cache;
 
 pub fn run(args: &[String]) -> Result<String, String> {
-    let mut assume_yes = false;
-
-    for arg in args {
-        match arg.as_str() {
-            "--yes" | "-y" => assume_yes = true,
-            flag => return Err(format!("unknown clean option: {flag}")),
-        }
-    }
+    let parsed = match CleanArgs::parse_from(args)? {
+        ParseOutcome::Continue(parsed) => parsed,
+        ParseOutcome::EarlyExit(text) => return Ok(text),
+    };
+    let assume_yes = parsed.yes;
 
     #[cfg(feature = "llama-native")]
     {
@@ -90,6 +93,7 @@ fn file_size(path: &Path) -> Result<u64, std::io::Error> {
     Ok(std::fs::metadata(path)?.len())
 }
 
+#[cfg(feature = "llama-native")]
 fn human_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut value = bytes as f64;
@@ -104,5 +108,39 @@ fn human_bytes(bytes: u64) -> String {
         format!("{} {}", bytes, UNITS[unit_idx])
     } else {
         format!("{value:.2} {}", UNITS[unit_idx])
+    }
+}
+
+enum ParseOutcome<T> {
+    Continue(T),
+    EarlyExit(String),
+}
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "autocommit-cli clean",
+    about = "Delete persisted per-repo KV generation cache"
+)]
+struct CleanArgs {
+    /// Skip confirmation and delete cache immediately
+    #[arg(long, short = 'y')]
+    yes: bool,
+}
+
+impl CleanArgs {
+    fn parse_from(args: &[String]) -> Result<ParseOutcome<Self>, String> {
+        let argv = std::iter::once("autocommit-cli clean".to_string()).chain(args.iter().cloned());
+        match Self::try_parse_from(argv) {
+            Ok(parsed) => Ok(ParseOutcome::Continue(parsed)),
+            Err(err) => {
+                use clap::error::ErrorKind;
+                match err.kind() {
+                    ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => {
+                        Ok(ParseOutcome::EarlyExit(err.to_string()))
+                    }
+                    _ => Err(err.to_string()),
+                }
+            }
+        }
     }
 }

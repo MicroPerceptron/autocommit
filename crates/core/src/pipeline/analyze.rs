@@ -23,7 +23,7 @@ impl Default for AnalyzeOptions {
 pub fn run(
     engine: &dyn LlmEngine,
     diff_text: &str,
-    options: &AnalyzeOptions,
+    _options: &AnalyzeOptions,
 ) -> Result<AnalysisReport, CoreError> {
     let chunks = collect::collect(diff_text);
 
@@ -41,8 +41,14 @@ pub fn run(
     let heuristic = heuristics::score(&features);
     let embedding_hint = if embedding_gate::should_run_embedding(heuristic) {
         let prompt = prompts::build_embedding_prompt(&chunks, 8_000);
-        let vector = engine.embed(&prompt)?;
-        embedding_gate::classify_embedding(&vector, options.embedding_threshold)
+        let signal_embedding = engine.embed(&prompt)?;
+        let draft_anchor_embedding = engine.embed(prompts::DISPATCH_DRAFT_ANCHOR)?;
+        let full_anchor_embedding = engine.embed(prompts::DISPATCH_FULL_ANCHOR)?;
+        embedding_gate::classify_embedding(
+            &signal_embedding,
+            &draft_anchor_embedding,
+            &full_anchor_embedding,
+        )
     } else {
         None
     };

@@ -26,7 +26,11 @@ pub fn analyze_chunks(
         }
 
         let analyzed = if let Some(result) = engine.analyze_chunks_batched(
-            &missing.iter().map(|&idx| &chunks[idx]).cloned().collect::<Vec<_>>(),
+            &missing
+                .iter()
+                .map(|&idx| &chunks[idx])
+                .cloned()
+                .collect::<Vec<_>>(),
         ) {
             result?
         } else {
@@ -126,7 +130,7 @@ fn chunk_cache_key(chunk: &DiffChunk) -> String {
     use std::hash::{Hash, Hasher};
 
     let mut hasher = DefaultHasher::new();
-    "v1".hash(&mut hasher);
+    "v2".hash(&mut hasher);
     chunk.path.hash(&mut hasher);
     chunk.text.hash(&mut hasher);
     format!("{:016x}", hasher.finish())

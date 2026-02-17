@@ -17,7 +17,25 @@ autocommit_common_config * autocommit_common_config_new(void);
 void autocommit_common_config_free(autocommit_common_config * cfg);
 
 void autocommit_common_config_set_model_path(autocommit_common_config * cfg, const char * path);
+void autocommit_common_config_set_hf_repo(autocommit_common_config * cfg, const char * repo);
+void autocommit_common_config_set_cache_dir(autocommit_common_config * cfg, const char * dir);
 void autocommit_common_config_set_n_parallel(autocommit_common_config * cfg, int32_t n_parallel);
+
+int autocommit_common_config_resolve_model_path(
+        autocommit_common_config * cfg,
+        char * out_path,
+        size_t out_path_len,
+        char * err,
+        size_t err_len);
+
+int autocommit_common_config_list_cached_models(
+        autocommit_common_config * cfg,
+        char * out_models,
+        size_t out_models_len,
+        char * out_cache_dir,
+        size_t out_cache_dir_len,
+        char * err,
+        size_t err_len);
 
 int autocommit_common_config_apply_env(
         autocommit_common_config * cfg,

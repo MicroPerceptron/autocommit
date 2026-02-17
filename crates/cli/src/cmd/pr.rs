@@ -1,17 +1,22 @@
 use std::io::{IsTerminal, Write};
+#[cfg(feature = "llama-native")]
+use std::path::PathBuf;
 use std::process::Command;
 
 #[cfg(not(feature = "llama-native"))]
 use autocommit_core::llm::traits::LlmEngine;
-use autocommit_core::{AnalyzeOptions, CoreError, run as core_run};
-use dialoguer::console::{Term, style};
-use dialoguer::{Confirm, Editor, Select, theme::ColorfulTheme};
-use serde::Deserialize;
+use autocommit_core::{run as core_run, AnalyzeOptions, CoreError};
+use clap::Parser;
+use dialoguer::console::{style, Term};
+use dialoguer::{theme::ColorfulTheme, Confirm, Editor, Select};
 use indicatif::{ProgressBar, ProgressStyle};
+use serde::Deserialize;
 
-use crate::cmd::{analysis_progress::AnalysisProgress, git, report_cache};
 #[cfg(feature = "llama-native")]
 use crate::cmd::repo_cache;
+use crate::cmd::{analysis_progress::AnalysisProgress, git, report_cache};
+#[cfg(feature = "llama-native")]
+use crate::path_util::expand_tilde;
 
 #[cfg(not(feature = "llama-native"))]
 use autocommit_core::types::{
@@ -20,17 +25,33 @@ use autocommit_core::types::{
 };
 
 pub fn run(args: &[String]) -> Result<String, String> {
-    let mut staged_only = false;
-    let mut push = false;
-    let mut dry_run = false;
-    let mut draft = false;
-    let mut base: Option<String> = None;
-    let mut head: Option<String> = None;
-    let mut title: Option<String> = None;
-    let mut body: Option<String> = None;
-    let mut interactive_override: Option<bool> = None;
-    let mut assume_yes = false;
-    let mut model_path: Option<String> = None;
+    let parsed = match PrArgs::parse_from(args)? {
+        ParseOutcome::Continue(parsed) => parsed,
+        ParseOutcome::EarlyExit(text) => return Ok(text),
+    };
+
+    let staged_only = parsed.staged;
+    let push = parsed.push;
+    let dry_run = parsed.dry_run;
+    let draft = parsed.draft;
+    let base = parsed.base;
+    let head = parsed.head;
+    let title = parsed.title;
+    let body = parsed.body;
+    let interactive_override = if parsed.interactive {
+        Some(true)
+    } else if parsed.no_interactive {
+        Some(false)
+    } else {
+        None
+    };
+    let assume_yes = parsed.yes;
+    #[allow(unused_mut)]
+    let mut model_path = parsed.model_path;
+    #[allow(unused_mut)]
+    let mut model_hf_repo = parsed.hf_repo;
+    #[allow(unused_mut)]
+    let mut model_cache_dir = parsed.cache_dir;
     #[cfg(feature = "llama-native")]
     let mut runtime_profile = "auto".to_string();
     #[cfg(feature = "llama-native")]
@@ -38,70 +59,23 @@ pub fn run(args: &[String]) -> Result<String, String> {
     #[cfg(not(feature = "llama-native"))]
     let runtime_profile = "mock".to_string();
 
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--staged" | "-s" => staged_only = true,
-            "--push" | "-p" => push = true,
-            "--dry-run" => dry_run = true,
-            "--draft" => draft = true,
-            "--base" => {
-                let value = args
-                    .get(i + 1)
-                    .ok_or_else(|| "--base requires a value".to_string())?;
-                base = Some(value.clone());
-                i += 1;
-            }
-            "--head" => {
-                let value = args
-                    .get(i + 1)
-                    .ok_or_else(|| "--head requires a value".to_string())?;
-                head = Some(value.clone());
-                i += 1;
-            }
-            "--title" => {
-                let value = args
-                    .get(i + 1)
-                    .ok_or_else(|| "--title requires a value".to_string())?;
-                title = Some(value.clone());
-                i += 1;
-            }
-            "--body" => {
-                let value = args
-                    .get(i + 1)
-                    .ok_or_else(|| "--body requires a value".to_string())?;
-                body = Some(value.clone());
-                i += 1;
-            }
-            "--interactive" => interactive_override = Some(true),
-            "--no-interactive" => interactive_override = Some(false),
-            "--yes" | "-y" => assume_yes = true,
-            "--model-path" => {
-                let path = args
-                    .get(i + 1)
-                    .ok_or_else(|| "--model-path requires a path".to_string())?;
-                model_path = Some(path.clone());
-                i += 1;
-            }
-            "--profile" => {
-                let profile = args
-                    .get(i + 1)
-                    .ok_or_else(|| "--profile requires a value".to_string())?;
-                #[cfg(feature = "llama-native")]
-                {
-                    runtime_profile = profile.clone();
-                    runtime_profile_overridden = true;
-                }
-                #[cfg(not(feature = "llama-native"))]
-                {
-                    let _ = profile;
-                }
-                i += 1;
-            }
-            flag => return Err(format!("unknown pr option: {flag}")),
+    if let Some(profile) = parsed.profile {
+        #[cfg(feature = "llama-native")]
+        {
+            runtime_profile = profile;
+            runtime_profile_overridden = true;
         }
-        i += 1;
+        #[cfg(not(feature = "llama-native"))]
+        {
+            let _ = profile;
+        }
     }
+
+    if model_path.is_some() && model_hf_repo.is_some() {
+        return Err("use either `--model-path` or `--hf-repo`, not both".to_string());
+    }
+    #[cfg(not(feature = "llama-native"))]
+    let _ = &model_cache_dir;
 
     let interactive = resolve_interactive_mode(interactive_override)?;
     let rich_interactive = interactive && Term::stderr().is_term();
@@ -110,10 +84,18 @@ pub fn run(args: &[String]) -> Result<String, String> {
     let repo_paths = repo_cache::maybe_discover_repo_kv_paths();
 
     #[cfg(feature = "llama-native")]
-    if model_path.is_none() || !runtime_profile_overridden {
+    if model_path.is_none()
+        || model_hf_repo.is_none()
+        || model_cache_dir.is_none()
+        || !runtime_profile_overridden
+    {
         if let Some(metadata) = repo_paths.as_ref().and_then(repo_cache::read_metadata) {
-            if model_path.is_none() {
-                model_path = metadata.model_path;
+            if model_path.is_none() && model_hf_repo.is_none() {
+                model_path = metadata.model_path.clone();
+                model_hf_repo = metadata.model_hf_repo.clone();
+            }
+            if model_cache_dir.is_none() {
+                model_cache_dir = metadata.model_cache_dir.clone();
             }
             if !runtime_profile_overridden && !metadata.profile.trim().is_empty() {
                 runtime_profile = metadata.profile;
@@ -121,15 +103,12 @@ pub fn run(args: &[String]) -> Result<String, String> {
         }
     }
 
-    if let Some(path) = model_path {
-        // SAFETY: this CLI is single-threaded for command setup and sets env before runtime init.
-        unsafe {
-            std::env::set_var("AUTOCOMMIT_EMBED_MODEL", path);
-        }
-    }
-
-    let repo = run_step(rich_interactive, "Discovering repository", git::Repo::discover)
-        .map_err(|err| err.to_string())?;
+    let repo = run_step(
+        rich_interactive,
+        "Discovering repository",
+        git::Repo::discover,
+    )
+    .map_err(|err| err.to_string())?;
     // Best-effort partial cache for large diffs.
     if let Some(cache_dir) = repo
         .common_git_dir()
@@ -143,13 +122,7 @@ pub fn run(args: &[String]) -> Result<String, String> {
 
     let remote_names = repo.remote_names().map_err(|err| err.to_string())?;
 
-    let (base, head) = resolve_pr_branches(
-        &repo,
-        base,
-        head,
-        interactive,
-        rich_interactive,
-    )?;
+    let (base, head) = resolve_pr_branches(&repo, base, head, interactive, rich_interactive)?;
 
     let diff_text = run_step(rich_interactive, "Collecting PR diff", || {
         prepare_pr_diff(&repo, staged_only, base.as_deref(), head.as_deref())
@@ -157,7 +130,7 @@ pub fn run(args: &[String]) -> Result<String, String> {
     .map_err(|err| err.to_string())?;
 
     let diff_hash = report_cache::diff_hash(&diff_text);
-    let cache_key = report_cache::cache_key("pr", runtime_profile.as_str(), &diff_hash, "1.0");
+    let cache_key = report_cache::cache_key("pr", runtime_profile.as_str(), &diff_hash);
     let cache_path = report_cache::cache_path(repo.common_git_dir());
     let cached_report = report_cache::read_cached_report(&cache_path, &cache_key);
 
@@ -169,10 +142,24 @@ pub fn run(args: &[String]) -> Result<String, String> {
     } else {
         #[cfg(feature = "llama-native")]
         let generation_state = repo_paths.map(|paths| paths.generation_state);
+        #[cfg(feature = "llama-native")]
+        let model_config = llama_runtime::ModelConfig::from_explicit(
+            model_path.as_deref().map(expand_tilde).map(PathBuf::from),
+            model_hf_repo.clone(),
+            model_cache_dir
+                .as_deref()
+                .map(expand_tilde)
+                .map(PathBuf::from),
+        )
+        .with_default_hf_if_unset();
 
         #[cfg(feature = "llama-native")]
         let engine = run_step(rich_interactive, "Initializing llama runtime", || {
-            llama_runtime::Engine::new_with_generation_cache(&runtime_profile, generation_state)
+            llama_runtime::Engine::new_with_generation_cache_and_model(
+                &runtime_profile,
+                generation_state,
+                model_config.clone(),
+            )
         })
         .map_err(|err| format!("runtime init failed: {err}"))?;
 
@@ -183,7 +170,7 @@ pub fn run(args: &[String]) -> Result<String, String> {
         .map_err(|err| format!("runtime init failed: {err}"))?;
 
         let progress = if rich_interactive {
-            Some(AnalysisProgress::new(&diff_text))
+            Some(AnalysisProgress::new(&diff_text, "Generating PR analysis"))
         } else {
             None
         };
@@ -366,10 +353,8 @@ fn find_existing_pr(head: Option<&str>, base: Option<&str>) -> Result<Option<Exi
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut list: Vec<ExistingPr> =
-        serde_json::from_str(stdout.trim()).map_err(|err| {
-            format!("failed to parse gh pr list output: {err}")
-        })?;
+    let mut list: Vec<ExistingPr> = serde_json::from_str(stdout.trim())
+        .map_err(|err| format!("failed to parse gh pr list output: {err}"))?;
 
     if list.is_empty() {
         return Ok(None);
@@ -486,6 +471,82 @@ fn resolve_interactive_mode(interactive_override: Option<bool>) -> Result<bool, 
         }
         Some(false) => Ok(false),
         None => Ok(stderr_tty),
+    }
+}
+
+enum ParseOutcome<T> {
+    Continue(T),
+    EarlyExit(String),
+}
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "autocommit-cli pr",
+    about = "Generate and optionally create or update a pull request"
+)]
+struct PrArgs {
+    /// Use staged changes only
+    #[arg(long, short = 's')]
+    staged: bool,
+    /// Push source branch before creating/updating PR
+    #[arg(long, short = 'p')]
+    push: bool,
+    /// Preview output without creating/updating a PR
+    #[arg(long = "dry-run")]
+    dry_run: bool,
+    /// Create PR as draft
+    #[arg(long)]
+    draft: bool,
+    /// Base branch (target), for example `origin/main`
+    #[arg(long, value_name = "BRANCH")]
+    base: Option<String>,
+    /// Head branch (source), for example `feature/my-branch`
+    #[arg(long, value_name = "BRANCH")]
+    head: Option<String>,
+    /// Override generated PR title
+    #[arg(long, value_name = "TEXT")]
+    title: Option<String>,
+    /// Override generated PR body
+    #[arg(long, value_name = "TEXT")]
+    body: Option<String>,
+    /// Force interactive UI
+    #[arg(long, conflicts_with = "no_interactive")]
+    interactive: bool,
+    /// Disable interactive UI
+    #[arg(long = "no-interactive", conflicts_with = "interactive")]
+    no_interactive: bool,
+    /// Assume yes for confirmations
+    #[arg(long, short = 'y')]
+    yes: bool,
+    /// Explicit local model path (`.gguf`)
+    #[arg(long = "model-path", value_name = "PATH")]
+    model_path: Option<String>,
+    /// Hugging Face model repo (`org/model` or `org/model:file`)
+    #[arg(long = "hf-repo", value_name = "REPO")]
+    hf_repo: Option<String>,
+    /// Override llama.cpp model cache directory
+    #[arg(long = "cache-dir", value_name = "PATH")]
+    cache_dir: Option<String>,
+    /// Runtime profile (`auto`, etc.)
+    #[arg(long = "profile", value_name = "PROFILE")]
+    profile: Option<String>,
+}
+
+impl PrArgs {
+    fn parse_from(args: &[String]) -> Result<ParseOutcome<Self>, String> {
+        let argv = std::iter::once("autocommit-cli pr".to_string()).chain(args.iter().cloned());
+        match Self::try_parse_from(argv) {
+            Ok(parsed) => Ok(ParseOutcome::Continue(parsed)),
+            Err(err) => {
+                use clap::error::ErrorKind;
+                match err.kind() {
+                    ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => {
+                        Ok(ParseOutcome::EarlyExit(err.to_string()))
+                    }
+                    _ => Err(err.to_string()),
+                }
+            }
+        }
     }
 }
 
@@ -717,8 +778,14 @@ fn print_pr_preview(title: &str, body: &str, rich: bool) {
     }
 
     println!();
-    println!("{}", style("Proposed pull request").bold().underlined().cyan());
-    println!("{}", style("----------------------------------------").dim());
+    println!(
+        "{}",
+        style("Proposed pull request").bold().underlined().cyan()
+    );
+    println!(
+        "{}",
+        style("----------------------------------------").dim()
+    );
     if !title.trim().is_empty() {
         println!("{}", style(title).bold().green());
     }
@@ -736,7 +803,10 @@ fn print_pr_preview(title: &str, body: &str, rich: bool) {
             }
         }
     }
-    println!("{}", style("----------------------------------------").dim());
+    println!(
+        "{}",
+        style("----------------------------------------").dim()
+    );
     println!();
 }
 
@@ -1105,7 +1175,8 @@ fn format_change_item(item: &autocommit_core::types::ChangeItem) -> String {
     };
 
     let title = normalize_change_fragment(item.title.trim());
-    let title = clamp_words(&title, 88);
+    let (title, _) = clamp_words(&title, 120);
+    let title = rebalance_backticks(&title);
     let title = if title.is_empty() {
         "update file".to_string()
     } else {
@@ -1113,9 +1184,13 @@ fn format_change_item(item: &autocommit_core::types::ChangeItem) -> String {
     };
 
     let intent = normalize_change_fragment(item.intent.trim());
-    let intent = clamp_words(&intent, 132);
+    let (intent, intent_truncated) = clamp_words(&intent, 132);
+    let intent = rebalance_backticks(&intent);
 
-    let suffix = if should_include_intent_detail(&title, &intent) {
+    let suffix = if !intent_truncated
+        && !ends_with_dangling_joiner(&intent)
+        && should_include_intent_detail(&title, &intent)
+    {
         format!(": {intent}")
     } else {
         String::new()
@@ -1187,10 +1262,10 @@ fn normalize_change_fragment(raw: &str) -> String {
     out
 }
 
-fn clamp_words(value: &str, max_chars: usize) -> String {
+fn clamp_words(value: &str, max_chars: usize) -> (String, bool) {
     let value = value.trim();
     if value.chars().count() <= max_chars {
-        return value.to_string();
+        return (value.to_string(), false);
     }
 
     let mut out = String::new();
@@ -1206,7 +1281,7 @@ fn clamp_words(value: &str, max_chars: usize) -> String {
         out = next;
     }
 
-    if out.is_empty() {
+    let clamped = if out.is_empty() {
         value
             .chars()
             .take(max_chars)
@@ -1215,6 +1290,59 @@ fn clamp_words(value: &str, max_chars: usize) -> String {
             .to_string()
     } else {
         out
+    };
+    (clamped, true)
+}
+
+fn ends_with_dangling_joiner(value: &str) -> bool {
+    let cleaned = value
+        .trim()
+        .trim_end_matches(|ch: char| matches!(ch, '.' | ',' | ';' | ':' | '!' | '?'))
+        .to_ascii_lowercase();
+    if cleaned.is_empty() {
+        return false;
+    }
+
+    let cleaned = cleaned.trim_end_matches(|ch: char| !ch.is_ascii_alphanumeric());
+    let word_count = cleaned.split_whitespace().count();
+    if word_count < 3 {
+        return false;
+    }
+
+    if ["based on", "as a", "in order", "such as", "up to"]
+        .iter()
+        .any(|suffix| cleaned.ends_with(suffix))
+    {
+        return true;
+    }
+
+    matches!(
+        cleaned.split_whitespace().last().unwrap_or_default(),
+        "a" | "an"
+            | "the"
+            | "to"
+            | "for"
+            | "with"
+            | "without"
+            | "from"
+            | "into"
+            | "on"
+            | "in"
+            | "of"
+            | "and"
+            | "or"
+            | "but"
+            | "via"
+            | "by"
+            | "based"
+    )
+}
+
+fn rebalance_backticks(value: &str) -> String {
+    if value.matches('`').count() % 2 == 0 {
+        value.to_string()
+    } else {
+        value.replace('`', "")
     }
 }
 
@@ -1264,7 +1392,12 @@ fn create_pr(
     head: Option<&str>,
 ) -> Result<String, CoreError> {
     let mut cmd = Command::new("gh");
-    cmd.arg("pr").arg("create").arg("--title").arg(title).arg("--body").arg(body);
+    cmd.arg("pr")
+        .arg("create")
+        .arg("--title")
+        .arg(title)
+        .arg("--body")
+        .arg(body);
     if draft {
         cmd.arg("--draft");
     }

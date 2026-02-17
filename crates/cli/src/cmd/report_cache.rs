@@ -6,6 +6,7 @@ use autocommit_core::AnalysisReport;
 use serde::{Deserialize, Serialize};
 
 const CACHE_SCHEMA_VERSION: u32 = 1;
+const CACHE_KEY_VERSION: &str = "2.3";
 const CACHE_DIR: &str = "autocommit/kv";
 const REPORT_CACHE_FILE: &str = "report_cache.json";
 
@@ -23,13 +24,8 @@ struct ReportCacheEntry {
     created_unix_secs: u64,
 }
 
-pub(crate) fn cache_key(
-    scope: &str,
-    model_profile: &str,
-    diff_hash: &str,
-    schema_version: &str,
-) -> String {
-    format!("{scope}|{model_profile}|{schema_version}|{diff_hash}")
+pub(crate) fn cache_key(scope: &str, model_profile: &str, diff_hash: &str) -> String {
+    format!("{scope}|{model_profile}|{CACHE_KEY_VERSION}|{diff_hash}")
 }
 
 pub(crate) fn read_cached_report(cache_path: &Path, cache_key: &str) -> Option<AnalysisReport> {
@@ -74,8 +70,8 @@ pub(crate) fn cache_path(git_dir: &Path) -> PathBuf {
 }
 
 pub(crate) fn diff_hash(diff_text: &str) -> String {
-    use std::hash::{Hash, Hasher};
     use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
 
     let mut hasher = DefaultHasher::new();
     diff_text.hash(&mut hasher);

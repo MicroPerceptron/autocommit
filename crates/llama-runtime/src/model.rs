@@ -14,9 +14,12 @@ use serde::Deserialize;
 
 use crate::context::RuntimeContext;
 use crate::context_handle::ContextHandle;
-use crate::embed::{EMBEDDING_MODEL_ENV, FALLBACK_MODEL_ENV, resolve_embedding_model_path};
+use crate::embed::{
+    DEFAULT_HF_REPO, resolve_embedding_hf_repo, resolve_embedding_model_path,
+    resolve_llama_cache_dir,
+};
 use crate::error::RuntimeError;
-use crate::model_handle::ModelHandle;
+use crate::model_handle::{ModelHandle, list_cached_models as list_cached_models_bridge};
 use crate::progress::{ProgressCallback, ProgressEvent, ProgressStage};
 
 static BACKEND_REFCOUNT: AtomicUsize = AtomicUsize::new(0);
@@ -79,12 +82,19 @@ struct LoadedRuntime {
 
 impl LoadedRuntime {
     fn load(
-        model_path: &Path,
+        model_path: Option<&Path>,
+        model_hf_repo: Option<&str>,
+        model_cache_dir: Option<&Path>,
         profile: &str,
         generation_state_path: Option<PathBuf>,
     ) -> Result<Self, RuntimeError> {
         let cpu_only = profile.eq_ignore_ascii_case("cpu");
-        let model = Arc::new(ModelHandle::load(model_path, cpu_only)?);
+        let model = Arc::new(ModelHandle::load(
+            model_path,
+            model_hf_repo,
+            model_cache_dir,
+            cpu_only,
+        )?);
 
         Ok(Self {
             generation_ctx: None,
@@ -175,10 +185,13 @@ impl LoadedRuntime {
         }
 
         let model = Arc::clone(&self.model);
+        let generation_state_path = self.generation_state_path.clone();
+        let generation_ctx = self.generation_ctx()?;
+        let context_window_tokens = generation_ctx.context_window_tokens();
         let prompts = chunks
             .iter()
             .map(|chunk| {
-                let prompt = build_analyze_prompt_capped(chunk);
+                let prompt = build_analyze_prompt_capped(chunk, context_window_tokens);
                 model
                     .apply_chat_template(Some(prompts::SYSTEM_PROMPT), &prompt)
                     .unwrap_or_else(|| {
@@ -190,10 +203,10 @@ impl LoadedRuntime {
                     })
             })
             .collect::<Vec<_>>();
-        let budgets = chunks.iter().map(analyze_token_budget).collect::<Vec<_>>();
-        let generation_state_path = self.generation_state_path.clone();
-
-        let generation_ctx = self.generation_ctx()?;
+        let budgets = chunks
+            .iter()
+            .map(|chunk| analyze_token_budget(chunk, context_window_tokens))
+            .collect::<Vec<_>>();
         let mut out: Vec<PartialReport> = chunks
             .iter()
             .enumerate()
@@ -386,10 +399,67 @@ impl LoadedRuntime {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct ModelConfig {
+    pub local_path: Option<PathBuf>,
+    pub hf_repo: Option<String>,
+    pub cache_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CachedModelList {
+    pub cache_dir: PathBuf,
+    pub models: Vec<String>,
+}
+
+pub fn list_cached_models(cache_dir: Option<PathBuf>) -> Result<CachedModelList, RuntimeError> {
+    let (cache_dir, models) = list_cached_models_bridge(cache_dir.as_deref())?;
+    Ok(CachedModelList { cache_dir, models })
+}
+
+impl ModelConfig {
+    pub fn from_explicit(
+        local_path: Option<PathBuf>,
+        hf_repo: Option<String>,
+        cache_dir: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            local_path,
+            hf_repo: hf_repo
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+            cache_dir,
+        }
+    }
+
+    pub fn from_env_or_default() -> Self {
+        let local_path = resolve_embedding_model_path();
+        let hf_repo = if local_path.is_some() {
+            None
+        } else {
+            resolve_embedding_hf_repo().or_else(|| Some(DEFAULT_HF_REPO.to_string()))
+        };
+        let cache_dir = resolve_llama_cache_dir();
+
+        Self {
+            local_path,
+            hf_repo,
+            cache_dir,
+        }
+    }
+
+    pub fn with_default_hf_if_unset(mut self) -> Self {
+        if self.local_path.is_none() && self.hf_repo.is_none() {
+            self.hf_repo = Some(DEFAULT_HF_REPO.to_string());
+        }
+        self
+    }
+}
+
 pub struct Engine {
     _backend: Arc<BackendGuard>,
     context: RuntimeContext,
-    runtime_model_path: Option<PathBuf>,
+    runtime_model: ModelConfig,
     generation_state_path: Option<PathBuf>,
     runtime: Mutex<Option<LoadedRuntime>>,
     progress: Mutex<Option<ProgressCallback>>,
@@ -399,7 +469,7 @@ impl std::fmt::Debug for Engine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Engine")
             .field("context", &self.context)
-            .field("runtime_model_path", &self.runtime_model_path)
+            .field("runtime_model", &self.runtime_model)
             .field("generation_state_path", &self.generation_state_path)
             .finish_non_exhaustive()
     }
@@ -414,11 +484,24 @@ impl Engine {
         profile: &str,
         generation_state_path: Option<PathBuf>,
     ) -> Result<Self, RuntimeError> {
+        Self::new_with_generation_cache_and_model(
+            profile,
+            generation_state_path,
+            ModelConfig::from_env_or_default(),
+        )
+    }
+
+    pub fn new_with_generation_cache_and_model(
+        profile: &str,
+        generation_state_path: Option<PathBuf>,
+        model_config: ModelConfig,
+    ) -> Result<Self, RuntimeError> {
         let backend = Arc::new(BackendGuard::acquire());
+        let runtime_model = model_config.with_default_hf_if_unset();
         Ok(Self {
             _backend: backend,
             context: RuntimeContext::new(profile),
-            runtime_model_path: resolve_embedding_model_path(),
+            runtime_model,
             generation_state_path,
             runtime: Mutex::new(None),
             progress: Mutex::new(None),
@@ -435,7 +518,15 @@ impl Engine {
     }
 
     pub fn configured_model_path(&self) -> Option<&Path> {
-        self.runtime_model_path.as_deref()
+        self.runtime_model.local_path.as_deref()
+    }
+
+    pub fn configured_hf_repo(&self) -> Option<&str> {
+        self.runtime_model.hf_repo.as_deref()
+    }
+
+    pub fn configured_cache_dir(&self) -> Option<&Path> {
+        self.runtime_model.cache_dir.as_deref()
     }
 
     pub fn warmup_generation_cache(&self) -> Result<(), RuntimeError> {
@@ -452,11 +543,11 @@ impl Engine {
         &self,
         f: impl FnOnce(&mut LoadedRuntime) -> Result<T, RuntimeError>,
     ) -> Result<T, RuntimeError> {
-        let model_path = self.runtime_model_path.as_deref().ok_or_else(|| {
-            RuntimeError::Inference(format!(
-                "runtime model path is not configured; set {EMBEDDING_MODEL_ENV} or {FALLBACK_MODEL_ENV}"
-            ))
-        })?;
+        if self.runtime_model.local_path.is_none() && self.runtime_model.hf_repo.is_none() {
+            return Err(RuntimeError::Inference(
+                "runtime model is not configured".to_string(),
+            ));
+        }
 
         let mut guard = self
             .runtime
@@ -465,7 +556,9 @@ impl Engine {
 
         if guard.is_none() {
             *guard = Some(LoadedRuntime::load(
-                model_path,
+                self.runtime_model.local_path.as_deref(),
+                self.runtime_model.hf_repo.as_deref(),
+                self.runtime_model.cache_dir.as_deref(),
                 &self.context.profile,
                 self.generation_state_path.clone(),
             )?);
@@ -544,16 +637,31 @@ impl LlmEngine for Engine {
         let generated_summary_candidate = generated
             .as_ref()
             .and_then(|g| normalize_reduce_summary(&g.summary));
+        let repaired_commit_candidate = generated
+            .as_ref()
+            .and_then(|g| recover_commit_message_from_reduce(g, &items));
 
         let fallback_commit_message = synthesize_fallback_commit_message(&items, partials.len());
         let fallback_summary = synthesize_fallback_summary(&items, stats);
 
-        let commit_message = generated_commit_candidate
-            .clone()
-            .unwrap_or_else(|| fallback_commit_message.clone());
-        let summary = generated_summary_candidate
-            .clone()
-            .unwrap_or_else(|| fallback_summary.clone());
+        let (commit_message, commit_source) =
+            if let Some(commit) = generated_commit_candidate.clone() {
+                (commit, "reduce_model")
+            } else if let Some(commit) = repaired_commit_candidate.clone() {
+                (commit, "reduce_model_repaired")
+            } else {
+                (fallback_commit_message.clone(), "composed_partials")
+            };
+        let repaired_summary_candidate = generated
+            .as_ref()
+            .and_then(|g| recover_summary_from_reduce(g, &commit_message, stats));
+        let (summary, summary_source) = if let Some(summary) = generated_summary_candidate.clone() {
+            (summary, "reduce_model")
+        } else if let Some(summary) = repaired_summary_candidate.clone() {
+            (summary, "reduce_model_repaired")
+        } else {
+            (fallback_summary.clone(), "composed_partials")
+        };
 
         let risk_level = generated
             .as_ref()
@@ -579,24 +687,20 @@ impl LlmEngine for Engine {
                 }
                 notes
             });
-        risk_notes.push(if generated_commit_candidate.is_some() {
-            "commit_source:reduce_model".to_string()
-        } else {
-            "commit_source:composed_partials".to_string()
-        });
-        risk_notes.push(if generated_summary_candidate.is_some() {
-            "summary_source:reduce_model".to_string()
-        } else {
-            "summary_source:composed_partials".to_string()
-        });
+        risk_notes.push(format!("commit_source:{commit_source}"));
+        risk_notes.push(format!("summary_source:{summary_source}"));
         if generated.is_some() {
             risk_notes.push(if generated_commit_candidate.is_some() {
                 "reduce_commit_candidate:usable".to_string()
+            } else if repaired_commit_candidate.is_some() {
+                "reduce_commit_candidate:repaired".to_string()
             } else {
                 "reduce_commit_candidate:invalid".to_string()
             });
             risk_notes.push(if generated_summary_candidate.is_some() {
                 "reduce_summary_candidate:usable".to_string()
+            } else if repaired_summary_candidate.is_some() {
+                "reduce_summary_candidate:repaired".to_string()
             } else {
                 "reduce_summary_candidate:invalid".to_string()
             });
@@ -651,12 +755,16 @@ impl LlmEngine for Engine {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 struct ReduceModelOutput {
+    #[serde(default, alias = "commit", alias = "message")]
     commit_message: String,
+    #[serde(default, alias = "description")]
     summary: String,
+    #[serde(default, alias = "risk")]
     risk_level: String,
     #[serde(default)]
+    #[serde(alias = "notes")]
     risk_notes: Vec<String>,
 }
 
@@ -698,6 +806,17 @@ fn build_reduce_prompt_plan(
         decision.route,
         decision.reason_codes.join(",")
     ));
+    if let Some(theme) = reduce_dominant_theme(partials) {
+        prompt.push_str(&format!("- dominant_theme={theme}\n"));
+    }
+    let scope_distribution = reduce_scope_distribution(partials, 4);
+    if !scope_distribution.is_empty() {
+        prompt.push_str(&format!("- scope_distribution={scope_distribution}\n"));
+    }
+    let type_distribution = reduce_type_distribution(partials);
+    if !type_distribution.is_empty() {
+        prompt.push_str(&format!("- type_distribution={type_distribution}\n"));
+    }
     prompt.push_str("Representative items:\n");
 
     let mut sampled = 0usize;
@@ -730,35 +849,44 @@ fn build_reduce_prompt_plan(
 }
 
 fn reduce_token_budget(stats: &DiffStats, total: usize) -> usize {
-    if stats.lines_changed > 1_500 || total > 24 {
-        224
-    } else if stats.lines_changed > 900 || total > 12 {
-        256
-    } else {
-        320
+    if let Some(override_tokens) = env_budget_override("AUTOCOMMIT_REDUCE_MAX_TOKENS") {
+        return override_tokens.clamp(96, 2_048);
     }
+
+    let complexity = reduce_complexity(stats, total);
+    blend_budget(320, 448, complexity)
 }
 
 fn reduce_item_budget(stats: &DiffStats, total: usize) -> usize {
-    if total <= 6 {
-        total
-    } else if stats.lines_changed > 1_500 || total > 24 {
-        8
-    } else if stats.lines_changed > 900 || total > 12 {
-        10
-    } else {
-        14
+    if let Some(override_items) = env_budget_override("AUTOCOMMIT_REDUCE_MAX_ITEMS") {
+        return override_items.clamp(1, 64).min(total.max(1));
     }
+
+    let complexity = reduce_complexity(stats, total);
+    blend_budget(12, 24, complexity).min(total)
 }
 
 fn reduce_char_budget(stats: &DiffStats, total: usize) -> usize {
-    if stats.lines_changed > 1_500 || total > 24 {
-        2_500
-    } else if stats.lines_changed > 900 || total > 12 {
-        3_000
-    } else {
-        4_500
+    if let Some(override_chars) = env_budget_override("AUTOCOMMIT_REDUCE_MAX_PROMPT_CHARS") {
+        return override_chars.clamp(2_000, 20_000);
     }
+
+    let complexity = reduce_complexity(stats, total);
+    blend_budget(4_800, 10_000, complexity)
+}
+
+fn reduce_complexity(stats: &DiffStats, total: usize) -> f32 {
+    let lines = (stats.lines_changed as f32 / 8_000.0).clamp(0.0, 1.0);
+    let chunks = (total as f32 / 96.0).clamp(0.0, 1.0);
+    let hunks = (stats.hunks as f32 / 160.0).clamp(0.0, 1.0);
+    ((lines * 0.6) + (chunks * 0.3) + (hunks * 0.1)).sqrt()
+}
+
+fn blend_budget(low: usize, high: usize, factor: f32) -> usize {
+    let factor = factor.clamp(0.0, 1.0);
+    let span = high.saturating_sub(low) as f32;
+    let value = low as f32 + span * factor;
+    value.round() as usize
 }
 
 fn sampled_indices(partials: &[PartialReport], max_items: usize) -> Vec<usize> {
@@ -821,7 +949,6 @@ fn sampled_indices(partials: &[PartialReport], max_items: usize) -> Vec<usize> {
         }
     }
 
-    selected.sort_unstable();
     selected
 }
 
@@ -862,6 +989,7 @@ fn reduce_partial_scope_key(partial: &PartialReport) -> String {
 fn format_partial_for_reduce(partial: &PartialReport) -> String {
     let summary = compact_reduce_text(&partial.summary, 220);
     if let Some(item) = partial.items.first() {
+        let scope = reduce_partial_scope_key(partial);
         let file_paths = item
             .files
             .iter()
@@ -871,12 +999,100 @@ fn format_partial_for_reduce(partial: &PartialReport) -> String {
             .join("|");
         let title = compact_reduce_text(&item.title, 120);
         format!(
-            "bucket={:?} type={:?} title={} files={} confidence={:.2} summary={}",
-            item.bucket, item.type_tag, title, file_paths, item.confidence, summary
+            "scope={} bucket={:?} type={:?} title={} files={} confidence={:.2} summary={}",
+            scope, item.bucket, item.type_tag, title, file_paths, item.confidence, summary
         )
     } else {
         summary
     }
+}
+
+fn reduce_dominant_theme(partials: &[PartialReport]) -> Option<String> {
+    let type_distribution = reduce_type_distribution(partials);
+    let dominant_type = type_distribution
+        .split(',')
+        .next()
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string();
+    let scope_distribution = reduce_scope_distribution(partials, 1);
+    let dominant_scope = scope_distribution
+        .split(',')
+        .next()
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string();
+    if dominant_type.is_empty() && dominant_scope.is_empty() {
+        return None;
+    }
+    if dominant_type.is_empty() {
+        return Some(dominant_scope.to_string());
+    }
+    if dominant_scope.is_empty() {
+        return Some(dominant_type.to_string());
+    }
+    Some(format!("{dominant_type} in {dominant_scope}"))
+}
+
+fn reduce_scope_distribution(partials: &[PartialReport], max_scopes: usize) -> String {
+    if max_scopes == 0 {
+        return String::new();
+    }
+
+    let mut counts = std::collections::BTreeMap::<String, f32>::new();
+    for partial in partials {
+        let scope = reduce_partial_scope_key(partial);
+        let weight = partial
+            .items
+            .first()
+            .map(|item| item.confidence.clamp(0.05, 1.0))
+            .unwrap_or(0.1);
+        *counts.entry(scope).or_insert(0.0) += weight;
+    }
+
+    render_distribution(counts, max_scopes)
+}
+
+fn reduce_type_distribution(partials: &[PartialReport]) -> String {
+    let mut counts = std::collections::BTreeMap::<String, f32>::new();
+    for partial in partials {
+        let Some(item) = partial.items.first() else {
+            continue;
+        };
+        let weight = item.confidence.clamp(0.05, 1.0);
+        *counts
+            .entry(type_tag_prefix(item.type_tag.clone()).to_string())
+            .or_insert(0.0) += weight;
+    }
+
+    render_distribution(counts, 4)
+}
+
+fn render_distribution(
+    counts: std::collections::BTreeMap<String, f32>,
+    max_items: usize,
+) -> String {
+    if counts.is_empty() || max_items == 0 {
+        return String::new();
+    }
+
+    let total = counts.values().sum::<f32>().max(f32::EPSILON);
+    let mut ranked = counts.into_iter().collect::<Vec<_>>();
+    ranked.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+
+    ranked
+        .into_iter()
+        .take(max_items)
+        .map(|(label, score)| {
+            let pct = (score / total) * 100.0;
+            format!("{label}:{pct:.0}%")
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn compact_reduce_text(value: &str, max_chars: usize) -> String {
@@ -910,6 +1126,10 @@ fn parse_reduce_output(raw: &str) -> Result<ReduceModelOutput, RuntimeError> {
         }
     }
 
+    if last.is_none() {
+        last = salvage_reduce_output(raw);
+    }
+
     let mut output = last.ok_or_else(|| {
         RuntimeError::Inference(format!(
             "failed to parse reduce JSON output from model: {}",
@@ -921,15 +1141,9 @@ fn parse_reduce_output(raw: &str) -> Result<ReduceModelOutput, RuntimeError> {
     output.summary = output.summary.trim().to_string();
     output.risk_level = output.risk_level.trim().to_ascii_lowercase();
 
-    if output.commit_message.is_empty() {
+    if output.commit_message.is_empty() && output.summary.is_empty() {
         return Err(RuntimeError::Inference(
-            "reduce output commit_message is empty".to_string(),
-        ));
-    }
-
-    if output.summary.is_empty() {
-        return Err(RuntimeError::Inference(
-            "reduce output summary is empty".to_string(),
+            "reduce output is missing both commit_message and summary".to_string(),
         ));
     }
 
@@ -939,6 +1153,65 @@ fn parse_reduce_output(raw: &str) -> Result<ReduceModelOutput, RuntimeError> {
 
     output.risk_notes.retain(|note| !note.trim().is_empty());
     Ok(output)
+}
+
+fn salvage_reduce_output(raw: &str) -> Option<ReduceModelOutput> {
+    let mut commit_message: Option<String> = None;
+    let mut summary: Option<String> = None;
+
+    for line in raw.lines() {
+        let cleaned = line
+            .trim()
+            .trim_matches(|ch: char| ch == '"' || ch == '\'' || ch == '`')
+            .trim_start_matches("- ")
+            .trim_start_matches("* ")
+            .trim()
+            .to_string();
+        if cleaned.is_empty() {
+            continue;
+        }
+
+        let lowered = cleaned.to_ascii_lowercase();
+        let normalized_commit = if let Some(rest) = lowered
+            .strip_prefix("commit:")
+            .map(|_| cleaned["commit:".len()..].trim())
+        {
+            normalize_commit_message(rest)
+        } else {
+            normalize_commit_message(&cleaned)
+        };
+        if commit_message.is_none() {
+            if let Some(commit) = normalized_commit {
+                commit_message = Some(commit);
+                continue;
+            }
+        }
+
+        if summary.is_none() {
+            let summary_candidate = if let Some(rest) = lowered
+                .strip_prefix("summary:")
+                .map(|_| cleaned["summary:".len()..].trim())
+            {
+                normalize_reduce_summary(rest)
+            } else {
+                normalize_reduce_summary(&cleaned)
+            };
+            if let Some(candidate) = summary_candidate {
+                summary = Some(candidate);
+            }
+        }
+    }
+
+    if commit_message.is_none() && summary.is_none() {
+        return None;
+    }
+
+    Some(ReduceModelOutput {
+        commit_message: commit_message.unwrap_or_default(),
+        summary: summary.unwrap_or_default(),
+        risk_level: "medium".to_string(),
+        risk_notes: vec!["salvaged_reduce_output".to_string()],
+    })
 }
 
 fn generate_analyze_output(
@@ -951,11 +1224,14 @@ fn generate_analyze_output(
         Ok(raw) => match parse_analyze_output(&raw) {
             Ok(parsed) => Ok(parsed),
             Err(parse_err) => {
-                let retry_raw =
-                    generation_ctx.generate_text(prompt, None, max_tokens.saturating_add(64))?;
+                let retry_raw = generation_ctx.generate_text(
+                    prompt,
+                    Some(grammar::ANALYZE_GBNF),
+                    max_tokens.saturating_add(96),
+                )?;
                 parse_analyze_output(&retry_raw).map_err(|retry_err| {
                     RuntimeError::Inference(format!(
-                        "analyze parse failed with and without grammar: primary={parse_err}; retry={retry_err}"
+                        "analyze parse failed with grammar: primary={parse_err}; retry={retry_err}"
                     ))
                 })
             }
@@ -965,11 +1241,14 @@ fn generate_analyze_output(
                 .to_string()
                 .contains("grammar rejected all sampled candidates")
             {
-                let retry_raw =
-                    generation_ctx.generate_text(prompt, None, max_tokens.saturating_add(64))?;
+                let retry_raw = generation_ctx.generate_text(
+                    prompt,
+                    Some(grammar::ANALYZE_GBNF),
+                    max_tokens.saturating_add(96),
+                )?;
                 parse_analyze_output(&retry_raw).map_err(|retry_err| {
                     RuntimeError::Inference(format!(
-                        "analyze grammar pass failed ({err}); unconstrained retry parse failed ({retry_err})"
+                        "analyze grammar pass failed ({err}); grammar retry parse failed ({retry_err})"
                     ))
                 })
             } else {
@@ -1017,8 +1296,71 @@ fn parse_analyze_output(raw: &str) -> Result<AnalyzeModelOutput, RuntimeError> {
     if output.intent.is_empty() {
         output.intent = output.title.clone();
     }
+    if analyze_output_has_dangling_fragment(&output) {
+        return Err(RuntimeError::Inference(
+            "analyze output has dangling fragment likely caused by token truncation".to_string(),
+        ));
+    }
 
     Ok(output)
+}
+
+fn analyze_output_has_dangling_fragment(output: &AnalyzeModelOutput) -> bool {
+    ends_with_dangling_joiner(&output.intent)
+        || ends_with_dangling_joiner(&output.summary)
+        || ends_with_dangling_joiner(&output.title)
+}
+
+fn ends_with_dangling_joiner(value: &str) -> bool {
+    let cleaned = sanitize_sentence(value).trim().to_ascii_lowercase();
+    if cleaned.is_empty() {
+        return false;
+    }
+
+    let cleaned = cleaned.trim_end_matches(|ch: char| {
+        matches!(
+            ch,
+            '.' | ',' | ';' | ':' | '!' | '?' | '"' | '\'' | ')' | ']' | '}'
+        )
+    });
+    let word_count = cleaned.split_whitespace().count();
+    if word_count < 3 {
+        return false;
+    }
+
+    let dangling_two_word_suffixes = ["based on", "as a", "such as", "in order", "up to"];
+    if dangling_two_word_suffixes
+        .iter()
+        .any(|suffix| cleaned.ends_with(suffix))
+    {
+        return true;
+    }
+
+    let last = cleaned
+        .split_whitespace()
+        .last()
+        .unwrap_or_default()
+        .trim_matches(|ch: char| !ch.is_ascii_alphanumeric());
+    matches!(
+        last,
+        "a" | "an"
+            | "the"
+            | "to"
+            | "for"
+            | "with"
+            | "without"
+            | "from"
+            | "into"
+            | "on"
+            | "in"
+            | "of"
+            | "and"
+            | "or"
+            | "but"
+            | "via"
+            | "by"
+            | "based"
+    )
 }
 
 fn salvage_analyze_output(raw: &str) -> Option<AnalyzeModelOutput> {
@@ -1266,24 +1608,21 @@ fn compact_error_note(raw: &str) -> String {
     out
 }
 
-fn analyze_token_budget(chunk: &DiffChunk) -> usize {
-    if chunk.estimated_tokens > 3_000 {
-        192
-    } else if chunk.estimated_tokens > 1_500 {
-        224
-    } else {
-        256
+fn analyze_token_budget(chunk: &DiffChunk, context_window_tokens: usize) -> usize {
+    if let Some(override_tokens) = env_budget_override("AUTOCOMMIT_ANALYZE_MAX_TOKENS") {
+        return override_tokens.clamp(96, 1_024);
     }
+
+    let density = (chunk.estimated_tokens as f32 / 4_000.0)
+        .clamp(0.0, 1.0)
+        .sqrt();
+    let context_bonus = ((context_window_tokens as f32 - 2_048.0) / 4_096.0).clamp(0.0, 1.0);
+    let base = 344.0 - (72.0 * density) + (24.0 * context_bonus);
+    base.round().clamp(224.0, 384.0) as usize
 }
 
-fn build_analyze_prompt_capped(chunk: &DiffChunk) -> String {
-    let max_chars = if chunk.estimated_tokens > 3_000 {
-        3_000
-    } else if chunk.estimated_tokens > 1_500 {
-        4_000
-    } else {
-        6_000
-    };
+fn build_analyze_prompt_capped(chunk: &DiffChunk, context_window_tokens: usize) -> String {
+    let max_chars = analyze_char_budget(chunk, context_window_tokens);
 
     if chunk.text.len() <= max_chars {
         return prompts::build_analyze_prompt(chunk);
@@ -1292,14 +1631,34 @@ fn build_analyze_prompt_capped(chunk: &DiffChunk) -> String {
     let truncated = compact_diff_for_prompt(&chunk.text, max_chars);
 
     format!(
-        "Task: Analyze one diff chunk.\n\
+        "/no_think\n\
+Task: Analyze one diff chunk.\n\
 Return ONLY JSON with keys: summary, bucket, type_tag, title, intent.\n\
 Allowed bucket values: Feature, Patch, Addition, Other.\n\
 Allowed type_tag values: Feat, Fix, Refactor, Docs, Test, Chore, Perf, Style, Mixed.\n\
+summary: <= 18 words, concrete change outcome.\n\
+title: <= 10 words, action-first phrase.\n\
+intent: <= 16 words, concise rationale phrase (not a long sentence).\n\
+Do not end `summary`, `title`, or `intent` with dangling filler words.\n\
+No markdown, no prose outside JSON.\n\
 Path: {}\n\
 Diff:\n```diff\n{}\n```",
         chunk.path, truncated
     )
+}
+
+fn analyze_char_budget(chunk: &DiffChunk, context_window_tokens: usize) -> usize {
+    if let Some(override_chars) = env_budget_override("AUTOCOMMIT_ANALYZE_MAX_PROMPT_CHARS") {
+        return override_chars.clamp(2_000, 16_000);
+    }
+
+    let context_cap = context_window_tokens.saturating_mul(3).clamp(2_400, 18_000);
+    let density = (chunk.estimated_tokens as f32 / 6_000.0)
+        .clamp(0.0, 1.0)
+        .sqrt();
+    let raw = 8_600.0 - (3_000.0 * density);
+    let contextual = raw.min((context_cap as f32) * 0.92);
+    contextual.round().clamp(3_600.0, context_cap as f32) as usize
 }
 
 fn compact_diff_for_prompt(text: &str, max_chars: usize) -> String {
@@ -1308,52 +1667,251 @@ fn compact_diff_for_prompt(text: &str, max_chars: usize) -> String {
     }
 
     let lines = text.lines().collect::<Vec<_>>();
+    if lines.is_empty() {
+        return String::new();
+    }
     let mut used = vec![false; lines.len()];
     let mut out = String::with_capacity(max_chars + 128);
     let mut header_lines = 0usize;
     let mut change_lines = 0usize;
+    let mut semantic_lines = 0usize;
 
     for (idx, line) in lines.iter().copied().enumerate() {
-        if is_structural_diff_line(line) {
-            if !push_line_with_limit(&mut out, line, max_chars) {
+        if is_file_header_line(line) {
+            if !push_line_index_with_limit(&mut out, &lines, &mut used, idx, max_chars) {
                 break;
             }
-            used[idx] = true;
             header_lines += 1;
         }
     }
 
-    for (idx, line) in lines.iter().copied().enumerate() {
-        if used[idx] || !is_change_line(line) {
-            continue;
+    let hunk_ranges = extract_hunk_ranges(&lines);
+    let selected_hunks = if hunk_ranges.is_empty() {
+        vec![0usize]
+    } else {
+        let max_hunks = (max_chars / 900).clamp(2, 10);
+        sample_stratified_indices(hunk_ranges.len(), max_hunks)
+    };
+
+    let mut scoped_hunks = Vec::with_capacity(selected_hunks.len());
+    if hunk_ranges.is_empty() {
+        scoped_hunks.push((0usize, lines.len()));
+    } else {
+        for idx in selected_hunks {
+            if let Some(range) = hunk_ranges.get(idx).copied() {
+                scoped_hunks.push(range);
+            }
         }
-        if !push_line_with_limit(&mut out, line, max_chars) {
-            break;
-        }
-        used[idx] = true;
-        change_lines += 1;
     }
 
-    for (idx, line) in lines.iter().copied().enumerate() {
-        if used[idx] || !is_semantic_context_line(line) {
-            continue;
+    for (start, _) in scoped_hunks.iter().copied() {
+        if start < lines.len()
+            && lines[start].starts_with("@@ ")
+            && push_line_index_with_limit(&mut out, &lines, &mut used, start, max_chars)
+        {
+            header_lines += 1;
         }
-        if !push_line_with_limit(&mut out, line, max_chars) {
-            break;
+    }
+
+    let per_hunk_change_budget = ((max_chars / scoped_hunks.len().max(1)) / 95).clamp(4, 16);
+    for (start, end) in scoped_hunks.iter().copied() {
+        let candidates = (start..end)
+            .filter(|&idx| is_change_line(lines[idx]))
+            .collect::<Vec<_>>();
+        for relative_idx in sample_stratified_indices(candidates.len(), per_hunk_change_budget) {
+            let idx = candidates[relative_idx];
+            if !push_line_index_with_limit(&mut out, &lines, &mut used, idx, max_chars) {
+                break;
+            }
+            change_lines += 1;
         }
-        used[idx] = true;
+    }
+
+    let mut change_buckets = scoped_hunks
+        .iter()
+        .map(|(start, end)| {
+            (*start..*end)
+                .filter(|&idx| is_change_line(lines[idx]))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    change_lines += round_robin_fill(&mut out, &lines, &mut used, &mut change_buckets, max_chars);
+
+    let per_hunk_semantic_budget = ((max_chars / scoped_hunks.len().max(1)) / 260).clamp(1, 4);
+    for (start, end) in scoped_hunks.iter().copied() {
+        let candidates = (start..end)
+            .filter(|&idx| is_semantic_context_line(lines[idx]))
+            .collect::<Vec<_>>();
+        for relative_idx in sample_stratified_indices(candidates.len(), per_hunk_semantic_budget) {
+            let idx = candidates[relative_idx];
+            if !push_line_index_with_limit(&mut out, &lines, &mut used, idx, max_chars) {
+                break;
+            }
+            semantic_lines += 1;
+        }
+    }
+
+    if out.len() < max_chars / 2 {
+        let mut semantic_buckets = scoped_hunks
+            .iter()
+            .map(|(start, end)| {
+                (*start..*end)
+                    .filter(|&idx| is_semantic_context_line(lines[idx]))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        semantic_lines += round_robin_fill(
+            &mut out,
+            &lines,
+            &mut used,
+            &mut semantic_buckets,
+            max_chars,
+        );
     }
 
     if out.len() < max_chars / 3 {
         out.clear();
+        used.fill(false);
+        header_lines = 0;
+        change_lines = 0;
+        semantic_lines = 0;
         append_head_tail_with_limit(text, &mut out, max_chars);
+        for line in out.lines() {
+            if is_file_header_line(line) || line.starts_with("@@ ") {
+                header_lines += 1;
+            } else if is_change_line(line) {
+                change_lines += 1;
+            } else if is_semantic_context_line(line) {
+                semantic_lines += 1;
+            }
+        }
     }
 
     out.push_str(&format!(
-        "\n... [diff truncated for budget; kept {} headers and {} change lines]",
-        header_lines, change_lines
+        "\n... [diff truncated for budget; kept {} headers, {} change lines, {} semantic lines]",
+        header_lines, change_lines, semantic_lines
     ));
     out
+}
+
+fn extract_hunk_ranges(lines: &[&str]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut current_start: Option<usize> = None;
+
+    for (idx, line) in lines.iter().copied().enumerate() {
+        if line.starts_with("@@ ") {
+            if let Some(start) = current_start.replace(idx) {
+                out.push((start, idx));
+            }
+        } else if line.starts_with("diff --git ") {
+            if let Some(start) = current_start.take() {
+                out.push((start, idx));
+            }
+        }
+    }
+
+    if let Some(start) = current_start {
+        out.push((start, lines.len()));
+    }
+
+    out
+}
+
+fn sample_stratified_indices(total: usize, limit: usize) -> Vec<usize> {
+    if total == 0 || limit == 0 {
+        return Vec::new();
+    }
+    if total <= limit {
+        return (0..total).collect();
+    }
+    if limit == 1 {
+        return vec![0];
+    }
+
+    let mut selected = std::collections::BTreeSet::new();
+    let last = total.saturating_sub(1);
+    let denom = limit.saturating_sub(1);
+
+    for slot in 0..limit {
+        let numerator = slot.saturating_mul(last);
+        let idx = (numerator + (denom / 2)) / denom;
+        selected.insert(idx.min(last));
+    }
+
+    let mut next = 0usize;
+    while selected.len() < limit {
+        if selected.insert(next) {
+            next = next.saturating_add(1);
+            continue;
+        }
+        next = next.saturating_add(1);
+    }
+
+    selected.into_iter().collect()
+}
+
+fn round_robin_fill(
+    out: &mut String,
+    lines: &[&str],
+    used: &mut [bool],
+    buckets: &mut [Vec<usize>],
+    max_chars: usize,
+) -> usize {
+    if buckets.is_empty() {
+        return 0;
+    }
+
+    let mut cursors = vec![0usize; buckets.len()];
+    let mut added = 0usize;
+
+    loop {
+        let mut progressed = false;
+        for (bucket_idx, bucket) in buckets.iter().enumerate() {
+            let cursor = &mut cursors[bucket_idx];
+            while *cursor < bucket.len() && used[bucket[*cursor]] {
+                *cursor += 1;
+            }
+            if *cursor >= bucket.len() {
+                continue;
+            }
+
+            let idx = bucket[*cursor];
+            if !push_line_index_with_limit(out, lines, used, idx, max_chars) {
+                return added;
+            }
+            *cursor += 1;
+            added += 1;
+            progressed = true;
+        }
+        if !progressed {
+            break;
+        }
+    }
+    added
+}
+
+fn push_line_index_with_limit(
+    out: &mut String,
+    lines: &[&str],
+    used: &mut [bool],
+    idx: usize,
+    max_chars: usize,
+) -> bool {
+    if idx >= lines.len() || used[idx] {
+        return true;
+    }
+    if !push_line_with_limit(out, lines[idx], max_chars) {
+        return false;
+    }
+    used[idx] = true;
+    true
+}
+
+fn is_file_header_line(line: &str) -> bool {
+    line.starts_with("diff --git ")
+        || line.starts_with("index ")
+        || line.starts_with("--- ")
+        || line.starts_with("+++ ")
 }
 
 fn push_line_with_limit(out: &mut String, line: &str, max_chars: usize) -> bool {
@@ -1386,14 +1944,6 @@ fn append_head_tail_with_limit(text: &str, out: &mut String, max_chars: usize) {
             return;
         }
     }
-}
-
-fn is_structural_diff_line(line: &str) -> bool {
-    line.starts_with("diff --git ")
-        || line.starts_with("index ")
-        || line.starts_with("--- ")
-        || line.starts_with("+++ ")
-        || line.starts_with("@@ ")
 }
 
 fn is_change_line(line: &str) -> bool {
@@ -1704,6 +2254,96 @@ fn type_tag_prefix(tag: TypeTag) -> &'static str {
     }
 }
 
+fn dominant_commit_type_by_confidence(items: &[ChangeItem]) -> Option<&'static str> {
+    let mut feat = 0.0f32;
+    let mut fix = 0.0f32;
+    let mut refactor = 0.0f32;
+    let mut docs = 0.0f32;
+    let mut test = 0.0f32;
+    let mut chore = 0.0f32;
+
+    for item in items {
+        let weight = item.confidence.clamp(0.05, 1.0);
+        match item.type_tag {
+            TypeTag::Feat => feat += weight,
+            TypeTag::Fix => fix += weight,
+            TypeTag::Refactor => refactor += weight,
+            TypeTag::Docs => docs += weight,
+            TypeTag::Test => test += weight,
+            TypeTag::Chore | TypeTag::Perf | TypeTag::Style | TypeTag::Mixed => chore += weight,
+        }
+    }
+
+    let ranked = [
+        (feat, "feat"),
+        (fix, "fix"),
+        (refactor, "refactor"),
+        (docs, "docs"),
+        (test, "test"),
+        (chore, "chore"),
+    ];
+
+    ranked
+        .into_iter()
+        .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
+        .and_then(|(weight, kind)| {
+            if weight > f32::EPSILON {
+                Some(kind)
+            } else {
+                None
+            }
+        })
+}
+
+fn reconcile_commit_type_with_items(
+    candidate_type: &'static str,
+    items: &[ChangeItem],
+) -> &'static str {
+    let dominant_type = dominant_commit_type_by_confidence(items)
+        .or_else(|| dominant_type_tag(items).map(type_tag_prefix))
+        .unwrap_or("chore");
+    if dominant_type == candidate_type || items.is_empty() {
+        return candidate_type;
+    }
+
+    let mut total_weight = 0.0f32;
+    let mut candidate_weight = 0.0f32;
+    let mut dominant_weight = 0.0f32;
+
+    for item in items {
+        let weight = item.confidence.clamp(0.05, 1.0);
+        total_weight += weight;
+
+        let item_type = type_tag_prefix(item.type_tag.clone());
+        if item_type == candidate_type {
+            candidate_weight += weight;
+        }
+        if item_type == dominant_type {
+            dominant_weight += weight;
+        }
+    }
+
+    if total_weight <= f32::EPSILON {
+        return dominant_type;
+    }
+
+    let candidate_ratio = candidate_weight / total_weight;
+    let dominant_ratio = dominant_weight / total_weight;
+    if candidate_ratio >= 0.45 {
+        return candidate_type;
+    }
+
+    if candidate_type == "feat" && candidate_ratio < 0.34 {
+        return dominant_type;
+    }
+
+    if dominant_ratio >= candidate_ratio + 0.2 {
+        dominant_type
+    } else {
+        candidate_type
+    }
+}
+
 #[derive(Debug)]
 struct SubjectCandidate {
     score: f32,
@@ -1882,6 +2522,7 @@ fn top_subject_candidates(items: &[ChangeItem], limit: usize) -> Vec<SubjectCand
     let mut candidates = Vec::new();
     for item in items {
         let mut best_for_item: Option<SubjectCandidate> = None;
+        let primary_path = item.files.first().map(|file| file.path.as_str());
         let item_scope = item
             .files
             .first()
@@ -1902,7 +2543,10 @@ fn top_subject_candidates(items: &[ChangeItem], limit: usize) -> Vec<SubjectCand
                 continue;
             }
 
-            let score = item.confidence + bonus + subject_quality_bonus(&candidate_raw);
+            let score = item.confidence
+                + bonus
+                + subject_quality_bonus(&candidate_raw)
+                + subject_context_bonus(&candidate_raw, primary_path);
             if best_for_item
                 .as_ref()
                 .map(|existing| score > existing.score)
@@ -1968,7 +2612,32 @@ fn sanitize_scope(raw: &str) -> Option<String> {
         .collect::<String>()
         .to_ascii_lowercase();
 
-    if scope.is_empty() { None } else { Some(scope) }
+    if scope.is_empty() {
+        return None;
+    }
+
+    if matches!(
+        scope.as_str(),
+        "scope"
+            | "module"
+            | "file"
+            | "files"
+            | "project"
+            | "repo"
+            | "repository"
+            | "code"
+            | "default"
+            | "misc"
+            | "mixed"
+            | "unknown"
+            | "change"
+            | "changes"
+            | "autocommit"
+    ) {
+        return None;
+    }
+
+    Some(scope)
 }
 
 fn subject_quality_bonus(subject: &str) -> f32 {
@@ -2028,9 +2697,87 @@ fn subject_quality_bonus(subject: &str) -> f32 {
     score
 }
 
+fn subject_context_bonus(subject: &str, file_path: Option<&str>) -> f32 {
+    let lower = subject.to_ascii_lowercase();
+    let mut score = 0.0f32;
+
+    if lower == "add version number"
+        || lower == "add version"
+        || lower == "update version"
+        || lower == "version bump"
+        || lower == "bump version"
+    {
+        score -= 0.40;
+    }
+    if lower.contains("update cargo.lock versions")
+        || lower.contains("update cargo lock versions")
+        || lower.contains("update lockfile")
+        || lower.contains("update dependencies")
+    {
+        score -= 0.28;
+    }
+    if lower.contains("version number") {
+        score -= 0.22;
+    }
+
+    if let Some(path) = file_path {
+        let path_lower = path.to_ascii_lowercase();
+        if path_lower.ends_with("cargo.lock")
+            || path_lower.ends_with("package-lock.json")
+            || path_lower.ends_with("yarn.lock")
+            || path_lower.ends_with("pnpm-lock.yaml")
+            || path_lower.ends_with("go.sum")
+            || path_lower.ends_with("composer.lock")
+            || path_lower.ends_with("gemfile.lock")
+        {
+            score -= 0.45;
+        } else if path_lower.ends_with("cargo.toml")
+            || path_lower.ends_with("package.json")
+            || path_lower.ends_with("pyproject.toml")
+            || path_lower.ends_with("go.mod")
+            || path_lower.ends_with("pom.xml")
+            || path_lower.ends_with("build.gradle")
+            || path_lower.ends_with("build.gradle.kts")
+            || path_lower.ends_with("pubspec.yaml")
+        {
+            if lower.contains("version")
+                || lower.contains("dependencies")
+                || lower.contains("dependency")
+            {
+                score -= 0.25;
+            } else {
+                score -= 0.08;
+            }
+        } else if path_lower.contains("/src/") || path_lower.ends_with(".rs") {
+            score += 0.05;
+        }
+    }
+
+    score
+}
+
 fn is_low_information_subject(subject: &str) -> bool {
     let lower = subject.trim().to_ascii_lowercase();
     if lower.is_empty() {
+        return true;
+    }
+    if matches!(
+        lower.as_str(),
+        "add version number"
+            | "add version"
+            | "update version"
+            | "update versions"
+            | "version bump"
+            | "bump version"
+            | "update dependencies"
+            | "mixed"
+    ) {
+        return true;
+    }
+    if lower.starts_with("update cargo.lock")
+        || lower.starts_with("update cargo lock")
+        || lower.starts_with("update lockfile")
+    {
         return true;
     }
 
@@ -2163,6 +2910,18 @@ fn simplify_subject_phrase(subject: &str) -> String {
         }
     }
 
+    for prefix in [
+        "extract/simplify/reorganize ",
+        "extract, simplify, reorganize ",
+        "extract simplify reorganize ",
+        "extract/reorganize ",
+    ] {
+        if out.to_ascii_lowercase().starts_with(prefix) {
+            out = format!("refactor {}", out[prefix.len()..].trim_start());
+            break;
+        }
+    }
+
     for (from, to) in [
         (" and creates ", " and create "),
         (" and adds ", " and add "),
@@ -2216,16 +2975,32 @@ fn decapitalize_first(value: &str) -> String {
 
 fn looks_like_reducer_meta(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
-    let has_any = |terms: &[&str]| terms.iter().any(|term| lower.contains(term));
-    let has_all = |terms: &[&str]| terms.iter().all(|term| lower.contains(term));
+    let tokens = lower
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    let contains_word = |needle: &str| tokens.iter().any(|token| *token == needle);
 
-    has_all(&["partial", "analys"])
-        || has_all(&["chunk", "analys"])
-        || has_all(&["consolidated", "report"])
-        || has_all(&["adaptive", "reducer"])
-        || (lower.contains("reduce")
-            && has_any(&["analysis", "analyses", "report", "chunk", "partial"]))
-        || (lower.contains("synthesi") && has_any(&["analysis", "analyses", "report", "chunk"]))
+    let has_analysis = contains_word("analysis") || contains_word("analyses");
+    let has_report = contains_word("report") || contains_word("reports");
+    let has_chunk = contains_word("chunk") || contains_word("chunks");
+    let has_partial = contains_word("partial") || contains_word("partials");
+    let has_reduce = contains_word("reduce")
+        || contains_word("reducer")
+        || contains_word("reducers")
+        || contains_word("reduction")
+        || contains_word("reductions");
+    let has_synthesis = contains_word("synthesis")
+        || contains_word("synthesize")
+        || contains_word("synthesized")
+        || contains_word("synthesizes");
+
+    (has_partial && has_analysis)
+        || (has_chunk && has_analysis)
+        || (lower.contains("consolidated report"))
+        || (lower.contains("adaptive reducer"))
+        || (has_reduce && (has_analysis || has_report || has_chunk || has_partial))
+        || (has_synthesis && (has_analysis || has_report || has_chunk))
 }
 
 fn normalize_reduce_summary(raw: &str) -> Option<String> {
@@ -2248,6 +3023,94 @@ fn normalize_reduce_summary(raw: &str) -> Option<String> {
     Some(summary)
 }
 
+fn recover_commit_message_from_reduce(
+    generated: &ReduceModelOutput,
+    items: &[ChangeItem],
+) -> Option<String> {
+    let description_candidate = sanitize_commit_subject(&generated.commit_message)
+        .or_else(|| sanitize_commit_subject(&generated.summary))?;
+    if looks_like_reducer_meta(&description_candidate)
+        || is_low_information_subject(&description_candidate)
+    {
+        return None;
+    }
+
+    let (commit_type_candidate, scope_from_header) =
+        parse_conventional_commit(&generated.commit_message)
+            .map(|(kind, scope, _)| (kind, scope.and_then(sanitize_scope)))
+            .or_else(|| {
+                parse_type_prefixed_header(&generated.commit_message).map(|(kind, _)| (kind, None))
+            })
+            .or_else(|| {
+                parse_type_prefixed_header(&generated.summary).map(|(kind, _)| (kind, None))
+            })
+            .unwrap_or_else(|| {
+                (
+                    dominant_type_tag(items).map_or("chore", type_tag_prefix),
+                    None,
+                )
+            });
+    let commit_type = reconcile_commit_type_with_items(commit_type_candidate, items);
+
+    let description =
+        trim_redundant_commit_type_prefix(commit_type, &decapitalize_first(&description_candidate));
+    if description.is_empty() {
+        return None;
+    }
+    let scope = if commit_type != commit_type_candidate {
+        dominant_scope(items).or(scope_from_header)
+    } else {
+        scope_from_header.or_else(|| dominant_scope(items))
+    };
+
+    Some(match scope {
+        Some(scope) => format!("{commit_type}({scope}): {description}"),
+        None => format!("{commit_type}: {description}"),
+    })
+}
+
+fn recover_summary_from_reduce(
+    generated: &ReduceModelOutput,
+    commit_message: &str,
+    stats: &DiffStats,
+) -> Option<String> {
+    if let Some(summary) = normalize_reduce_summary(&generated.summary) {
+        return Some(summary);
+    }
+
+    let cleaned = sanitize_sentence(&generated.summary).trim().to_string();
+    if !cleaned.is_empty() && cleaned.len() >= 8 && !looks_like_reducer_meta(&cleaned) {
+        return Some(ensure_terminal_punctuation(cleaned));
+    }
+
+    summary_from_commit_message(commit_message, stats)
+}
+
+fn summary_from_commit_message(commit_message: &str, stats: &DiffStats) -> Option<String> {
+    let (_, _, desc) = parse_conventional_commit(commit_message)?;
+    let description = desc.trim();
+    if description.is_empty() {
+        return None;
+    }
+
+    let file_count = stats.files_changed.max(1);
+    let noun = if file_count == 1 { "file" } else { "files" };
+    Some(format!(
+        "{} across {file_count} {noun}.",
+        capitalize_first(description)
+    ))
+}
+
+fn ensure_terminal_punctuation(mut value: String) -> String {
+    let trimmed = value.trim_end();
+    if trimmed.ends_with(['.', '!', '?']) {
+        return trimmed.to_string();
+    }
+    value = trimmed.to_string();
+    value.push('.');
+    value
+}
+
 fn normalize_commit_message(raw: &str) -> Option<String> {
     let header = raw.lines().next()?.trim();
     if header.is_empty() {
@@ -2255,28 +3118,52 @@ fn normalize_commit_message(raw: &str) -> Option<String> {
     }
 
     if let Some((kind, scope, desc)) = parse_conventional_commit(header) {
-        if looks_like_reducer_meta(desc) {
+        let normalized_desc = sanitize_commit_subject(desc)?;
+        if looks_like_reducer_meta(&normalized_desc) || is_low_information_subject(&normalized_desc)
+        {
+            return None;
+        }
+        let description =
+            trim_redundant_commit_type_prefix(kind, &decapitalize_first(&normalized_desc));
+        if description.is_empty() {
             return None;
         }
         let mut out = kind.to_string();
-        if let Some(scope) = scope {
+        if let Some(scope) = scope.and_then(sanitize_scope) {
             out.push('(');
-            out.push_str(scope);
+            out.push_str(&scope);
             out.push(')');
         }
         out.push_str(": ");
-        out.push_str(desc);
+        out.push_str(&description);
         return Some(out);
     }
 
     if let Some((kind, desc)) = parse_type_prefixed_header(header) {
-        if looks_like_reducer_meta(desc) {
+        let normalized_desc = sanitize_commit_subject(desc)?;
+        if looks_like_reducer_meta(&normalized_desc) || is_low_information_subject(&normalized_desc)
+        {
             return None;
         }
-        return Some(format!("{kind}(autocommit): {desc}"));
+        let description =
+            trim_redundant_commit_type_prefix(kind, &decapitalize_first(&normalized_desc));
+        if description.is_empty() {
+            return None;
+        }
+        return Some(format!("{kind}(autocommit): {description}"));
     }
 
     None
+}
+
+fn env_budget_override(key: &str) -> Option<usize> {
+    std::env::var(key).ok().and_then(|raw| {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        trimmed.parse::<usize>().ok().filter(|value| *value > 0)
+    })
 }
 
 fn parse_conventional_commit(header: &str) -> Option<(&'static str, Option<&str>, &str)> {
@@ -2404,6 +3291,26 @@ mod tests {
     }
 
     #[test]
+    fn parse_analyze_output_rejects_dangling_fragment() {
+        let raw = r#"{"summary":"Route embeddings based on cosine similarity","bucket":"Patch","type_tag":"Refactor","title":"Update embedding gate","intent":"Determine dispatch route based on the"}"#;
+        let err = parse_analyze_output(raw).expect_err("dangling fragment should fail");
+        assert!(
+            err.to_string()
+                .contains("analyze output has dangling fragment")
+        );
+    }
+
+    #[test]
+    fn ends_with_dangling_joiner_detects_common_cutoff_suffixes() {
+        assert!(ends_with_dangling_joiner(
+            "Determine dispatch route based on the"
+        ));
+        assert!(!ends_with_dangling_joiner(
+            "Determine dispatch route using cosine similarity."
+        ));
+    }
+
+    #[test]
     fn normalize_commit_message_rejects_reducer_meta() {
         let raw = "refactor: Consolidate 9 partial analyses into one consolidated report";
         assert!(normalize_commit_message(raw).is_none());
@@ -2414,6 +3321,20 @@ mod tests {
         let raw = "perf: reduce memory usage in model initialization";
         let normalized = normalize_commit_message(raw).expect("valid commit should be kept");
         assert_eq!(normalized, raw);
+    }
+
+    #[test]
+    fn normalize_commit_message_rewrites_extract_simplify_reorganize_subject() {
+        let raw = "refactor: extract/simplify/reorganize model reduction logic";
+        let normalized = normalize_commit_message(raw).expect("commit should normalize");
+        assert_eq!(normalized, "refactor: model reduction logic");
+    }
+
+    #[test]
+    fn normalize_commit_message_drops_placeholder_scope() {
+        let raw = "feat(scope): add cache key with no version";
+        let normalized = normalize_commit_message(raw).expect("commit should normalize");
+        assert_eq!(normalized, "feat: add cache key with no version");
     }
 
     #[test]
@@ -2429,6 +3350,139 @@ mod tests {
             normalize_reduce_summary(raw).as_deref(),
             Some("Improve commit message quality across 4 files.")
         );
+    }
+
+    #[test]
+    fn normalize_reduce_summary_allows_non_meta_reduce_wording() {
+        let raw = "Preserve valid commit text when reduce JSON is partially malformed.";
+        assert_eq!(
+            normalize_reduce_summary(raw).as_deref(),
+            Some("Preserve valid commit text when reduce JSON is partially malformed.")
+        );
+    }
+
+    #[test]
+    fn parse_reduce_output_keeps_commit_when_summary_missing() {
+        let raw = r#"{"commit_message":"refactor(cli): tighten reduce output acceptance","risk_level":"low"}"#;
+        let parsed = parse_reduce_output(raw).expect("reduce parse should keep commit");
+        assert_eq!(
+            normalize_commit_message(&parsed.commit_message).as_deref(),
+            Some("refactor(cli): tighten reduce output acceptance")
+        );
+        assert!(parsed.summary.is_empty());
+    }
+
+    #[test]
+    fn parse_reduce_output_salvages_freeform_commit_and_summary() {
+        let raw = "\
+Commit: feat(core): preserve valid reduce commit output
+Summary: Preserve valid commit text when reduce JSON is partially malformed.
+";
+        let parsed = parse_reduce_output(raw).expect("freeform reduce output should salvage");
+        assert_eq!(
+            normalize_commit_message(&parsed.commit_message).as_deref(),
+            Some("feat(core): preserve valid reduce commit output")
+        );
+        assert_eq!(
+            normalize_reduce_summary(&parsed.summary).as_deref(),
+            Some("Preserve valid commit text when reduce JSON is partially malformed.")
+        );
+    }
+
+    #[test]
+    fn recover_commit_message_from_reduce_repairs_non_conventional_subject() {
+        let generated = ReduceModelOutput {
+            commit_message: "extract/simplify/reorganize model reduction logic".to_string(),
+            summary: String::new(),
+            risk_level: "low".to_string(),
+            risk_notes: Vec::new(),
+        };
+        let items = vec![sample_item(
+            TypeTag::Refactor,
+            "Refactor model reduction logic",
+            "Refactor model reduction logic",
+            "crates/llama-runtime/src/model.rs",
+            0.9,
+        )];
+
+        let repaired =
+            recover_commit_message_from_reduce(&generated, &items).expect("should repair commit");
+        assert_eq!(repaired, "refactor(llama-runtime): model reduction logic");
+    }
+
+    #[test]
+    fn recover_commit_message_from_reduce_ignores_placeholder_scope() {
+        let generated = ReduceModelOutput {
+            commit_message: "feat(scope): add cache key with no version".to_string(),
+            summary: String::new(),
+            risk_level: "low".to_string(),
+            risk_notes: Vec::new(),
+        };
+        let items = vec![sample_item(
+            TypeTag::Feat,
+            "Add cache key with no version",
+            "Share cache keys between commands",
+            "crates/cli/src/cmd/report_cache.rs",
+            0.88,
+        )];
+
+        let repaired =
+            recover_commit_message_from_reduce(&generated, &items).expect("should repair commit");
+        assert_eq!(repaired, "feat(cli): add cache key with no version");
+    }
+
+    #[test]
+    fn recover_commit_message_from_reduce_reconciles_misaligned_type() {
+        let generated = ReduceModelOutput {
+            commit_message: "feat(cli): improve model reduction stability".to_string(),
+            summary: String::new(),
+            risk_level: "low".to_string(),
+            risk_notes: Vec::new(),
+        };
+        let items = vec![
+            sample_item(
+                TypeTag::Refactor,
+                "Refactor model reduction logic",
+                "Refactor model reduction flow",
+                "crates/llama-runtime/src/model.rs",
+                0.93,
+            ),
+            sample_item(
+                TypeTag::Fix,
+                "Fix reduce item sampling",
+                "Fix change-line sampling behavior",
+                "crates/llama-runtime/src/model.rs",
+                0.81,
+            ),
+        ];
+
+        let repaired = recover_commit_message_from_reduce(&generated, &items)
+            .expect("should reconcile commit type");
+        assert!(repaired.starts_with("refactor(llama-runtime):"));
+    }
+
+    #[test]
+    fn recover_summary_from_reduce_uses_commit_when_summary_is_meta() {
+        let generated = ReduceModelOutput {
+            commit_message: "refactor(llama-runtime): model reduction logic".to_string(),
+            summary: "Consolidate partial analyses into one report".to_string(),
+            risk_level: "medium".to_string(),
+            risk_notes: Vec::new(),
+        };
+        let stats = DiffStats {
+            files_changed: 3,
+            lines_changed: 120,
+            hunks: 10,
+            binary_files: 0,
+        };
+
+        let summary = recover_summary_from_reduce(
+            &generated,
+            "refactor(llama-runtime): model reduction logic",
+            &stats,
+        )
+        .expect("should recover summary");
+        assert_eq!(summary, "Model reduction logic across 3 files.");
     }
 
     #[test]
@@ -2553,6 +3607,29 @@ mod tests {
 
         let commit = synthesize_fallback_commit_message(&items, 2);
         assert_eq!(commit, "feat(core): build reduce prompt");
+    }
+
+    #[test]
+    fn commit_synthesis_downranks_manifest_version_noise() {
+        let items = vec![
+            sample_item(
+                TypeTag::Feat,
+                "Add version number",
+                "Update package version",
+                "crates/llama-runtime/Cargo.toml",
+                0.95,
+            ),
+            sample_item(
+                TypeTag::Refactor,
+                "Refactor model reduction logic",
+                "Simplify reduce candidate handling",
+                "crates/llama-runtime/src/model.rs",
+                0.82,
+            ),
+        ];
+
+        let commit = synthesize_fallback_commit_message(&items, 2);
+        assert_eq!(commit, "refactor(llama-runtime): model reduction logic");
     }
 
     #[test]

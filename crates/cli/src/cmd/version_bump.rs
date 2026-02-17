@@ -3,8 +3,8 @@ use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use autocommit_core::AnalysisReport;
 use autocommit_core::types::TypeTag;
+use autocommit_core::AnalysisReport;
 use serde::{Deserialize, Serialize};
 
 use crate::cmd::git;
@@ -173,9 +173,7 @@ fn recommend_inner(
         .iter()
         .any(|path| !is_manifest_path(path) && !is_lockfile_path(path));
     let heuristic_level = suggested_level(report);
-    let recommended_level = embedding_level
-        .map(|level| level.max(heuristic_level))
-        .unwrap_or(heuristic_level);
+    let recommended_level = combine_recommended_level(heuristic_level, embedding_level);
 
     let mut context = load_context(&context_path);
     let candidates = collect_manifest_candidates(&repo_root, &changed_paths);
@@ -241,6 +239,15 @@ fn recommend_inner(
     Ok(recommendations)
 }
 
+fn combine_recommended_level(heuristic: BumpLevel, embedding: Option<BumpLevel>) -> BumpLevel {
+    // Embeddings are currently good at catching obvious breaking-change signals, but
+    // too noisy for patch-vs-minor distinctions. Keep patch/minor heuristic-driven.
+    match embedding {
+        Some(BumpLevel::Major) => BumpLevel::Major.max(heuristic),
+        _ => heuristic,
+    }
+}
+
 fn build_recommendation(
     manifest_path: &str,
     kind: ManifestKind,
@@ -256,12 +263,14 @@ fn build_recommendation(
 
     if let (Some(previous), Some(current)) = (previous_semver, current_semver) {
         if current > previous {
-            if let Some(actual) = bump_distance(previous, current) {
+            let actual = bump_distance(previous, current);
+            if let Some(actual) = actual {
                 if actual >= level {
                     return None;
                 }
             }
             let suggested = previous.bump(level).to_string();
+            let actual_level = actual.unwrap_or(BumpLevel::Patch);
             return Some(VersionRecommendation {
                 manifest_path: manifest_path.to_string(),
                 ecosystem: kind.ecosystem(),
@@ -270,9 +279,9 @@ fn build_recommendation(
                 suggested_version: Some(suggested),
                 level,
                 reason: format!(
-                    "version bumped, but {} changes usually merit at least a {} bump",
+                    "version bumped by {}, but detected changes suggest at least a {} bump",
+                    actual_level.as_str(),
                     level.as_str(),
-                    level.as_str()
                 ),
                 kind,
             });
@@ -331,13 +340,9 @@ fn build_go_mod_recommendation(
     let suggested = format!("v{target_major}");
     let current_version = format!("v{}", info.major);
     let reason = if manifest_changed {
-        format!(
-            "go.mod changed; breaking changes suggest module path bump to /{suggested}"
-        )
+        format!("go.mod changed; breaking changes suggest module path bump to /{suggested}")
     } else {
-        format!(
-            "breaking changes suggest Go module path bump to /{suggested}"
-        )
+        format!("breaking changes suggest Go module path bump to /{suggested}")
     };
 
     Some(VersionRecommendation {
@@ -386,27 +391,172 @@ pub(crate) fn apply(
 }
 
 fn suggested_level(report: &AnalysisReport) -> BumpLevel {
-    let has_breaking = report.items.iter().any(|item| {
-        let text = format!(
-            "{} {}",
-            item.title.to_ascii_lowercase(),
-            item.intent.to_ascii_lowercase()
-        );
-        text.contains("breaking") || text.contains("break ")
-    });
+    let subject = report.commit_message.trim().to_ascii_lowercase();
+    let summary = report.summary.trim().to_ascii_lowercase();
+    let risk_notes = report.risk.notes.join(" ").to_ascii_lowercase();
+
+    let has_breaking = contains_breaking_signal(&subject)
+        || contains_breaking_signal(&summary)
+        || contains_breaking_signal(&risk_notes)
+        || report.items.iter().any(|item| {
+            let text = format!(
+                "{} {}",
+                item.title.to_ascii_lowercase(),
+                item.intent.to_ascii_lowercase()
+            );
+            contains_breaking_signal(&text)
+        });
     if has_breaking {
         return BumpLevel::Major;
     }
 
-    if report
+    let subject_feature = subject.starts_with("feat(")
+        || subject.starts_with("feat:")
+        || subject.starts_with("feature(")
+        || subject.starts_with("feature:");
+    let subject_patchy = subject.starts_with("fix(")
+        || subject.starts_with("fix:")
+        || subject.starts_with("refactor(")
+        || subject.starts_with("refactor:")
+        || subject.starts_with("chore(")
+        || subject.starts_with("chore:")
+        || subject.starts_with("docs(")
+        || subject.starts_with("docs:")
+        || subject.starts_with("test(")
+        || subject.starts_with("test:");
+
+    let total = report.items.len();
+    let feature_like = report
         .items
         .iter()
-        .any(|item| matches!(item.type_tag, TypeTag::Feat))
-    {
-        BumpLevel::Minor
-    } else {
-        BumpLevel::Patch
+        .filter(|item| {
+            matches!(item.type_tag, TypeTag::Feat)
+                || matches!(item.bucket, autocommit_core::types::ChangeBucket::Feature)
+        })
+        .count();
+    let strong_feature_like = report
+        .items
+        .iter()
+        .filter(|item| item.confidence >= 0.78)
+        .filter(|item| {
+            matches!(item.type_tag, TypeTag::Feat)
+                || matches!(item.bucket, autocommit_core::types::ChangeBucket::Feature)
+        })
+        .count();
+    let strong_feature_phrase_hits = report
+        .items
+        .iter()
+        .filter(|item| {
+            let text = format!(
+                "{} {}",
+                item.title.to_ascii_lowercase(),
+                item.intent.to_ascii_lowercase()
+            );
+            contains_strong_feature_signal(&text)
+        })
+        .count();
+    let summary_or_risk_feature = contains_strong_feature_signal(&summary)
+        || contains_strong_feature_signal(&risk_notes)
+        || contains_feature_signal(&summary)
+        || contains_feature_signal(&risk_notes);
+    let multi_item_feature =
+        feature_like >= 2 && total > 0 && feature_like.saturating_mul(2) >= total;
+    let high_conf_multi_item_feature =
+        strong_feature_like >= 2 && total > 0 && strong_feature_like.saturating_mul(2) >= total;
+
+    // Conservative default: patch unless there is clear and repeated feature evidence.
+    if subject_patchy && !subject_feature {
+        if high_conf_multi_item_feature
+            && (strong_feature_phrase_hits > 0 || summary_or_risk_feature)
+        {
+            return BumpLevel::Minor;
+        }
+        return BumpLevel::Patch;
     }
+
+    if subject_feature {
+        if strong_feature_like >= 1 && (strong_feature_phrase_hits > 0 || summary_or_risk_feature) {
+            return BumpLevel::Minor;
+        }
+        if multi_item_feature && strong_feature_phrase_hits > 0 {
+            return BumpLevel::Minor;
+        }
+        return BumpLevel::Patch;
+    }
+
+    if high_conf_multi_item_feature && (strong_feature_phrase_hits > 0 || summary_or_risk_feature) {
+        return BumpLevel::Minor;
+    }
+
+    BumpLevel::Patch
+}
+
+fn contains_breaking_signal(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    [
+        "breaking change",
+        "breaking:",
+        "breaks compatibility",
+        "incompatible",
+        "backward incompatible",
+        "backwards incompatible",
+        "remove ",
+        "removed ",
+        "deprecat",
+        "migration",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+fn contains_feature_signal(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    [
+        "add ",
+        "adds ",
+        "added ",
+        "new ",
+        "introduce",
+        "support ",
+        "enable ",
+        "implements ",
+        "implement ",
+        "expose ",
+        "allow ",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
+}
+
+fn contains_strong_feature_signal(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    [
+        "new command",
+        "new subcommand",
+        "new api",
+        "new endpoint",
+        "new flag",
+        "new option",
+        "new workflow",
+        "add command",
+        "add subcommand",
+        "add api",
+        "add endpoint",
+        "add flag",
+        "add option",
+        "add support for",
+        "introduce command",
+        "introduce api",
+        "introduce endpoint",
+        "introduce feature",
+        "support for ",
+        "implements command",
+        "implements api",
+        "expose api",
+        "expose endpoint",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
 }
 
 fn parse_changed_paths(diff_text: &str) -> BTreeSet<String> {
@@ -902,9 +1052,8 @@ fn apply_manifest_bump(
         ),
         ManifestKind::SetupPy => replace_setup_py_version(&content, suggested_version),
         ManifestKind::GoMod => {
-            let suggested_major = parse_go_mod_major(suggested_version).ok_or_else(|| {
-                std::io::Error::other("invalid Go module version format")
-            })?;
+            let suggested_major = parse_go_mod_major(suggested_version)
+                .ok_or_else(|| std::io::Error::other("invalid Go module version format"))?;
             replace_go_mod_module_path(&content, suggested_major)
         }
         ManifestKind::PomXml => replace_xml_tag_value(&content, "version", suggested_version),
@@ -1072,7 +1221,10 @@ fn replace_gemspec_version(content: &str, suggested_version: &str) -> Option<Str
 
             let indent_len = line.len().saturating_sub(trimmed.len());
             let indent = &line[..indent_len];
-            let lhs = trimmed.split_once('=').map(|(lhs, _)| lhs.trim()).unwrap_or("");
+            let lhs = trimmed
+                .split_once('=')
+                .map(|(lhs, _)| lhs.trim())
+                .unwrap_or("");
             if lhs.is_empty() {
                 return line.to_string();
             }
@@ -1102,10 +1254,7 @@ fn replace_mix_version(content: &str, suggested_version: &str) -> Option<String>
 
             let prefix = &line[..marker];
             let rest = &line[marker + "version:".len()..];
-            let suffix = rest
-                .find(',')
-                .map(|idx| &rest[idx..])
-                .unwrap_or("");
+            let suffix = rest.find(',').map(|idx| &rest[idx..]).unwrap_or("");
             changed = true;
             format!("{prefix}version: \"{suggested_version}\"{suffix}")
         })
@@ -1132,7 +1281,10 @@ fn replace_setup_py_version(content: &str, suggested_version: &str) -> Option<St
 
             let prefix = &line[..marker + "version=".len()];
             let rest = &line[marker + "version=".len()..];
-            let suffix_start = rest.find(',').or_else(|| rest.find(')')).unwrap_or(rest.len());
+            let suffix_start = rest
+                .find(',')
+                .or_else(|| rest.find(')'))
+                .unwrap_or(rest.len());
             let suffix = &rest[suffix_start..];
             changed = true;
             format!("{prefix}\"{suggested_version}\"{suffix}")
@@ -1167,10 +1319,7 @@ fn replace_yaml_key_value(content: &str, key: &str, suggested_version: &str) -> 
 
             let indent_len = line.len().saturating_sub(trimmed.len());
             let indent = &line[..indent_len];
-            let comment = rhs
-                .find('#')
-                .map(|idx| rhs[idx..].trim_end())
-                .unwrap_or("");
+            let comment = rhs.find('#').map(|idx| rhs[idx..].trim_end()).unwrap_or("");
             changed = true;
             if comment.is_empty() {
                 format!("{indent}{key}: {suggested_version}")
@@ -1208,9 +1357,7 @@ fn parse_go_mod_info(content: &str) -> Option<GoModInfo> {
         }
         let (_, major, _) = parse_go_mod_path_major(module_path);
         let major = major.unwrap_or(1);
-        return Some(GoModInfo {
-            major,
-        });
+        return Some(GoModInfo { major });
     }
     None
 }
@@ -1455,6 +1602,187 @@ diff --git a/Cargo.toml b/Cargo.toml\n";
     }
 
     #[test]
+    fn suggested_level_keeps_patch_for_refactor_subject_with_single_noisy_feature_item() {
+        let report = AnalysisReport {
+            schema_version: "1.0".to_string(),
+            commit_message: "refactor(core): simplify parser".to_string(),
+            summary: "Refactor parser".to_string(),
+            items: vec![autocommit_core::types::ChangeItem {
+                id: "x".to_string(),
+                bucket: autocommit_core::types::ChangeBucket::Patch,
+                type_tag: TypeTag::Feat,
+                title: "Simplify parser".to_string(),
+                intent: "Refactor parsing".to_string(),
+                files: Vec::new(),
+                confidence: 0.65,
+            }],
+            risk: autocommit_core::types::RiskReport {
+                level: "low".to_string(),
+                notes: Vec::new(),
+            },
+            stats: autocommit_core::types::DiffStats::default(),
+            dispatch: autocommit_core::types::DispatchDecision {
+                route: autocommit_core::types::DispatchRoute::DraftOnly,
+                reason_codes: Vec::new(),
+                estimated_cost_tokens: 0,
+            },
+        };
+
+        assert_eq!(suggested_level(&report), BumpLevel::Patch);
+    }
+
+    #[test]
+    fn suggested_level_keeps_patch_for_feat_subject_without_real_feature_signals() {
+        let report = AnalysisReport {
+            schema_version: "1.0".to_string(),
+            commit_message: "feat(core): refactor internals".to_string(),
+            summary: "Refactor internals".to_string(),
+            items: vec![autocommit_core::types::ChangeItem {
+                id: "x".to_string(),
+                bucket: autocommit_core::types::ChangeBucket::Patch,
+                type_tag: TypeTag::Refactor,
+                title: "Refactor internals".to_string(),
+                intent: "Reorganize implementation".to_string(),
+                files: Vec::new(),
+                confidence: 0.82,
+            }],
+            risk: autocommit_core::types::RiskReport {
+                level: "low".to_string(),
+                notes: Vec::new(),
+            },
+            stats: autocommit_core::types::DiffStats {
+                files_changed: 2,
+                lines_changed: 40,
+                hunks: 3,
+                binary_files: 0,
+            },
+            dispatch: autocommit_core::types::DispatchDecision {
+                route: autocommit_core::types::DispatchRoute::DraftOnly,
+                reason_codes: Vec::new(),
+                estimated_cost_tokens: 0,
+            },
+        };
+
+        assert_eq!(suggested_level(&report), BumpLevel::Patch);
+    }
+
+    #[test]
+    fn suggested_level_returns_minor_for_multi_signal_feature_change() {
+        let report = AnalysisReport {
+            schema_version: "1.0".to_string(),
+            commit_message: "feat(core): add workspace config command".to_string(),
+            summary: "Add a new command to configure workspace defaults".to_string(),
+            items: vec![
+                autocommit_core::types::ChangeItem {
+                    id: "a".to_string(),
+                    bucket: autocommit_core::types::ChangeBucket::Feature,
+                    type_tag: TypeTag::Feat,
+                    title: "Add `config` command".to_string(),
+                    intent: "Add interactive config workflow".to_string(),
+                    files: Vec::new(),
+                    confidence: 0.91,
+                },
+                autocommit_core::types::ChangeItem {
+                    id: "b".to_string(),
+                    bucket: autocommit_core::types::ChangeBucket::Feature,
+                    type_tag: TypeTag::Feat,
+                    title: "Support persisted defaults".to_string(),
+                    intent: "Enable per-repo defaults".to_string(),
+                    files: Vec::new(),
+                    confidence: 0.86,
+                },
+            ],
+            risk: autocommit_core::types::RiskReport {
+                level: "low".to_string(),
+                notes: vec!["adds new CLI workflow".to_string()],
+            },
+            stats: autocommit_core::types::DiffStats {
+                files_changed: 4,
+                lines_changed: 120,
+                hunks: 8,
+                binary_files: 0,
+            },
+            dispatch: autocommit_core::types::DispatchDecision {
+                route: autocommit_core::types::DispatchRoute::DraftOnly,
+                reason_codes: Vec::new(),
+                estimated_cost_tokens: 0,
+            },
+        };
+
+        assert_eq!(suggested_level(&report), BumpLevel::Minor);
+    }
+
+    #[test]
+    fn suggested_level_keeps_patch_for_single_noisy_feature_signal() {
+        let report = AnalysisReport {
+            schema_version: "1.0".to_string(),
+            commit_message: "refactor(cli): simplify argument parsing".to_string(),
+            summary: "Add support for cleaner parsing internals".to_string(),
+            items: vec![autocommit_core::types::ChangeItem {
+                id: "x".to_string(),
+                bucket: autocommit_core::types::ChangeBucket::Feature,
+                type_tag: TypeTag::Feat,
+                title: "Support cleaner parsing".to_string(),
+                intent: "Refactor parser internals".to_string(),
+                files: Vec::new(),
+                confidence: 0.92,
+            }],
+            risk: autocommit_core::types::RiskReport {
+                level: "low".to_string(),
+                notes: Vec::new(),
+            },
+            stats: autocommit_core::types::DiffStats {
+                files_changed: 1,
+                lines_changed: 42,
+                hunks: 3,
+                binary_files: 0,
+            },
+            dispatch: autocommit_core::types::DispatchDecision {
+                route: autocommit_core::types::DispatchRoute::DraftOnly,
+                reason_codes: Vec::new(),
+                estimated_cost_tokens: 0,
+            },
+        };
+
+        assert_eq!(suggested_level(&report), BumpLevel::Patch);
+    }
+
+    #[test]
+    fn combine_recommended_level_uses_embedding_only_for_major_escalation() {
+        assert_eq!(
+            combine_recommended_level(BumpLevel::Patch, Some(BumpLevel::Minor)),
+            BumpLevel::Patch
+        );
+        assert_eq!(
+            combine_recommended_level(BumpLevel::Minor, Some(BumpLevel::Patch)),
+            BumpLevel::Minor
+        );
+        assert_eq!(
+            combine_recommended_level(BumpLevel::Patch, Some(BumpLevel::Major)),
+            BumpLevel::Major
+        );
+    }
+
+    #[test]
+    fn build_recommendation_reports_actual_vs_suggested_bump_distance() {
+        let rec = build_recommendation(
+            "crates/cli/Cargo.toml",
+            ManifestKind::CargoToml,
+            Some("1.0.1"),
+            Some("1.0.0"),
+            true,
+            BumpLevel::Minor,
+        )
+        .expect("recommendation should be produced");
+
+        assert_eq!(
+            rec.reason,
+            "version bumped by patch, but detected changes suggest at least a minor bump"
+        );
+        assert_eq!(rec.suggested_version.as_deref(), Some("1.1.0"));
+    }
+
+    #[test]
     fn collect_manifest_candidates_maps_to_nearest_subproject_manifest() {
         let root = create_temp_tree();
         write_file(
@@ -1496,8 +1824,7 @@ diff --git a/Cargo.toml b/Cargo.toml\n";
             "[package]\nname = \"demo\"\nversion = \"0.4.0\"\n",
         );
 
-        apply_manifest_bump(&manifest, ManifestKind::CargoToml, "0.5.0")
-            .expect("cargo bump apply");
+        apply_manifest_bump(&manifest, ManifestKind::CargoToml, "0.5.0").expect("cargo bump apply");
         let next = fs::read_to_string(&manifest).expect("read cargo");
         assert!(next.contains("version = \"0.5.0\""));
 
@@ -1526,14 +1853,9 @@ diff --git a/Cargo.toml b/Cargo.toml\n";
     fn apply_manifest_bump_updates_go_mod_module_path() {
         let root = create_temp_tree();
         let manifest = root.join("go.mod");
-        write_file(
-            &root,
-            "go.mod",
-            "module example.com/demo\n\ngo 1.22\n",
-        );
+        write_file(&root, "go.mod", "module example.com/demo\n\ngo 1.22\n");
 
-        apply_manifest_bump(&manifest, ManifestKind::GoMod, "v2")
-            .expect("go mod bump apply");
+        apply_manifest_bump(&manifest, ManifestKind::GoMod, "v2").expect("go mod bump apply");
         let next = fs::read_to_string(&manifest).expect("read go.mod");
         assert!(next.contains("module example.com/demo/v2"));
 

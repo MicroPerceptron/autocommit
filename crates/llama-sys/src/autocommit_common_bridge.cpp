@@ -7,9 +7,11 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "arg.h"
 #include "common.h"
+#include "download.h"
 #include "sampling.h"
 
 // common.h defines a global `build_info` string derived from these variables.
@@ -22,6 +24,7 @@ const char * LLAMA_BUILD_TARGET = "unknown";
 
 struct autocommit_common_config {
     common_params params;
+    std::string cache_dir_override;
 };
 
 struct autocommit_common_sampler {
@@ -38,6 +41,149 @@ void write_error(char * err, const size_t err_len, const std::string & msg) {
     const size_t write_len = std::min(err_len - 1, msg.size());
     std::memcpy(err, msg.data(), write_len);
     err[write_len] = '\0';
+}
+
+void write_out(char * out, const size_t out_len, const std::string & msg) {
+    if (out == nullptr || out_len == 0) {
+        return;
+    }
+
+    const size_t write_len = std::min(out_len - 1, msg.size());
+    std::memcpy(out, msg.data(), write_len);
+    out[write_len] = '\0';
+}
+
+std::string ensure_trailing_sep(const std::string & dir) {
+    if (dir.empty()) {
+        return dir;
+    }
+    const char last = dir.back();
+    if (last == '/' || last == '\\') {
+        return dir;
+    }
+    return dir + DIRECTORY_SEPARATOR;
+}
+
+bool is_ascii_alnum(const unsigned char ch) {
+    return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9');
+}
+
+std::string sanitize_cache_filename(const std::string & value) {
+    std::string out;
+    out.reserve(value.size());
+    for (unsigned char ch : value) {
+        if (is_ascii_alnum(ch) || ch == '.' || ch == '-' || ch == '_') {
+            out.push_back(static_cast<char>(ch));
+        } else {
+            out.push_back('_');
+        }
+    }
+    if (out.empty()) {
+        out = "model.gguf";
+    }
+    return out;
+}
+
+std::string cache_file_for(const autocommit_common_config & cfg, const std::string & filename) {
+    if (cfg.cache_dir_override.empty()) {
+        return fs_get_cache_file(filename);
+    }
+
+    const std::string cache_dir = ensure_trailing_sep(cfg.cache_dir_override);
+    if (!fs_create_directory_with_parents(cache_dir)) {
+        throw std::runtime_error("failed to create cache directory: " + cache_dir);
+    }
+    return cache_dir + filename;
+}
+
+std::string basename_from_url(std::string url) {
+    if (const auto hash = url.find('#'); hash != std::string::npos) {
+        url = url.substr(0, hash);
+    }
+    if (const auto query = url.find('?'); query != std::string::npos) {
+        url = url.substr(0, query);
+    }
+    if (const auto slash = url.find_last_of("/\\"); slash != std::string::npos) {
+        return url.substr(slash + 1);
+    }
+    return url;
+}
+
+std::vector<common_cached_model_info> list_cached_models_in_dir(const std::string & cache_dir) {
+    std::vector<common_cached_model_info> models;
+    const std::vector<common_file_info> files = fs_list(cache_dir, false);
+    for (const auto & file : files) {
+        if (string_starts_with(file.name, "manifest=") && string_ends_with(file.name, ".json")) {
+            common_cached_model_info model_info;
+            model_info.manifest_path = file.path;
+            std::string fname = file.name;
+            string_replace_all(fname, ".json", "");
+            auto parts = string_split<std::string>(fname, '=');
+            if (parts.size() != 4) {
+                continue;
+            }
+            model_info.user = parts[1];
+            model_info.model = parts[2];
+            model_info.tag = parts[3];
+            model_info.size = 0;
+            models.push_back(model_info);
+        }
+    }
+    return models;
+}
+
+std::string resolve_model_path(autocommit_common_config & cfg) {
+    auto & model = cfg.params.model;
+
+    if (!model.path.empty()) {
+        return model.path;
+    }
+
+    if (!model.docker_repo.empty()) {
+        model.path = common_docker_resolve_model(model.docker_repo);
+        model.name = model.docker_repo;
+        return model.path;
+    }
+
+    if (!model.hf_repo.empty()) {
+        if (model.hf_file.empty()) {
+            auto auto_detected = common_get_hf_file(
+                model.hf_repo,
+                cfg.params.hf_token,
+                cfg.params.offline);
+            if (auto_detected.repo.empty() || auto_detected.ggufFile.empty()) {
+                throw std::runtime_error("failed to auto-detect GGUF file from Hugging Face repo");
+            }
+            model.name = model.hf_repo;
+            model.hf_repo = auto_detected.repo;
+            model.hf_file = auto_detected.ggufFile;
+        }
+
+        const std::string model_endpoint = get_model_endpoint();
+        model.url = model_endpoint + model.hf_repo + "/resolve/main/" + model.hf_file;
+        if (model.path.empty()) {
+            const std::string filename = sanitize_cache_filename(model.hf_repo + "_" + model.hf_file);
+            model.path = cache_file_for(cfg, filename);
+        }
+    } else if (!model.url.empty()) {
+        if (model.path.empty()) {
+            const std::string filename = sanitize_cache_filename(basename_from_url(model.url));
+            model.path = cache_file_for(cfg, filename);
+        }
+    }
+
+    if (!model.url.empty()) {
+        const bool ok = common_download_model(model, cfg.params.hf_token, cfg.params.offline);
+        if (!ok) {
+            throw std::runtime_error("failed to download model from " + model.url);
+        }
+    }
+
+    if (model.path.empty()) {
+        throw std::runtime_error("model path is not configured");
+    }
+
+    return model.path;
 }
 
 bool parse_bool_or_throw(const std::string & value) {
@@ -120,6 +266,30 @@ void autocommit_common_config_set_model_path(autocommit_common_config * cfg, con
         return;
     }
     cfg->params.model.path = path != nullptr ? path : "";
+    if (!cfg->params.model.path.empty()) {
+        cfg->params.model.hf_repo.clear();
+        cfg->params.model.hf_file.clear();
+        cfg->params.model.url.clear();
+    }
+}
+
+void autocommit_common_config_set_hf_repo(autocommit_common_config * cfg, const char * repo) {
+    if (cfg == nullptr) {
+        return;
+    }
+    cfg->params.model.hf_repo = repo != nullptr ? repo : "";
+    if (!cfg->params.model.hf_repo.empty()) {
+        cfg->params.model.path.clear();
+        cfg->params.model.url.clear();
+        cfg->params.model.hf_file.clear();
+    }
+}
+
+void autocommit_common_config_set_cache_dir(autocommit_common_config * cfg, const char * dir) {
+    if (cfg == nullptr) {
+        return;
+    }
+    cfg->cache_dir_override = dir != nullptr ? dir : "";
 }
 
 void autocommit_common_config_set_n_parallel(autocommit_common_config * cfg, const int32_t n_parallel) {
@@ -127,6 +297,72 @@ void autocommit_common_config_set_n_parallel(autocommit_common_config * cfg, con
         return;
     }
     cfg->params.n_parallel = n_parallel;
+}
+
+int autocommit_common_config_resolve_model_path(
+        autocommit_common_config * cfg,
+        char * out_path,
+        const size_t out_path_len,
+        char * err,
+        const size_t err_len) {
+    if (cfg == nullptr) {
+        write_error(err, err_len, "common config is null");
+        return 0;
+    }
+
+    try {
+        const std::string path = resolve_model_path(*cfg);
+        write_out(out_path, out_path_len, path);
+        return 1;
+    } catch (const std::exception & ex) {
+        write_error(err, err_len, ex.what());
+        return 0;
+    }
+}
+
+int autocommit_common_config_list_cached_models(
+        autocommit_common_config * cfg,
+        char * out_models,
+        const size_t out_models_len,
+        char * out_cache_dir,
+        const size_t out_cache_dir_len,
+        char * err,
+        const size_t err_len) {
+    if (cfg == nullptr) {
+        write_error(err, err_len, "common config is null");
+        return 0;
+    }
+
+    try {
+        std::string cache_dir = cfg->cache_dir_override.empty()
+            ? fs_get_cache_directory()
+            : ensure_trailing_sep(cfg->cache_dir_override);
+        if (!cfg->cache_dir_override.empty()) {
+            fs_create_directory_with_parents(cache_dir);
+        }
+
+        std::vector<common_cached_model_info> models = cfg->cache_dir_override.empty()
+            ? common_list_cached_models()
+            : list_cached_models_in_dir(cache_dir);
+        std::sort(models.begin(), models.end(), [](const auto & a, const auto & b) {
+            return a.to_string() < b.to_string();
+        });
+
+        std::string joined;
+        for (size_t i = 0; i < models.size(); ++i) {
+            if (i > 0) {
+                joined.push_back('\n');
+            }
+            joined += models[i].to_string();
+        }
+
+        write_out(out_models, out_models_len, joined);
+        write_out(out_cache_dir, out_cache_dir_len, cache_dir);
+        return 1;
+    } catch (const std::exception & ex) {
+        write_error(err, err_len, ex.what());
+        return 0;
+    }
 }
 
 int autocommit_common_config_apply_env(

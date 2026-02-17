@@ -4,9 +4,9 @@ mod context_handle;
 pub mod embed;
 pub mod error;
 pub mod model;
-pub mod progress;
 mod model_handle;
+pub mod progress;
 pub mod sampler;
 pub mod state;
 
-pub use model::Engine;
+pub use model::{CachedModelList, Engine, ModelConfig, list_cached_models};

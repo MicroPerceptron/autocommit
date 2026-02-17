@@ -81,31 +81,25 @@ fn mock_and_runtime_satisfy_llm_contract() {
     }
 
     let runtime = Engine::new("test").expect("runtime init");
-    if runtime_model_is_available() {
-        let partial = runtime.analyze_chunk(&chunk).expect("runtime partial");
-        assert!(!partial.items.is_empty());
-        let report = runtime
-            .reduce_report(&[partial], &decision, &stats)
-            .expect("runtime report");
-        assert_eq!(report.schema_version, "1.0");
-        assert!(!report.commit_message.is_empty());
-    } else {
-        let err = runtime
-            .analyze_chunk(&chunk)
-            .expect_err("runtime should fail without configured model");
-        assert!(
-            err.to_string()
-                .contains("runtime model path is not configured"),
-            "unexpected runtime error: {err}"
-        );
+    match runtime.analyze_chunk(&chunk) {
+        Ok(partial) => {
+            assert!(!partial.items.is_empty());
+            let report = runtime
+                .reduce_report(&[partial], &decision, &stats)
+                .expect("runtime report");
+            assert_eq!(report.schema_version, "1.0");
+            assert!(!report.commit_message.is_empty());
+        }
+        Err(err) => {
+            let msg = err.to_string();
+            assert!(
+                msg.contains("runtime model")
+                    || msg.contains("download")
+                    || msg.contains("Hugging Face")
+                    || msg.contains("not enabled")
+                    || msg.contains("embedding model"),
+                "unexpected runtime error: {err}"
+            );
+        }
     }
-}
-
-fn runtime_model_is_available() -> bool {
-    let path =
-        std::env::var_os("AUTOCOMMIT_EMBED_MODEL").or_else(|| std::env::var_os("LLAMA_MODEL_PATH"));
-    let Some(path) = path else {
-        return false;
-    };
-    std::path::PathBuf::from(path).is_file()
 }

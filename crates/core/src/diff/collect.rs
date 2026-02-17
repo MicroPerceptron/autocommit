@@ -55,7 +55,22 @@ fn parse_path(header: &str) -> Option<String> {
 }
 
 fn estimate_tokens(text: &str) -> usize {
-    text.split_whitespace().count().max(1)
+    if text.trim().is_empty() {
+        return 1;
+    }
+
+    let whitespace_tokens = text.split_whitespace().count();
+    let punctuation_tokens = text
+        .bytes()
+        .filter(|byte| matches!(*byte, b'{' | b'}' | b'(' | b')' | b'[' | b']' | b':' | b';'))
+        .count()
+        / 3;
+    let char_tokens = text.len() / 10;
+
+    whitespace_tokens
+        .max(char_tokens)
+        .saturating_add(punctuation_tokens)
+        .max(1)
 }
 
 #[cfg(test)]

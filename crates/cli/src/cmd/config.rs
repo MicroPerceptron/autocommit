@@ -15,9 +15,11 @@ use dialoguer::{Confirm, Input, Select};
 use crate::cmd::commit_policy;
 #[cfg(feature = "llama-native")]
 use crate::cmd::repo_cache::{
-    RepoKvMetadata, RepoKvPaths, discover_repo_kv_paths, ensure_cache_dir, read_metadata,
-    write_metadata,
+    discover_repo_kv_paths, ensure_cache_dir, read_metadata, write_metadata, RepoKvMetadata,
+    RepoKvPaths,
 };
+#[cfg(feature = "llama-native")]
+use crate::path_util::expand_tilde;
 
 pub fn run(args: &[String]) -> Result<String, String> {
     let parsed = match ConfigArgs::parse_from(args)? {
@@ -602,17 +604,4 @@ fn prompt_model_selection() -> Result<(Option<String>, Option<String>, Option<St
         Some(2) => Ok((None, None, None)),
         Some(_) => Err("invalid model source selection".to_string()),
     }
-}
-
-#[cfg(feature = "llama-native")]
-fn expand_tilde(path: &str) -> String {
-    if path == "~" {
-        return std::env::var("HOME").unwrap_or_else(|_| path.to_string());
-    }
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return format!("{home}/{rest}");
-        }
-    }
-    path.to_string()
 }

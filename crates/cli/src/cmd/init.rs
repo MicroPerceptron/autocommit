@@ -1,11 +1,11 @@
 #[cfg(feature = "llama-native")]
-use dialoguer::Input;
-#[cfg(feature = "llama-native")]
-use dialoguer::Select;
-#[cfg(feature = "llama-native")]
 use dialoguer::console::Term;
 #[cfg(feature = "llama-native")]
 use dialoguer::theme::ColorfulTheme;
+#[cfg(feature = "llama-native")]
+use dialoguer::Input;
+#[cfg(feature = "llama-native")]
+use dialoguer::Select;
 #[cfg(feature = "llama-native")]
 use std::io::IsTerminal;
 #[cfg(feature = "llama-native")]
@@ -15,10 +15,12 @@ use clap::Parser;
 
 #[cfg(feature = "llama-native")]
 use crate::cmd::repo_cache::{
-    RepoKvMetadata, discover_repo_kv_paths, ensure_cache_dir, write_metadata,
+    discover_repo_kv_paths, ensure_cache_dir, write_metadata, RepoKvMetadata,
 };
 #[cfg(feature = "llama-native")]
 use crate::cmd::{commit_policy, commit_policy::CommitPolicy};
+#[cfg(feature = "llama-native")]
+use crate::path_util::expand_tilde;
 
 pub fn run(args: &[String]) -> Result<String, String> {
     let parsed = match InitArgs::parse_from(args)? {
@@ -328,17 +330,4 @@ fn prompt_model_selection() -> Result<(Option<String>, Option<String>, Option<St
         }
         Some(_) => Err("invalid model source selection".to_string()),
     }
-}
-
-#[cfg(feature = "llama-native")]
-fn expand_tilde(path: &str) -> String {
-    if path == "~" {
-        return std::env::var("HOME").unwrap_or_else(|_| path.to_string());
-    }
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return format!("{home}/{rest}");
-        }
-    }
-    path.to_string()
 }

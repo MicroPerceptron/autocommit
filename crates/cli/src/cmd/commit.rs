@@ -3,12 +3,12 @@ use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::Command;
 
-use autocommit_core::AnalysisReport;
 use autocommit_core::llm::traits::LlmEngine;
-use autocommit_core::{AnalyzeOptions, CoreError, run as core_run};
+use autocommit_core::AnalysisReport;
+use autocommit_core::{run as core_run, AnalyzeOptions, CoreError};
 use clap::Parser;
-use dialoguer::console::{Term, style};
-use dialoguer::{Confirm, Editor, Select, theme::ColorfulTheme};
+use dialoguer::console::{style, Term};
+use dialoguer::{theme::ColorfulTheme, Confirm, Editor, Select};
 use indicatif::{ProgressBar, ProgressStyle};
 
 #[cfg(feature = "llama-native")]
@@ -18,6 +18,8 @@ use crate::cmd::{
     report_cache, version_bump,
 };
 use crate::output;
+#[cfg(feature = "llama-native")]
+use crate::path_util::expand_tilde;
 
 #[cfg(not(feature = "llama-native"))]
 use autocommit_core::types::{
@@ -712,19 +714,6 @@ fn read_line_trimmed() -> Result<String, String> {
         return Err("interactive input was closed".to_string());
     }
     Ok(buffer.trim().to_string())
-}
-
-#[cfg(feature = "llama-native")]
-fn expand_tilde(path: &str) -> String {
-    if path == "~" {
-        return std::env::var("HOME").unwrap_or_else(|_| path.to_string());
-    }
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return format!("{home}/{rest}");
-        }
-    }
-    path.to_string()
 }
 
 fn prepare_diff(repo: &git::Repo, staged_only: bool, dry_run: bool) -> Result<String, CoreError> {
@@ -2632,11 +2621,8 @@ mod tests {
         assert!(message.starts_with("feat(core): add detailed commit composition\n\n"));
         assert!(message.contains("Compose commit output from chunk-level analyses."));
         assert!(message.contains("### Changes\n- [`crates/cli/src/cmd/commit.rs`] Compose final commit body: Include per-file details in commit body"));
-        assert!(
-            message.contains(
-                "- [`crates/cli/src/output/text.rs` (+1 more)] Refactor output formatting"
-            )
-        );
+        assert!(message
+            .contains("- [`crates/cli/src/output/text.rs` (+1 more)] Refactor output formatting"));
         assert!(message.contains("### Risk\n- Level: medium"));
         assert!(message.contains("- Generated details were composed from partial analyses."));
         assert!(!message.contains("dispatch:DraftThenReduce"));

@@ -1,7 +1,6 @@
 #include "autocommit_common_bridge.h"
 
 #include <algorithm>
-#include <cctype>
 #include <cstring>
 #include <exception>
 #include <new>
@@ -65,11 +64,15 @@ std::string ensure_trailing_sep(const std::string & dir) {
     return dir + DIRECTORY_SEPARATOR;
 }
 
+bool is_ascii_alnum(const unsigned char ch) {
+    return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9');
+}
+
 std::string sanitize_cache_filename(const std::string & value) {
     std::string out;
     out.reserve(value.size());
     for (unsigned char ch : value) {
-        if (std::isalnum(ch) || ch == '.' || ch == '-' || ch == '_') {
+        if (is_ascii_alnum(ch) || ch == '.' || ch == '-' || ch == '_') {
             out.push_back(static_cast<char>(ch));
         } else {
             out.push_back('_');

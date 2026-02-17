@@ -1,5 +1,6 @@
 mod cmd;
 mod output;
+mod path_util;
 
 use clap::{CommandFactory, Parser, ValueEnum};
 

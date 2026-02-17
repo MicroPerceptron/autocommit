@@ -3,8 +3,8 @@ use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use autocommit_core::AnalysisReport;
 use autocommit_core::types::TypeTag;
+use autocommit_core::AnalysisReport;
 use serde::{Deserialize, Serialize};
 
 use crate::cmd::git;

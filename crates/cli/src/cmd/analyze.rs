@@ -4,13 +4,15 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use autocommit_core::llm::traits::LlmEngine;
-use autocommit_core::{AnalyzeOptions, CoreError, run as core_run};
+use autocommit_core::{run as core_run, AnalyzeOptions, CoreError};
 use clap::Parser;
 
 #[cfg(feature = "llama-native")]
 use crate::cmd::repo_cache;
 use crate::cmd::{git, report_cache};
 use crate::output;
+#[cfg(feature = "llama-native")]
+use crate::path_util::expand_tilde;
 
 #[cfg(not(feature = "llama-native"))]
 use autocommit_core::types::{
@@ -230,19 +232,6 @@ fn read_git_diff() -> Result<String, CoreError> {
     }
 
     Ok(combined)
-}
-
-#[cfg(feature = "llama-native")]
-fn expand_tilde(path: &str) -> String {
-    if path == "~" {
-        return std::env::var("HOME").unwrap_or_else(|_| path.to_string());
-    }
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return format!("{home}/{rest}");
-        }
-    }
-    path.to_string()
 }
 
 #[cfg(not(feature = "llama-native"))]

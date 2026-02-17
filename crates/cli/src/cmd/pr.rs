@@ -5,16 +5,18 @@ use std::process::Command;
 
 #[cfg(not(feature = "llama-native"))]
 use autocommit_core::llm::traits::LlmEngine;
-use autocommit_core::{AnalyzeOptions, CoreError, run as core_run};
+use autocommit_core::{run as core_run, AnalyzeOptions, CoreError};
 use clap::Parser;
-use dialoguer::console::{Term, style};
-use dialoguer::{Confirm, Editor, Select, theme::ColorfulTheme};
+use dialoguer::console::{style, Term};
+use dialoguer::{theme::ColorfulTheme, Confirm, Editor, Select};
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::Deserialize;
 
 #[cfg(feature = "llama-native")]
 use crate::cmd::repo_cache;
 use crate::cmd::{analysis_progress::AnalysisProgress, git, report_cache};
+#[cfg(feature = "llama-native")]
+use crate::path_util::expand_tilde;
 
 #[cfg(not(feature = "llama-native"))]
 use autocommit_core::types::{
@@ -817,19 +819,6 @@ fn read_line_trimmed() -> Result<String, String> {
         return Err("interactive input was closed".to_string());
     }
     Ok(buffer.trim().to_string())
-}
-
-#[cfg(feature = "llama-native")]
-fn expand_tilde(path: &str) -> String {
-    if path == "~" {
-        return std::env::var("HOME").unwrap_or_else(|_| path.to_string());
-    }
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return format!("{home}/{rest}");
-        }
-    }
-    path.to_string()
 }
 
 fn resolve_pr_branches(

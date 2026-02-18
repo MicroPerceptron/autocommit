@@ -253,11 +253,11 @@ fn prompt_model_selection() -> Result<(Option<String>, Option<String>, Option<St
         }
         Some(0) | None => {
             let repo_options = [
+                ("Gemma 3n E2B IT", "ggml-org/gemma-3n-E2B-it-GGUF"),
                 ("Qwen3 1.7B", "ggml-org/Qwen3-1.7B-GGUF"),
                 ("Qwen3 4B", "ggml-org/Qwen3-4B-GGUF"),
                 ("Qwen3 8B", "ggml-org/Qwen3-8B-GGUF"),
                 ("Gemma 3 1B IT", "ggml-org/gemma-3-1b-it-GGUF"),
-                ("Gemma 3n E2B IT", "ggml-org/gemma-3n-E2B-it-GGUF"),
                 ("Custom HF repo", ""),
             ];
             let repo_labels = repo_options

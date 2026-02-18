@@ -24,6 +24,39 @@ fn cmake_parallel_jobs() -> usize {
     std::cmp::max(1, nproc.saturating_mul(2) / 3)
 }
 
+fn detect_cuda() -> bool {
+    println!("cargo:rerun-if-env-changed=GGML_CUDA");
+    println!("cargo:rerun-if-env-changed=CUDA_PATH");
+
+    // Explicit override via GGML_CUDA env var
+    if let Ok(val) = env::var("GGML_CUDA") {
+        return matches!(val.to_ascii_lowercase().as_str(), "1" | "on" | "true");
+    }
+
+    // macOS uses Metal, not CUDA
+    if cfg!(target_os = "macos") {
+        return false;
+    }
+
+    // Auto-detect CUDA Toolkit via CUDA_PATH (set by NVIDIA installer on Windows,
+    // commonly set on Linux too)
+    if let Ok(cuda_path) = env::var("CUDA_PATH") {
+        if Path::new(&cuda_path).exists() {
+            println!("cargo:warning=CUDA auto-detected via CUDA_PATH={cuda_path}");
+            return true;
+        }
+    }
+
+    // On Linux, check the conventional /usr/local/cuda path
+    #[cfg(target_os = "linux")]
+    if Path::new("/usr/local/cuda/bin/nvcc").is_file() {
+        println!("cargo:warning=CUDA auto-detected via /usr/local/cuda");
+        return true;
+    }
+
+    false
+}
+
 fn main() {
     println!("cargo:rerun-if-env-changed=LLAMA_CPP_DIR");
     println!("cargo:rerun-if-changed=src/autocommit_common_bridge.cpp");
@@ -61,6 +94,7 @@ fn main() {
 
     generate_bindings(&source_dir, &out_dir);
 
+    let use_cuda = detect_cuda();
     let profile = profile_name();
 
     let mut configure = Command::new("cmake");
@@ -80,6 +114,9 @@ fn main() {
         .arg("-DLLAMA_BUILD_EXAMPLES=OFF")
         .arg("-DLLAMA_BUILD_TOOLS=OFF")
         .arg("-DLLAMA_BUILD_SERVER=OFF");
+    if use_cuda {
+        configure.arg("-DGGML_CUDA=ON");
+    }
     if cfg!(target_os = "macos") {
         let deployment_target = env::var("MACOSX_DEPLOYMENT_TARGET")
             .ok()
@@ -110,6 +147,9 @@ fn main() {
     build_common_bridge(&source_dir, &manifest_dir);
     emit_common_link_deps(&build_dir);
     emit_link_search_paths(&install_dir);
+    if use_cuda {
+        emit_cuda_link_deps();
+    }
 
     println!(
         "cargo:rustc-env=LLAMA_CPP_BUILD_DIR={}",
@@ -191,6 +231,46 @@ fn emit_link_search_paths(install_dir: &Path) {
         println!("cargo:rustc-link-lib=framework=Metal");
         println!("cargo:rustc-link-lib=framework=QuartzCore");
     }
+
+    #[cfg(target_os = "linux")]
+    {
+        println!("cargo:rustc-link-lib=dylib=stdc++");
+    }
+}
+
+fn emit_cuda_link_deps() {
+    // Locate the CUDA toolkit library directory
+    let lib_search_dirs: Vec<PathBuf> = if let Ok(cuda_path) = env::var("CUDA_PATH") {
+        vec![
+            PathBuf::from(&cuda_path).join("lib").join("x64"), // Windows
+            PathBuf::from(&cuda_path).join("lib64"),           // Linux
+        ]
+    } else {
+        // Fallback for Linux conventional path
+        vec![PathBuf::from("/usr/local/cuda/lib64")]
+    };
+
+    for dir in &lib_search_dirs {
+        if dir.exists() {
+            println!("cargo:rustc-link-search=native={}", dir.display());
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // Windows: static cudart, dynamic cublas (no static cublas on Windows)
+        println!("cargo:rustc-link-lib=static=cudart_static");
+        println!("cargo:rustc-link-lib=dylib=cublas");
+        println!("cargo:rustc-link-lib=dylib=cuda");
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        println!("cargo:rustc-link-lib=static=cudart_static");
+        println!("cargo:rustc-link-lib=static=cublas_static");
+        println!("cargo:rustc-link-lib=static=cublasLt_static");
+        println!("cargo:rustc-link-lib=dylib=cuda");
+    }
 }
 
 fn emit_link_libs_from_dir(dir: &Path) {
@@ -204,13 +284,21 @@ fn emit_link_libs_from_dir(dir: &Path) {
             continue;
         };
 
-        if !name.starts_with("lib") || !name.ends_with(".a") {
+        // Unix / MinGW: libfoo.a
+        if name.starts_with("lib") && name.ends_with(".a") {
+            let lib_name = &name[3..name.len() - 2];
+            if !lib_name.is_empty() {
+                println!("cargo:rustc-link-lib=static={lib_name}");
+            }
             continue;
         }
 
-        let lib_name = &name[3..name.len() - 2];
-        if !lib_name.is_empty() {
-            println!("cargo:rustc-link-lib=static={lib_name}");
+        // MSVC: foo.lib
+        if cfg!(target_os = "windows") && name.ends_with(".lib") {
+            let lib_name = &name[..name.len() - 4];
+            if !lib_name.is_empty() {
+                println!("cargo:rustc-link-lib=static={lib_name}");
+            }
         }
     }
 }
@@ -236,10 +324,14 @@ fn build_common_bridge(source_dir: &Path, manifest_dir: &Path) {
         .compile("autocommit_common_bridge");
 }
 
+fn has_static_lib(dir: &Path, name: &str) -> bool {
+    // Check for Unix/MinGW (libfoo.a) and MSVC (foo.lib)
+    dir.join(format!("lib{name}.a")).exists() || dir.join(format!("{name}.lib")).exists()
+}
+
 fn emit_common_link_deps(build_dir: &Path) {
     let common_dir = build_dir.join("common");
-    let common_lib = common_dir.join("libcommon.a");
-    if common_lib.exists() {
+    if has_static_lib(&common_dir, "common") {
         println!(
             "cargo:rustc-link-search=native={}",
             common_dir.to_string_lossy()
@@ -248,8 +340,7 @@ fn emit_common_link_deps(build_dir: &Path) {
     }
 
     let httplib_dir = build_dir.join("vendor").join("cpp-httplib");
-    let httplib_lib = httplib_dir.join("libcpp-httplib.a");
-    if httplib_lib.exists() {
+    if has_static_lib(&httplib_dir, "cpp-httplib") {
         println!(
             "cargo:rustc-link-search=native={}",
             httplib_dir.to_string_lossy()

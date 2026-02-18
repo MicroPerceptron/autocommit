@@ -84,7 +84,7 @@ dependencies = [
 
 [[package]]
 name = "autocommit-cli"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "autocommit-core",
  "clap",
@@ -1417,7 +1417,7 @@ dependencies = [
 
 [[package]]
 name = "llama-sys"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "bindgen",
  "cc",

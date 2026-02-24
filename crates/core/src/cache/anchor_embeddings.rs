@@ -76,9 +76,13 @@ impl AnchorEmbeddingCache {
         };
 
         if let Some(parent) = self.path.parent() {
+            // Best-effort: failures to create the cache directory are ignored so they
+            // do not interfere with the main workflow. This only affects caching.
             let _ = fs::create_dir_all(parent);
         }
         if let Ok(bytes) = serde_json::to_vec(&entry) {
+            // Best-effort: failures to write the cache file are ignored so they
+            // do not interfere with the main workflow. This only affects caching.
             let _ = fs::write(&self.path, bytes);
         }
     }

@@ -119,6 +119,34 @@ impl ManifestKind {
             Self::PubspecYaml => "pub",
         }
     }
+
+    /// Returns the lockfile sync command for this manifest ecosystem.
+    /// The `manifest_dir` is used for ecosystems (like JS) where the lockfile
+    /// type determines which package manager to invoke.
+    fn lockfile_sync_command(self, manifest_dir: &Path) -> Option<(&'static str, &'static [&'static str])> {
+        match self {
+            Self::CargoToml => Some(("cargo", &["generate-lockfile"])),
+            Self::PackageJson => detect_js_lockfile_sync(manifest_dir),
+            Self::GoMod => Some(("go", &["mod", "tidy"])),
+            Self::ComposerJson => Some(("composer", &["update", "--lock"])),
+            Self::Gemfile => Some(("bundle", &["lock"])),
+            Self::MixExs => Some(("mix", &["deps.get"])),
+            Self::PubspecYaml => Some(("dart", &["pub", "get"])),
+            _ => None,
+        }
+    }
+}
+
+fn detect_js_lockfile_sync(dir: &Path) -> Option<(&'static str, &'static [&'static str])> {
+    if dir.join("pnpm-lock.yaml").exists() {
+        Some(("pnpm", &["install", "--lockfile-only"]))
+    } else if dir.join("yarn.lock").exists() {
+        Some(("yarn", &["install"]))
+    } else if dir.join("package-lock.json").exists() {
+        Some(("npm", &["install", "--package-lock-only"]))
+    } else {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -390,6 +418,71 @@ pub(crate) fn apply(
     Ok(touched)
 }
 
+/// Run lockfile sync commands for the ecosystems whose manifests were bumped.
+/// Returns warnings for any sync that failed; failures are non-fatal.
+pub(crate) fn sync_lockfiles(
+    repo: &git::Repo,
+    recommendations: &[VersionRecommendation],
+) -> Vec<(String, String)> {
+    let root = repo.repo_root();
+    let mut warnings = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    for rec in recommendations {
+        let manifest_dir = Path::new(&rec.manifest_path)
+            .parent()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        // Deduplicate by (directory, kind) to avoid running the same sync twice.
+        let dedup_key = format!("{}:{:?}", manifest_dir, rec.kind);
+        if !seen.insert(dedup_key) {
+            continue;
+        }
+
+        let abs_dir = if manifest_dir.is_empty() {
+            root.to_path_buf()
+        } else {
+            root.join(&manifest_dir)
+        };
+
+        let Some((cmd, args)) = rec.kind.lockfile_sync_command(&abs_dir) else {
+            continue;
+        };
+
+        let result = std::process::Command::new(cmd)
+            .args(args)
+            .current_dir(&abs_dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .output();
+
+        match result {
+            Ok(output) if output.status.success() => {}
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                warnings.push((
+                    rec.manifest_path.clone(),
+                    format!(
+                        "`{cmd} {}` exited with {}: {}",
+                        args.join(" "),
+                        output.status,
+                        stderr.trim()
+                    ),
+                ));
+            }
+            Err(err) => {
+                warnings.push((
+                    rec.manifest_path.clone(),
+                    format!("`{cmd}` not found or failed to start: {err}"),
+                ));
+            }
+        }
+    }
+
+    warnings
+}
+
 fn suggested_level(report: &AnalysisReport) -> BumpLevel {
     let subject = report.commit_message.trim().to_ascii_lowercase();
     let summary = report.summary.trim().to_ascii_lowercase();
@@ -493,20 +586,73 @@ fn suggested_level(report: &AnalysisReport) -> BumpLevel {
 
 fn contains_breaking_signal(text: &str) -> bool {
     let text = text.to_ascii_lowercase();
-    [
+
+    // Strong, unambiguous breaking signals.
+    let strong = [
         "breaking change",
         "breaking:",
         "breaks compatibility",
         "incompatible",
         "backward incompatible",
         "backwards incompatible",
-        "remove ",
-        "removed ",
-        "deprecat",
-        "migration",
-    ]
-    .iter()
-    .any(|needle| text.contains(needle))
+    ];
+    if strong.iter().any(|needle| text.contains(needle)) {
+        return true;
+    }
+
+    // Context-dependent: "remove"/"removed" only when targeting user-facing constructs.
+    // "remove dead code" or "remove unused import" should NOT trigger.
+    if contains_contextual_removal_signal(&text) {
+        return true;
+    }
+
+    // "deprecat*" only when targeting user-facing constructs.
+    if contains_contextual_deprecation_signal(&text) {
+        return true;
+    }
+
+    false
+}
+
+const API_FACING_NOUNS: &[&str] = &[
+    "api",
+    "endpoint",
+    "function",
+    "method",
+    "field",
+    "column",
+    "parameter",
+    "argument",
+    "option",
+    "flag",
+    "command",
+    "subcommand",
+    "route",
+    "interface",
+    "trait",
+    "class",
+    "module",
+    "export",
+    "public",
+    "support for",
+];
+
+fn contains_contextual_removal_signal(text: &str) -> bool {
+    let pos = match text.find("remove") {
+        Some(p) => p,
+        None => return false,
+    };
+    let after = &text[pos..];
+    API_FACING_NOUNS.iter().any(|noun| after.contains(noun))
+}
+
+fn contains_contextual_deprecation_signal(text: &str) -> bool {
+    let pos = match text.find("deprecat") {
+        Some(p) => p,
+        None => return false,
+    };
+    let after = &text[pos..];
+    API_FACING_NOUNS.iter().any(|noun| after.contains(noun))
 }
 
 fn contains_feature_signal(text: &str) -> bool {
@@ -1517,6 +1663,17 @@ fn bump_distance(previous: Semver, current: Semver) -> Option<BumpLevel> {
 
 impl Semver {
     fn bump(self, level: BumpLevel) -> Self {
+        // Pre-1.0: breaking changes bump minor, not major.
+        // Jumping from 0.x.y to 1.0.0 signals "first stable release" per semver,
+        // which is almost never the intent of a routine breaking change.
+        if self.major == 0 && level == BumpLevel::Major {
+            return Self {
+                major: 0,
+                minor: self.minor.saturating_add(1),
+                patch: 0,
+            };
+        }
+
         match level {
             BumpLevel::Patch => Self {
                 major: self.major,
@@ -1860,6 +2017,104 @@ diff --git a/Cargo.toml b/Cargo.toml\n";
         assert!(next.contains("module example.com/demo/v2"));
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn semver_bump_major_on_pre_1_0_bumps_minor() {
+        let v = parse_semver("0.11.0").unwrap();
+        assert_eq!(v.bump(BumpLevel::Major).to_string(), "0.12.0");
+    }
+
+    #[test]
+    fn semver_bump_minor_on_pre_1_0_unchanged() {
+        let v = parse_semver("0.11.0").unwrap();
+        assert_eq!(v.bump(BumpLevel::Minor).to_string(), "0.12.0");
+    }
+
+    #[test]
+    fn semver_bump_patch_on_pre_1_0_unchanged() {
+        let v = parse_semver("0.11.2").unwrap();
+        assert_eq!(v.bump(BumpLevel::Patch).to_string(), "0.11.3");
+    }
+
+    #[test]
+    fn semver_bump_major_on_stable_unchanged() {
+        let v = parse_semver("2.3.1").unwrap();
+        assert_eq!(v.bump(BumpLevel::Major).to_string(), "3.0.0");
+    }
+
+    #[test]
+    fn breaking_signal_fires_on_breaking_change() {
+        assert!(contains_breaking_signal("breaking change: new config format"));
+    }
+
+    #[test]
+    fn breaking_signal_fires_on_remove_api() {
+        assert!(contains_breaking_signal("remove public api endpoint"));
+    }
+
+    #[test]
+    fn breaking_signal_fires_on_deprecate_function() {
+        assert!(contains_breaking_signal("deprecate the old function"));
+    }
+
+    #[test]
+    fn breaking_signal_ignores_remove_dead_code() {
+        assert!(!contains_breaking_signal("remove dead code"));
+    }
+
+    #[test]
+    fn breaking_signal_ignores_remove_unused_import() {
+        assert!(!contains_breaking_signal("remove unused import"));
+    }
+
+    #[test]
+    fn breaking_signal_ignores_migration_alone() {
+        assert!(!contains_breaking_signal("migration to new internal pattern"));
+    }
+
+    #[test]
+    fn lockfile_sync_command_returns_correct_commands() {
+        let tmp = create_temp_tree();
+        assert!(ManifestKind::CargoToml.lockfile_sync_command(&tmp).is_some());
+        assert!(ManifestKind::GoMod.lockfile_sync_command(&tmp).is_some());
+        assert!(ManifestKind::SetupPy.lockfile_sync_command(&tmp).is_none());
+        assert!(ManifestKind::PomXml.lockfile_sync_command(&tmp).is_none());
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn lockfile_sync_detects_npm_lockfile() {
+        let tmp = create_temp_tree();
+        write_file(&tmp, "package-lock.json", "{}");
+        let (cmd, _) = ManifestKind::PackageJson.lockfile_sync_command(&tmp).unwrap();
+        assert_eq!(cmd, "npm");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn lockfile_sync_detects_pnpm_lockfile() {
+        let tmp = create_temp_tree();
+        write_file(&tmp, "pnpm-lock.yaml", "");
+        let (cmd, _) = ManifestKind::PackageJson.lockfile_sync_command(&tmp).unwrap();
+        assert_eq!(cmd, "pnpm");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn lockfile_sync_detects_yarn_lockfile() {
+        let tmp = create_temp_tree();
+        write_file(&tmp, "yarn.lock", "");
+        let (cmd, _) = ManifestKind::PackageJson.lockfile_sync_command(&tmp).unwrap();
+        assert_eq!(cmd, "yarn");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn lockfile_sync_no_js_lockfile_returns_none() {
+        let tmp = create_temp_tree();
+        assert!(ManifestKind::PackageJson.lockfile_sync_command(&tmp).is_none());
+        let _ = fs::remove_dir_all(&tmp);
     }
 
     fn create_temp_tree() -> PathBuf {

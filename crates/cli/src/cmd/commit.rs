@@ -279,6 +279,19 @@ pub fn run(args: &[String]) -> Result<String, String> {
         run_step(rich_interactive, "Applying version bumps", || {
             apply_approved_version_bumps(&repo, staged_only, &approved_version_recommendations)
         })?;
+
+        let sync_warnings = run_step(rich_interactive, "Syncing lockfiles", || {
+            Ok::<_, String>(version_bump::sync_lockfiles(
+                &repo,
+                &approved_version_recommendations,
+            ))
+        })?;
+        for (path, warning) in &sync_warnings {
+            eprintln!(
+                "{}",
+                style(format!("warning: lockfile sync for {path}: {warning}")).yellow()
+            );
+        }
     }
 
     if dry_run {

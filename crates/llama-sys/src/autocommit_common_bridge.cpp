@@ -618,12 +618,12 @@ extern "C" float autocommit_cosine_similarity(const float * a, const float * b, 
         return 0.0f;
     }
 
-    const vDSP_Length len = static_cast<vDSP_Length>(n);
     float dot    = 0.0f;
     float norm_a = 0.0f;
     float norm_b = 0.0f;
 
 #ifdef __APPLE__
+    const vDSP_Length len = static_cast<vDSP_Length>(n);
     // Use vDSP (Accelerate): SIMD-optimized on Apple Silicon.
     vDSP_dotpr(a, 1, b, 1, &dot, len);
     vDSP_dotpr(a, 1, a, 1, &norm_a, len);

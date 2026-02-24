@@ -118,7 +118,7 @@ enum ParseOutcome<T> {
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "autocommit-cli clean",
+    name = "autocommit clean",
     about = "Delete persisted per-repo KV generation cache"
 )]
 struct CleanArgs {
@@ -129,7 +129,7 @@ struct CleanArgs {
 
 impl CleanArgs {
     fn parse_from(args: &[String]) -> Result<ParseOutcome<Self>, String> {
-        let argv = std::iter::once("autocommit-cli clean".to_string()).chain(args.iter().cloned());
+        let argv = std::iter::once("autocommit clean".to_string()).chain(args.iter().cloned());
         match Self::try_parse_from(argv) {
             Ok(parsed) => Ok(ParseOutcome::Continue(parsed)),
             Err(err) => {

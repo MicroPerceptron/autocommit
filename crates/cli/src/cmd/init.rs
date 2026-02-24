@@ -66,7 +66,7 @@ enum ParseOutcome<T> {
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "autocommit-cli init",
+    name = "autocommit init",
     about = "Initialize per-repository runtime cache and policy settings"
 )]
 struct InitArgs {
@@ -92,7 +92,7 @@ struct InitArgs {
 
 impl InitArgs {
     fn parse_from(args: &[String]) -> Result<ParseOutcome<Self>, String> {
-        let argv = std::iter::once("autocommit-cli init".to_string()).chain(args.iter().cloned());
+        let argv = std::iter::once("autocommit init".to_string()).chain(args.iter().cloned());
         match Self::try_parse_from(argv) {
             Ok(parsed) => Ok(ParseOutcome::Continue(parsed)),
             Err(err) => {

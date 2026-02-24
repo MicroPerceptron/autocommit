@@ -121,7 +121,7 @@ fn main() {
         let deployment_target = env::var("MACOSX_DEPLOYMENT_TARGET")
             .ok()
             .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| "11.0".to_string());
+            .unwrap_or_else(|| "14.0".to_string());
         configure.arg(format!("-DCMAKE_OSX_DEPLOYMENT_TARGET={deployment_target}"));
     }
     run(&mut configure, "configure");
@@ -230,6 +230,22 @@ fn emit_link_search_paths(install_dir: &Path) {
         println!("cargo:rustc-link-lib=framework=Foundation");
         println!("cargo:rustc-link-lib=framework=Metal");
         println!("cargo:rustc-link-lib=framework=QuartzCore");
+
+        // Link clang compiler runtime to provide __isPlatformVersionAtLeast
+        // needed by @available() checks in llama.cpp's Objective-C Metal code.
+        if let Ok(output) = Command::new("clang")
+            .arg("--print-resource-dir")
+            .output()
+        {
+            if output.status.success() {
+                let resource_dir = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                let rt_lib_dir = PathBuf::from(&resource_dir).join("lib").join("darwin");
+                if rt_lib_dir.is_dir() {
+                    println!("cargo:rustc-link-search=native={}", rt_lib_dir.display());
+                    println!("cargo:rustc-link-lib=static=clang_rt.osx");
+                }
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]

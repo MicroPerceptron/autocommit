@@ -1,7 +1,16 @@
 [package]
 name = "autocommit-cli"
-version = "0.13.2"
+version = "0.15.0"
 edition = "2024"
+
+[[bin]]
+name = "autocommit"
+path = "src/main.rs"
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/autocommit-{ version }-{ target }{ archive-suffix }"
+bin-dir = "autocommit{ binary-ext }"
+pkg-fmt = "tgz"
 
 [features]
 default = []

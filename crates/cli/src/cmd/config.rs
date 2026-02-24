@@ -76,7 +76,7 @@ enum ParseOutcome<T> {
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "autocommit-cli config",
+    name = "autocommit config",
     about = "View and update per-repository runtime and commit policy settings"
 )]
 struct ConfigArgs {
@@ -117,7 +117,7 @@ struct ConfigArgs {
 
 impl ConfigArgs {
     fn parse_from(args: &[String]) -> Result<ParseOutcome<Self>, String> {
-        let argv = std::iter::once("autocommit-cli config".to_string()).chain(args.iter().cloned());
+        let argv = std::iter::once("autocommit config".to_string()).chain(args.iter().cloned());
         match Self::try_parse_from(argv) {
             Ok(parsed) => Ok(ParseOutcome::Continue(parsed)),
             Err(err) => {
@@ -462,7 +462,7 @@ fn render_config_summary(paths: &RepoKvPaths, metadata: &RepoKvMetadata, status:
     let policy_summary = if metadata.commit_policy_configured {
         commit_policy::policy_summary(&metadata.commit_policy)
     } else {
-        "not configured (run `autocommit-cli config --configure-commit-policy`)".to_string()
+        "not configured (run `autocommit config --configure-commit-policy`)".to_string()
     };
     let cache_dir = metadata
         .model_cache_dir

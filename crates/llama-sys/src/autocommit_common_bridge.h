@@ -82,6 +82,16 @@ void autocommit_common_sampler_accept(
         int accept_grammar);
 void autocommit_common_sampler_reset(autocommit_common_sampler * sampler);
 
+/// Compute cosine similarity between two float vectors of length n.
+/// Uses BLAS (Accelerate on macOS) when available, falls back to plain C loop.
+/// Returns 0.0 if either vector has zero norm or n <= 0.
+float autocommit_cosine_similarity(const float * a, const float * b, int n);
+
+/// Set the common-library log verbosity threshold.
+/// 0 = errors only, 1 = +warnings, 2 = +info, 3 = +debug.
+/// Set to 0 to suppress the "using cached file" INFO messages from download.cpp.
+void autocommit_common_log_set_verbosity(int verbosity);
+
 #ifdef __cplusplus
 }
 #endif

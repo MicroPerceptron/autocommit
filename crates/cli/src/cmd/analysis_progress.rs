@@ -1,21 +1,19 @@
 use indicatif::{ProgressBar, ProgressStyle};
 
-#[cfg(feature = "llama-native")]
-use llama_runtime::progress::{ProgressCallback, ProgressEvent, ProgressStage};
-#[cfg(feature = "llama-native")]
+use autocommit_core::progress::{ProgressCallback, ProgressEvent, ProgressStage};
 use std::sync::{Arc, Mutex};
 
 pub struct AnalysisProgress {
     bar: ProgressBar,
     label: String,
-    #[cfg(feature = "llama-native")]
     callback: ProgressCallback,
 }
 
 impl AnalysisProgress {
     pub fn new(diff_text: &str, label: &str) -> Self {
         let total_chunks = autocommit_core::diff::collect::collect(diff_text).len();
-        let total_steps = (total_chunks as u64).saturating_add(2).max(1);
+        // Steps: dispatch(1) + merge(1) + chunks(N) + reduce(1) = N + 3
+        let total_steps = (total_chunks as u64).saturating_add(3).max(1);
         let bar = ProgressBar::new(total_steps);
         bar.set_style(
             ProgressStyle::with_template("{spinner} {msg}")
@@ -26,7 +24,6 @@ impl AnalysisProgress {
         let label = label.to_string();
         bar.set_message(render_message(&label, "preparing", 0, total_steps));
 
-        #[cfg(feature = "llama-native")]
         let callback: ProgressCallback = {
             let bar = bar.clone();
             let callback_label = label.clone();
@@ -42,24 +39,13 @@ impl AnalysisProgress {
             }) as ProgressCallback
         };
 
-        #[cfg(feature = "llama-native")]
-        {
-            Self {
-                bar,
-                label,
-                callback,
-            }
-        }
-
-        #[cfg(not(feature = "llama-native"))]
-        {
-            let _ = total_chunks;
-            let _ = total_steps;
-            Self { bar, label }
+        Self {
+            bar,
+            label,
+            callback,
         }
     }
 
-    #[cfg(feature = "llama-native")]
     pub fn callback(&self) -> ProgressCallback {
         self.callback.clone()
     }
@@ -69,14 +55,12 @@ impl AnalysisProgress {
     }
 }
 
-#[cfg(feature = "llama-native")]
 struct ProgressState {
     last_pos: u64,
     total_chunks: usize,
     total_steps: u64,
 }
 
-#[cfg(feature = "llama-native")]
 fn update_progress(
     bar: &ProgressBar,
     state: &mut ProgressState,
@@ -84,8 +68,17 @@ fn update_progress(
     event: ProgressEvent,
 ) {
     match event.stage {
-        ProgressStage::Embedding => {
+        ProgressStage::Dispatch => {
             advance_to(bar, state, 1);
+            bar.set_message(render_message(
+                label,
+                "dispatching",
+                state.last_pos,
+                state.total_steps,
+            ));
+        }
+        ProgressStage::Embedding => {
+            // Embedding events arrive during dispatch; keep position at 1.
             bar.set_message(render_message(
                 label,
                 "embedding",
@@ -93,9 +86,25 @@ fn update_progress(
                 state.total_steps,
             ));
         }
+        ProgressStage::Merging { from, to } => {
+            // Recalculate total steps based on the merged chunk count.
+            // Steps: dispatch(1) + merge(1) + merged_chunks(to) + reduce(1)
+            let new_total = (to as u64).saturating_add(3).max(1);
+            state.total_steps = new_total;
+            state.total_chunks = to;
+            bar.set_length(new_total);
+            advance_to(bar, state, 2);
+            bar.set_message(render_message(
+                label,
+                &format!("merged {from}\u{2192}{to} chunks"),
+                state.last_pos,
+                state.total_steps,
+            ));
+        }
         ProgressStage::Analyze { completed, total } => {
             let total = total.max(state.total_chunks);
-            let pos = 1 + completed.min(total) as u64;
+            // Position: dispatch(1) + merge(1) + completed
+            let pos = 2 + completed.min(total) as u64;
             advance_to(bar, state, pos);
             bar.set_message(render_message(
                 label,
@@ -113,10 +122,18 @@ fn update_progress(
                 state.total_steps,
             ));
         }
+        ProgressStage::DraftSynthesis => {
+            advance_to(bar, state, state.total_steps);
+            bar.set_message(render_message(
+                label,
+                "synthesizing",
+                state.last_pos,
+                state.total_steps,
+            ));
+        }
     }
 }
 
-#[cfg(feature = "llama-native")]
 fn advance_to(bar: &ProgressBar, state: &mut ProgressState, pos: u64) {
     let pos = pos.min(state.total_steps);
     if pos >= state.last_pos {

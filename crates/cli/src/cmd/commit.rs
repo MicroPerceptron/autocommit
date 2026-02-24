@@ -247,18 +247,17 @@ pub fn run(args: &[String]) -> Result<String, String> {
             None
         };
 
-        #[cfg(feature = "llama-native")]
-        if let Some(progress) = progress.as_ref() {
-            engine.set_progress_callback(Some(progress.callback()));
-        }
+        let analyze_options = {
+            let mut opts = AnalyzeOptions::default();
+            opts.anchor_cache_dir =
+                Some(repo.common_git_dir().join("autocommit/kv"));
+            opts.progress = progress.as_ref().map(|p| p.callback());
+            opts
+        };
 
-        let report = core_run(&engine, &diff_text, &AnalyzeOptions::default())
+        let report = core_run(&engine, &diff_text, &analyze_options)
             .map_err(|err| format!("analysis failed: {err}"))?;
 
-        #[cfg(feature = "llama-native")]
-        {
-            engine.set_progress_callback(None);
-        }
         if let Some(progress) = progress {
             progress.finish();
         }
@@ -280,6 +279,19 @@ pub fn run(args: &[String]) -> Result<String, String> {
         run_step(rich_interactive, "Applying version bumps", || {
             apply_approved_version_bumps(&repo, staged_only, &approved_version_recommendations)
         })?;
+
+        let sync_warnings = run_step(rich_interactive, "Syncing lockfiles", || {
+            Ok::<_, String>(version_bump::sync_lockfiles(
+                &repo,
+                &approved_version_recommendations,
+            ))
+        })?;
+        for (path, warning) in &sync_warnings {
+            eprintln!(
+                "{}",
+                style(format!("warning: lockfile sync for {path}: {warning}")).yellow()
+            );
+        }
     }
 
     if dry_run {
@@ -429,7 +441,7 @@ enum ParseOutcome<T> {
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "autocommit-cli commit",
+    name = "autocommit commit",
     about = "Generate and create a commit message from local repository changes"
 )]
 struct CommitArgs {
@@ -476,7 +488,7 @@ struct CommitArgs {
 
 impl CommitArgs {
     fn parse_from(args: &[String]) -> Result<ParseOutcome<Self>, String> {
-        let argv = std::iter::once("autocommit-cli commit".to_string()).chain(args.iter().cloned());
+        let argv = std::iter::once("autocommit commit".to_string()).chain(args.iter().cloned());
         match Self::try_parse_from(argv) {
             Ok(parsed) => Ok(ParseOutcome::Continue(parsed)),
             Err(err) => {
@@ -931,10 +943,10 @@ fn prompt_install_gpg(
 fn missing_gpg_message(hint: Option<GpgInstallHint>) -> String {
     match hint {
         Some(hint) => format!(
-            "signed commit policy requires `gpg`, but it was not found. Install it with `{}` or disable signing via `autocommit-cli commit --configure-commit-policy`",
+            "signed commit policy requires `gpg`, but it was not found. Install it with `{}` or disable signing via `autocommit commit --configure-commit-policy`",
             hint.render()
         ),
-        None => "signed commit policy requires `gpg`, but it was not found. Install it with your OS package manager or disable signing via `autocommit-cli commit --configure-commit-policy`".to_string(),
+        None => "signed commit policy requires `gpg`, but it was not found. Install it with your OS package manager or disable signing via `autocommit commit --configure-commit-policy`".to_string(),
     }
 }
 

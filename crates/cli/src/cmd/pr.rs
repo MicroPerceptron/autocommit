@@ -175,18 +175,15 @@ pub fn run(args: &[String]) -> Result<String, String> {
             None
         };
 
-        #[cfg(feature = "llama-native")]
-        if let Some(progress) = progress.as_ref() {
-            engine.set_progress_callback(Some(progress.callback()));
-        }
+        let analyze_options = {
+            let mut opts = AnalyzeOptions::default();
+            opts.progress = progress.as_ref().map(|p| p.callback());
+            opts
+        };
 
-        let report = core_run(&engine, &diff_text, &AnalyzeOptions::default())
+        let report = core_run(&engine, &diff_text, &analyze_options)
             .map_err(|err| format!("analysis failed: {err}"))?;
 
-        #[cfg(feature = "llama-native")]
-        {
-            engine.set_progress_callback(None);
-        }
         if let Some(progress) = progress {
             progress.finish();
         }
@@ -481,7 +478,7 @@ enum ParseOutcome<T> {
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "autocommit-cli pr",
+    name = "autocommit pr",
     about = "Generate and optionally create or update a pull request"
 )]
 struct PrArgs {
@@ -534,7 +531,7 @@ struct PrArgs {
 
 impl PrArgs {
     fn parse_from(args: &[String]) -> Result<ParseOutcome<Self>, String> {
-        let argv = std::iter::once("autocommit-cli pr".to_string()).chain(args.iter().cloned());
+        let argv = std::iter::once("autocommit pr".to_string()).chain(args.iter().cloned());
         match Self::try_parse_from(argv) {
             Ok(parsed) => Ok(ParseOutcome::Continue(parsed)),
             Err(err) => {

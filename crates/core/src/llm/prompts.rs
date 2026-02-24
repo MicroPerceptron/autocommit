@@ -54,6 +54,7 @@ Rules:\n\
 - commit_message should reflect the dominant weighted theme (scope + change type), not a single minor edit\n\
 - if scopes/types conflict, prefer the majority pattern shown in scope_distribution and type_distribution\n\
 - do not use backticks in commit_message\n\
+- commit_message and summary must describe the overall intent and outcome, not enumerate individual files or list per-file changes\n\
 - summary must be one sentence about the code change outcome\n\
 - risk_level must be low, medium, or high\n\
 - risk_notes should be concise and concrete\n\

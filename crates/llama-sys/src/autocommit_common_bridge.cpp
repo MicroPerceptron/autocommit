@@ -12,6 +12,7 @@
 #include "arg.h"
 #include "common.h"
 #include "download.h"
+#include "log.h"
 #include "sampling.h"
 
 // common.h defines a global `build_info` string derived from these variables.
@@ -598,4 +599,49 @@ void autocommit_common_sampler_reset(autocommit_common_sampler * sampler) {
     common_sampler_reset(sampler->sampler);
 }
 
+void autocommit_common_log_set_verbosity(int verbosity) {
+    common_log_set_verbosity_thold(verbosity);
+}
+
 } // extern "C"
+
+// --- Hardware-accelerated cosine similarity ---
+
+#ifdef __APPLE__
+#include <Accelerate/Accelerate.h>
+#endif
+
+#include <cmath>
+
+extern "C" float autocommit_cosine_similarity(const float * a, const float * b, int n) {
+    if (n <= 0 || a == nullptr || b == nullptr) {
+        return 0.0f;
+    }
+
+    float dot    = 0.0f;
+    float norm_a = 0.0f;
+    float norm_b = 0.0f;
+
+#ifdef __APPLE__
+    const vDSP_Length len = static_cast<vDSP_Length>(n);
+    // Use vDSP (Accelerate): SIMD-optimized on Apple Silicon.
+    vDSP_dotpr(a, 1, b, 1, &dot, len);
+    vDSP_dotpr(a, 1, a, 1, &norm_a, len);
+    vDSP_dotpr(b, 1, b, 1, &norm_b, len);
+    norm_a = std::sqrt(norm_a);
+    norm_b = std::sqrt(norm_b);
+#else
+    for (int i = 0; i < n; ++i) {
+        dot    += a[i] * b[i];
+        norm_a += a[i] * a[i];
+        norm_b += b[i] * b[i];
+    }
+    norm_a = std::sqrt(norm_a);
+    norm_b = std::sqrt(norm_b);
+#endif
+
+    if (norm_a <= 1e-7f || norm_b <= 1e-7f) {
+        return 0.0f;
+    }
+    return dot / (norm_a * norm_b);
+}

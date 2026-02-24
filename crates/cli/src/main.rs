@@ -6,12 +6,12 @@ use clap::{CommandFactory, Parser, ValueEnum};
 
 #[derive(Parser)]
 #[command(
-    name = "autocommit-cli",
+    name = "autocommit",
     version,
     about = "AI-assisted commit and pull request generation for local git repositories",
     disable_help_flag = true,
     disable_version_flag = true,
-    after_help = "Use `autocommit-cli <command> --help` for command-specific options.\nGlobal flags supported: `--help`, `-h`, `--version`, `-V`."
+    after_help = "Use `autocommit <command> --help` for command-specific options.\nGlobal flags supported: `--help`, `-h`, `--version`, `-V`."
 )]
 struct Cli {
     #[arg(value_name = "COMMAND", value_enum)]
@@ -73,11 +73,11 @@ fn run(args: Vec<String>) -> Result<(), String> {
         return Ok(());
     }
     if matches!(args.as_slice(), [flag] if flag == "-V" || flag == "--version") {
-        println!("autocommit-cli {}", env!("CARGO_PKG_VERSION"));
+        println!("autocommit {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
 
-    let argv = std::iter::once("autocommit-cli".to_string()).chain(args);
+    let argv = std::iter::once("autocommit".to_string()).chain(args);
     let cli = match Cli::try_parse_from(argv) {
         Ok(cli) => cli,
         Err(err) => {
@@ -128,6 +128,6 @@ fn run(args: Vec<String>) -> Result<(), String> {
             print!("{output}");
             Ok(())
         }
-        None => Err("missing command; run `autocommit-cli --help`".to_string()),
+        None => Err("missing command; run `autocommit --help`".to_string()),
     }
 }

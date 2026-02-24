@@ -2,3 +2,8 @@
 members = ["crates/core", "crates/cli", "crates/llama-sys", "crates/llama-runtime"]
 default-members = ["crates/core", "crates/cli"]
 resolver = "2"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true

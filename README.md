@@ -1,117 +1,159 @@
 # autocommit
 
-`autocommit` is a Rust CLI that analyzes local git diffs and drafts high-signal commit and pull request text with an interactive terminal workflow.
+AI-powered commit and pull request generation that runs entirely on your machine. Analyzes local git diffs using a bundled LLM and drafts structured, high-signal commit messages and PR descriptions through an interactive terminal workflow.
+
+No API keys. No cloud. Fully local inference powered by [llama.cpp](https://github.com/ggml-org/llama.cpp).
 
 ## Features
 
-- AI-assisted commit message generation with interactive approve/edit flow.
-- AI-assisted PR title/body generation with branch selection and optional push.
-- Per-repo cache and runtime settings (`.git/autocommit/kv/`).
-- Optional version bump recommendations with apply/skip confirmation.
-- Native local inference path powered by `llama.cpp` (`llama-native` feature).
+- **Commit generation** — analyzes staged/worktree diffs, generates conventional commit messages with interactive approve/edit/cancel flow
+- **PR generation** — generates PR title and body, creates or updates pull requests via `gh`, with branch selection and optional push
+- **Version bump recommendations** — detects manifest files (Cargo.toml, package.json, go.mod, etc.), suggests semver bumps, syncs lockfiles after applying
+- **Local inference** — ships with llama.cpp compiled in, supports Metal (macOS) and CUDA (Linux) acceleration out of the box
+- **Per-repo config** — caches model state and runtime settings under `.git/autocommit/` for fast subsequent runs
 
-## Install
+## Installation
 
-### Prerequisites
+### Pre-built binaries
 
-- Rust toolchain (`cargo`).
-- Git.
-- For `llama-native`: CMake + `libclang` (for `bindgen`), and a C++ toolchain.
+Download from [GitHub Releases](https://github.com/MicroPerceptron/autocommit/releases):
 
-### Install from source (local workspace)
+```sh
+# macOS (Apple Silicon)
+curl -L https://github.com/MicroPerceptron/autocommit/releases/latest/download/autocommit-aarch64-apple-darwin.tar.gz | tar xz
+sudo mv autocommit /usr/local/bin/
 
-- Lightweight build (no native llama runtime):
-  - `cargo install --path crates/cli --locked`
-- Native local inference build:
-  - `cargo install --path crates/cli --locked --features llama-native`
+# macOS (Intel)
+curl -L https://github.com/MicroPerceptron/autocommit/releases/latest/download/autocommit-x86_64-apple-darwin.tar.gz | tar xz
+sudo mv autocommit /usr/local/bin/
 
-### Run without installing
+# Linux (CPU)
+curl -L https://github.com/MicroPerceptron/autocommit/releases/latest/download/autocommit-x86_64-unknown-linux-gnu.tar.gz | tar xz
+sudo mv autocommit /usr/local/bin/
 
-- `cargo run --release -p autocommit-cli -- <command> [options]`
+# Linux (CUDA)
+curl -L https://github.com/MicroPerceptron/autocommit/releases/latest/download/autocommit-x86_64-unknown-linux-gnu-cuda.tar.gz | tar xz
+sudo mv autocommit /usr/local/bin/
+```
 
-## Quickstart
+### cargo binstall
 
-1. Initialize repository cache and model/runtime config:
-   - `autocommit-cli init`
-2. Review or update repository config later:
-   - `autocommit-cli config`
-3. Generate and review a commit:
-   - `autocommit-cli commit`
-4. Generate and review a pull request:
-   - `autocommit-cli pr`
+```sh
+cargo binstall autocommit-cli
+```
 
-For non-interactive runs, use `--yes` and explicit flags (for example `--base`, `--push`).
+### Build from source
 
-## Commands
+Requires: Rust toolchain, Git, CMake, C++17 compiler, libclang
 
-- `autocommit-cli analyze`
-  - Analyze staged/worktree diff and emit a structured report.
-- `autocommit-cli commit`
-  - Generate, review, and create commit messages.
-- `autocommit-cli pr`
-  - Generate PR title/body and create or update PRs.
-- `autocommit-cli init`
-  - Initialize per-repo cache, model config, and commit policy defaults.
-- `autocommit-cli config`
-  - View and update per-repo model/profile/cache settings and commit policy.
-- `autocommit-cli clean`
-  - Remove persisted generation KV cache for the current repo.
-- `autocommit-cli explain-dispatch`
-  - Print dispatch routing explanation for a representative sample.
+```sh
+git clone --recursive https://github.com/MicroPerceptron/autocommit.git
+cd autocommit
+cargo install --path crates/cli --locked --features llama-native
+```
 
-Use generated help for the latest options:
+## Quick start
 
-- `autocommit-cli --help`
-- `autocommit-cli --version`
-- `autocommit-cli <command> --help`
+```sh
+# 1. Initialize — select a model and configure commit policy
+autocommit init
 
-## Model Configuration
+# 2. Make some changes, then generate a commit
+autocommit commit
 
-When built with `llama-native`, runtime model settings can come from:
+# 3. Generate a pull request
+autocommit pr --push
+```
 
-1. Explicit CLI flags (`--model-path`, `--hf-repo`, `--cache-dir`, `--profile`).
-2. Per-repo metadata saved by `autocommit-cli init`.
-3. Runtime defaults (including default HF model selection when unset).
+## Usage
 
-Examples:
+### Commands
 
-- `autocommit-cli commit --hf-repo ggml-org/Qwen3-1.7B-GGUF:Q4_K_M`
-- `autocommit-cli pr --hf-repo ggml-org/gemma-3-1b-it-GGUF:Q8_0 --cache-dir ~/.cache/llama.cpp`
+| Command              | Description                                        |
+| -------------------- | -------------------------------------------------- |
+| `autocommit commit`  | Generate and create a commit from local changes    |
+| `autocommit pr`      | Generate and create/update a pull request          |
+| `autocommit init`    | Initialize per-repo model config and commit policy |
+| `autocommit config`  | View and update per-repo settings                  |
+| `autocommit analyze` | Analyze diff and emit a structured JSON report     |
+| `autocommit clean`   | Remove persisted KV generation cache               |
 
-## Typical Workflows
+Run `autocommit <command> --help` for detailed options.
 
-### Commit (interactive)
+### Common workflows
 
-- `autocommit-cli commit`
+```sh
+# Interactive commit (default)
+autocommit commit
 
-### Commit (non-interactive / CI style)
+# Non-interactive / CI mode
+autocommit commit --yes --no-interactive --staged
 
-- `autocommit-cli commit --yes --no-interactive --staged --dry-run`
+# Dry run — preview without creating a commit
+autocommit commit --dry-run
 
-### PR to a specific base
+# PR targeting a specific base branch
+autocommit pr --base origin/main --push
 
-- `autocommit-cli pr --yes --base origin/dev --push`
+# Use a specific model
+autocommit commit --hf-repo ggml-org/Qwen3-4B-GGUF:Q4_K_M
+```
+
+### Model configuration
+
+Model settings are resolved in order:
+
+1. CLI flags (`--model-path`, `--hf-repo`, `--cache-dir`, `--profile`)
+2. Per-repo metadata saved by `autocommit init`
+3. Runtime defaults
+
+Supported model sources:
+
+- **Hugging Face** — `--hf-repo ggml-org/Qwen3-1.7B-GGUF:Q4_K_M` (auto-downloaded and cached)
+- **Local GGUF** — `--model-path /path/to/model.gguf`
+
+List cached models:
+
+```sh
+autocommit init --list-cached-models
+```
+
+## Architecture
+
+```
+crates/
+  core/           Pure Rust analysis pipeline, dispatch, and diff processing
+  cli/            Terminal application (clap, dialoguer, indicatif)
+  llama-runtime/  Runtime integration layer wrapping llama-sys
+  llama-sys/      Native llama.cpp bindings (CMake build + bindgen FFI)
+third_party/
+  llama.cpp/      Upstream submodule (compiled from source, statically linked)
+```
 
 ## Development
 
-Workspace layout:
+```sh
+# Run tests
+cargo test --workspace --features llama-native
 
-- `crates/core`: shared analysis/pipeline logic.
-- `crates/cli`: terminal application.
-- `crates/llama-runtime`: runtime integration layer.
-- `crates/llama-sys`: native `llama.cpp` integration.
-- `third_party/llama.cpp`: upstream submodule.
+# Lint
+cargo clippy --workspace --features llama-native -- -D warnings
 
-Useful checks:
+# Format
+cargo fmt --all
 
-- `cargo check -p autocommit-cli`
-- `cargo check -p autocommit-cli --features llama-native`
+# Quick check (no native build)
+cargo check -p autocommit-cli
+```
 
 ## Troubleshooting
 
-- `runtime model path is not configured`
-  - Run `autocommit-cli init` or pass `--hf-repo` / `--model-path`.
-- GPG signing failures during commit
-  - Configure commit policy with `autocommit-cli commit --configure-commit-policy`, or set up `gpg` and `user.signingkey`.
-- PR creation errors from `gh`
-  - Ensure `gh auth status` succeeds and the selected base/head actually differ.
+| Problem                                | Solution                                                                     |
+| -------------------------------------- | ---------------------------------------------------------------------------- |
+| `runtime model path is not configured` | Run `autocommit init` or pass `--hf-repo` / `--model-path`                   |
+| GPG signing failures                   | Run `autocommit commit --configure-commit-policy` to adjust signing settings |
+| PR creation errors from `gh`           | Ensure `gh auth status` succeeds and the base/head branches differ           |
+
+## License
+
+MIT

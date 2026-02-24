@@ -478,7 +478,7 @@ enum ParseOutcome<T> {
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "autocommit-cli pr",
+    name = "autocommit pr",
     about = "Generate and optionally create or update a pull request"
 )]
 struct PrArgs {
@@ -531,7 +531,7 @@ struct PrArgs {
 
 impl PrArgs {
     fn parse_from(args: &[String]) -> Result<ParseOutcome<Self>, String> {
-        let argv = std::iter::once("autocommit-cli pr".to_string()).chain(args.iter().cloned());
+        let argv = std::iter::once("autocommit pr".to_string()).chain(args.iter().cloned());
         match Self::try_parse_from(argv) {
             Ok(parsed) => Ok(ParseOutcome::Continue(parsed)),
             Err(err) => {

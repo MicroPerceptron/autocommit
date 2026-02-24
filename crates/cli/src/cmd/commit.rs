@@ -441,7 +441,7 @@ enum ParseOutcome<T> {
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "autocommit-cli commit",
+    name = "autocommit commit",
     about = "Generate and create a commit message from local repository changes"
 )]
 struct CommitArgs {
@@ -488,7 +488,7 @@ struct CommitArgs {
 
 impl CommitArgs {
     fn parse_from(args: &[String]) -> Result<ParseOutcome<Self>, String> {
-        let argv = std::iter::once("autocommit-cli commit".to_string()).chain(args.iter().cloned());
+        let argv = std::iter::once("autocommit commit".to_string()).chain(args.iter().cloned());
         match Self::try_parse_from(argv) {
             Ok(parsed) => Ok(ParseOutcome::Continue(parsed)),
             Err(err) => {
@@ -943,10 +943,10 @@ fn prompt_install_gpg(
 fn missing_gpg_message(hint: Option<GpgInstallHint>) -> String {
     match hint {
         Some(hint) => format!(
-            "signed commit policy requires `gpg`, but it was not found. Install it with `{}` or disable signing via `autocommit-cli commit --configure-commit-policy`",
+            "signed commit policy requires `gpg`, but it was not found. Install it with `{}` or disable signing via `autocommit commit --configure-commit-policy`",
             hint.render()
         ),
-        None => "signed commit policy requires `gpg`, but it was not found. Install it with your OS package manager or disable signing via `autocommit-cli commit --configure-commit-policy`".to_string(),
+        None => "signed commit policy requires `gpg`, but it was not found. Install it with your OS package manager or disable signing via `autocommit commit --configure-commit-policy`".to_string(),
     }
 }
 

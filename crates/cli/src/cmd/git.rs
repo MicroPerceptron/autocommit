@@ -418,7 +418,7 @@ impl Repo {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             if signing_tool_missing(&stderr) {
                 return Err(CoreError::Io(
-                    "git commit signing requires `gpg`, but it is not available. Install `gpg` or disable signing with `autocommit-cli commit --configure-commit-policy`".to_string(),
+                    "git commit signing requires `gpg`, but it is not available. Install `gpg` or disable signing with `autocommit commit --configure-commit-policy`".to_string(),
                 ));
             }
             if signing_secret_key_missing(&stderr) {

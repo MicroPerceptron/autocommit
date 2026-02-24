@@ -40,14 +40,14 @@ enum ParseOutcome<T> {
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "autocommit-cli explain-dispatch",
+    name = "autocommit explain-dispatch",
     about = "Show dispatch policy routing for a representative sample"
 )]
 struct ExplainDispatchArgs {}
 
 impl ExplainDispatchArgs {
     fn parse_from(args: &[String]) -> Result<ParseOutcome<Self>, String> {
-        let argv = std::iter::once("autocommit-cli explain-dispatch".to_string())
+        let argv = std::iter::once("autocommit explain-dispatch".to_string())
             .chain(args.iter().cloned());
         match Self::try_parse_from(argv) {
             Ok(parsed) => Ok(ParseOutcome::Continue(parsed)),

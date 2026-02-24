@@ -533,12 +533,6 @@ impl Engine {
         self.with_runtime(|runtime| runtime.warmup_generation_cache())
     }
 
-    pub fn set_progress_callback(&self, callback: Option<ProgressCallback>) {
-        if let Ok(mut guard) = self.progress.lock() {
-            *guard = callback;
-        }
-    }
-
     fn with_runtime<T>(
         &self,
         f: impl FnOnce(&mut LoadedRuntime) -> Result<T, RuntimeError>,
@@ -786,6 +780,12 @@ impl LlmEngine for Engine {
             None
         } else {
             Some(result)
+        }
+    }
+
+    fn set_progress_callback(&self, callback: Option<ProgressCallback>) {
+        if let Ok(mut guard) = self.progress.lock() {
+            *guard = callback;
         }
     }
 }

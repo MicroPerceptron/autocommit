@@ -1,4 +1,5 @@
 use crate::CoreError;
+use crate::progress::ProgressCallback;
 use crate::types::{AnalysisReport, DiffChunk, DiffStats, DispatchDecision, PartialReport};
 
 pub type EmbeddingVector = Vec<f32>;
@@ -32,4 +33,7 @@ pub trait LlmEngine: Send + Sync {
     fn cosine_similarity(&self, a: &[f32], b: &[f32]) -> Option<f32> {
         crate::dispatch::embedding_gate::cosine_similarity_fallback(a, b)
     }
+
+    /// Set a progress callback for engine-level events (Embedding, Analyze, Reduce).
+    fn set_progress_callback(&self, _callback: Option<ProgressCallback>) {}
 }

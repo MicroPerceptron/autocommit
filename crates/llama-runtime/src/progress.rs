@@ -1,15 +1,5 @@
-use std::sync::Arc;
+// Re-export progress types from core. The canonical definitions live in
+// autocommit_core::progress; this module keeps existing `use crate::progress::*`
+// imports working throughout the crate.
 
-#[derive(Debug, Clone, Copy)]
-pub enum ProgressStage {
-    Embedding,
-    Analyze { completed: usize, total: usize },
-    Reduce,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct ProgressEvent {
-    pub stage: ProgressStage,
-}
-
-pub type ProgressCallback = Arc<dyn Fn(ProgressEvent) + Send + Sync>;
+pub use autocommit_core::progress::{ProgressCallback, ProgressEvent, ProgressStage};

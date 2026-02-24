@@ -8,6 +8,7 @@ use crate::dispatch::{embedding_gate, heuristics, policy};
 use crate::llm::prompts;
 use crate::llm::traits::LlmEngine;
 use crate::pipeline::{fanout, reduce, validate};
+use crate::progress::{self, ProgressCallback, ProgressStage};
 use crate::types::{AnalysisReport, DiffStats, DispatchDecision, DispatchRoute};
 
 /// Default token cap per merged chunk. Prevents merging from creating prompts
@@ -18,10 +19,10 @@ const MERGE_MAX_TOKENS: usize = 4_000;
 /// skip the per-chunk fanout and go straight to a single reduce-style call.
 const SMALL_CHUNK_THRESHOLD: usize = 3;
 
-#[derive(Debug, Clone)]
 pub struct AnalyzeOptions {
     pub embedding_threshold: f32,
     pub anchor_cache_dir: Option<PathBuf>,
+    pub progress: Option<ProgressCallback>,
 }
 
 impl Default for AnalyzeOptions {
@@ -29,7 +30,18 @@ impl Default for AnalyzeOptions {
         Self {
             embedding_threshold: 0.72,
             anchor_cache_dir: None,
+            progress: None,
         }
+    }
+}
+
+impl std::fmt::Debug for AnalyzeOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AnalyzeOptions")
+            .field("embedding_threshold", &self.embedding_threshold)
+            .field("anchor_cache_dir", &self.anchor_cache_dir)
+            .field("progress", &self.progress.as_ref().map(|_| ".."))
+            .finish()
     }
 }
 
@@ -37,6 +49,23 @@ pub fn run(
     engine: &dyn LlmEngine,
     diff_text: &str,
     options: &AnalyzeOptions,
+) -> Result<AnalysisReport, CoreError> {
+    let cb = options.progress.as_ref();
+
+    // Forward the progress callback to the engine for Embedding/Analyze/Reduce events.
+    engine.set_progress_callback(options.progress.clone());
+
+    let result = run_inner(engine, diff_text, options, cb);
+
+    engine.set_progress_callback(None);
+    result
+}
+
+fn run_inner(
+    engine: &dyn LlmEngine,
+    diff_text: &str,
+    options: &AnalyzeOptions,
+    cb: Option<&ProgressCallback>,
 ) -> Result<AnalysisReport, CoreError> {
     let raw_chunks = collect::collect(diff_text);
 
@@ -100,14 +129,20 @@ pub fn run(
     };
 
     let decision = policy::decide(&features, embedding_hint);
+    progress::emit(cb, ProgressStage::Dispatch);
 
     // Merge related chunks by directory scope to reduce fanout call count.
+    let raw_count = raw_chunks.len();
     let chunks = collect::merge_by_scope(raw_chunks, MERGE_MAX_TOKENS);
+    if chunks.len() != raw_count {
+        progress::emit(cb, ProgressStage::Merging { from: raw_count, to: chunks.len() });
+    }
 
     // DraftOnly fast path: skip the reduce inference call.
     if decision.route == DispatchRoute::DraftOnly {
         let partials = fanout::analyze_chunks(engine, &chunks)?;
         let report = reduce::synthesize_draft_report(&partials, &decision, &stats);
+        progress::emit(cb, ProgressStage::DraftSynthesis);
         validate::validate(&report)?;
         return Ok(report);
     }

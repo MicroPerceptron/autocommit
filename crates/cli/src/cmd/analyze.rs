@@ -137,7 +137,16 @@ pub fn run(args: &[String]) -> Result<String, String> {
     #[cfg(not(feature = "llama-native"))]
     let engine: Box<dyn LlmEngine> = Box::new(MockEngine);
 
-    let report = core_run(engine.as_ref(), &diff_text, &AnalyzeOptions::default())
+    let analyze_options = {
+        let mut opts = AnalyzeOptions::default();
+        if let Ok(repo) = git::Repo::discover() {
+            opts.anchor_cache_dir =
+                Some(repo.common_git_dir().join("autocommit/kv"));
+        }
+        opts
+    };
+
+    let report = core_run(engine.as_ref(), &diff_text, &analyze_options)
         .map_err(|err| format!("analysis failed: {err}"))?;
     if let Some(cache_path) = cache_path.as_ref() {
         let _ = report_cache::write_cached_report(cache_path, &cache_key, &report);

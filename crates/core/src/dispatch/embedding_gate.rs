@@ -1,4 +1,5 @@
 use crate::dispatch::heuristics::HeuristicScore;
+use crate::llm::traits::LlmEngine;
 use crate::types::DispatchRoute;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -25,20 +26,36 @@ pub fn should_run_embedding(score: HeuristicScore) -> bool {
     score.borderline
 }
 
-pub fn classify_embedding(
+/// Classify using the engine's cosine similarity (which may be hardware-accelerated).
+pub fn classify_embedding_with_engine(
+    engine: &dyn LlmEngine,
     signal_embedding: &[f32],
     draft_anchor_embedding: &[f32],
     full_anchor_embedding: &[f32],
 ) -> Option<EmbeddingHint> {
-    let draft_similarity = cosine_similarity(signal_embedding, draft_anchor_embedding)?;
-    let full_similarity = cosine_similarity(signal_embedding, full_anchor_embedding)?;
+    let draft_similarity = engine.cosine_similarity(signal_embedding, draft_anchor_embedding)?;
+    let full_similarity = engine.cosine_similarity(signal_embedding, full_anchor_embedding)?;
     Some(EmbeddingHint {
         draft_similarity,
         full_similarity,
     })
 }
 
-fn cosine_similarity(a: &[f32], b: &[f32]) -> Option<f32> {
+pub fn classify_embedding(
+    signal_embedding: &[f32],
+    draft_anchor_embedding: &[f32],
+    full_anchor_embedding: &[f32],
+) -> Option<EmbeddingHint> {
+    let draft_similarity = cosine_similarity_fallback(signal_embedding, draft_anchor_embedding)?;
+    let full_similarity = cosine_similarity_fallback(signal_embedding, full_anchor_embedding)?;
+    Some(EmbeddingHint {
+        draft_similarity,
+        full_similarity,
+    })
+}
+
+/// Pure-Rust cosine similarity used as the default fallback.
+pub fn cosine_similarity_fallback(a: &[f32], b: &[f32]) -> Option<f32> {
     if a.is_empty() || b.is_empty() {
         return None;
     }

@@ -252,7 +252,14 @@ pub fn run(args: &[String]) -> Result<String, String> {
             engine.set_progress_callback(Some(progress.callback()));
         }
 
-        let report = core_run(&engine, &diff_text, &AnalyzeOptions::default())
+        let analyze_options = {
+            let mut opts = AnalyzeOptions::default();
+            opts.anchor_cache_dir =
+                Some(repo.common_git_dir().join("autocommit/kv"));
+            opts
+        };
+
+        let report = core_run(&engine, &diff_text, &analyze_options)
             .map_err(|err| format!("analysis failed: {err}"))?;
 
         #[cfg(feature = "llama-native")]

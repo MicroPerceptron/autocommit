@@ -753,6 +753,41 @@ impl LlmEngine for Engine {
         self.emit_progress(ProgressStage::Embedding);
         Ok(result)
     }
+
+    fn model_fingerprint(&self) -> Option<String> {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = DefaultHasher::new();
+        if let Some(path) = self.runtime_model.local_path.as_ref() {
+            path.to_string_lossy().hash(&mut hasher);
+        }
+        if let Some(repo) = self.runtime_model.hf_repo.as_ref() {
+            repo.hash(&mut hasher);
+        }
+        self.context.profile.hash(&mut hasher);
+        Some(format!("{:016x}", hasher.finish()))
+    }
+
+    fn cosine_similarity(&self, a: &[f32], b: &[f32]) -> Option<f32> {
+        if a.is_empty() || b.is_empty() {
+            return None;
+        }
+        let len = a.len().min(b.len());
+        let result = unsafe {
+            llama_sys::bridge::autocommit_cosine_similarity(
+                a.as_ptr(),
+                b.as_ptr(),
+                len as std::ffi::c_int,
+            )
+        };
+        if result.abs() < f32::EPSILON && len > 0 {
+            // Zero result may indicate degenerate input; return None like the fallback.
+            None
+        } else {
+            Some(result)
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -817,20 +852,19 @@ fn build_reduce_prompt_plan(
     if !type_distribution.is_empty() {
         prompt.push_str(&format!("- type_distribution={type_distribution}\n"));
     }
-    prompt.push_str("Representative items:\n");
+    // Pre-aggregate by scope for more generalized output.
+    let aggregated = aggregate_partials_by_scope(partials, &indices);
+    prompt.push_str("Scope summary:\n");
 
     let mut sampled = 0usize;
-    for idx in indices {
-        if let Some(partial) = partials.get(idx) {
-            if prompt.len() >= max_prompt_chars {
-                break;
-            }
-
-            sampled += 1;
-            prompt.push_str("- ");
-            prompt.push_str(&format_partial_for_reduce(partial));
-            prompt.push('\n');
+    for group in &aggregated {
+        if prompt.len() >= max_prompt_chars {
+            break;
         }
+        sampled += group.count;
+        prompt.push_str("- ");
+        prompt.push_str(&group.display);
+        prompt.push('\n');
     }
 
     if sampled < total {
@@ -986,6 +1020,7 @@ fn reduce_partial_scope_key(partial: &PartialReport) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+#[allow(dead_code)]
 fn format_partial_for_reduce(partial: &PartialReport) -> String {
     let summary = compact_reduce_text(&partial.summary, 220);
     if let Some(item) = partial.items.first() {
@@ -1095,6 +1130,69 @@ fn render_distribution(
         .join(", ")
 }
 
+struct ScopeGroup {
+    display: String,
+    count: usize,
+}
+
+fn aggregate_partials_by_scope(partials: &[PartialReport], indices: &[usize]) -> Vec<ScopeGroup> {
+    use std::collections::BTreeMap;
+
+    // Group selected partials by scope.
+    let mut groups: BTreeMap<String, Vec<&PartialReport>> = BTreeMap::new();
+    for &idx in indices {
+        if let Some(partial) = partials.get(idx) {
+            let scope = reduce_partial_scope_key(partial);
+            groups.entry(scope).or_default().push(partial);
+        }
+    }
+
+    let mut result: Vec<ScopeGroup> = Vec::with_capacity(groups.len());
+    for (scope, items) in &groups {
+        let file_count = items.len();
+
+        // Count type tags within this scope.
+        let mut type_counts: BTreeMap<&str, usize> = BTreeMap::new();
+        let mut titles: Vec<&str> = Vec::new();
+        for partial in items {
+            if let Some(item) = partial.items.first() {
+                let tag = type_tag_prefix(item.type_tag.clone());
+                *type_counts.entry(tag).or_insert(0) += 1;
+                if titles.len() < 2 {
+                    titles.push(item.title.as_str());
+                }
+            }
+        }
+
+        let types_str = type_counts
+            .iter()
+            .map(|(tag, count)| format!("{count} {tag}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let titles_str = titles.join("; ");
+        let titles_compact = if titles_str.len() > 120 {
+            format!("{}...", &titles_str[..117])
+        } else {
+            titles_str
+        };
+
+        let display = format!(
+            "scope={scope} ({file_count} files): {types_str} \u{2014} {titles_compact}"
+        );
+
+        result.push(ScopeGroup {
+            display,
+            count: file_count,
+        });
+    }
+
+    // Sort by count descending (largest scope groups first).
+    result.sort_by(|a, b| b.count.cmp(&a.count));
+    result
+}
+
+#[allow(dead_code)]
 fn compact_reduce_text(value: &str, max_chars: usize) -> String {
     let mut normalized = sanitize_sentence(value);
     if normalized.contains("fallback heuristic due to analyze_error:") {
@@ -1652,13 +1750,13 @@ fn analyze_char_budget(chunk: &DiffChunk, context_window_tokens: usize) -> usize
         return override_chars.clamp(2_000, 16_000);
     }
 
-    let context_cap = context_window_tokens.saturating_mul(3).clamp(2_400, 18_000);
+    let context_cap = context_window_tokens.saturating_mul(3).clamp(2_000, 14_000);
     let density = (chunk.estimated_tokens as f32 / 6_000.0)
         .clamp(0.0, 1.0)
         .sqrt();
-    let raw = 8_600.0 - (3_000.0 * density);
+    let raw = 5_400.0 - (2_000.0 * density);
     let contextual = raw.min((context_cap as f32) * 0.92);
-    contextual.round().clamp(3_600.0, context_cap as f32) as usize
+    contextual.round().clamp(2_400.0, context_cap as f32) as usize
 }
 
 fn compact_diff_for_prompt(text: &str, max_chars: usize) -> String {
@@ -1713,7 +1811,7 @@ fn compact_diff_for_prompt(text: &str, max_chars: usize) -> String {
         }
     }
 
-    let per_hunk_change_budget = ((max_chars / scoped_hunks.len().max(1)) / 95).clamp(4, 16);
+    let per_hunk_change_budget = ((max_chars / scoped_hunks.len().max(1)) / 95).clamp(3, 10);
     for (start, end) in scoped_hunks.iter().copied() {
         let candidates = (start..end)
             .filter(|&idx| is_change_line(lines[idx]))
@@ -1737,7 +1835,7 @@ fn compact_diff_for_prompt(text: &str, max_chars: usize) -> String {
         .collect::<Vec<_>>();
     change_lines += round_robin_fill(&mut out, &lines, &mut used, &mut change_buckets, max_chars);
 
-    let per_hunk_semantic_budget = ((max_chars / scoped_hunks.len().max(1)) / 260).clamp(1, 4);
+    let per_hunk_semantic_budget = ((max_chars / scoped_hunks.len().max(1)) / 260).clamp(1, 2);
     for (start, end) in scoped_hunks.iter().copied() {
         let candidates = (start..end)
             .filter(|&idx| is_semantic_context_line(lines[idx]))

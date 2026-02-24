@@ -1175,7 +1175,14 @@ fn aggregate_partials_by_scope(partials: &[PartialReport], indices: &[usize]) ->
 
         let titles_str = titles.join("; ");
         let titles_compact = if titles_str.len() > 120 {
-            format!("{}...", &titles_str[..117])
+            // Find the largest valid UTF-8 boundary at or before byte index 117.
+            let cutoff = titles_str
+                .char_indices()
+                .take_while(|(i, _)| *i <= 117)
+                .map(|(i, _)| i)
+                .last()
+                .unwrap_or(0);
+            format!("{}...", &titles_str[..cutoff])
         } else {
             titles_str
         };

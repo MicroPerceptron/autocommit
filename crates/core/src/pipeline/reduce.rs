@@ -93,8 +93,8 @@ fn type_tag_prefix(tag: TypeTag) -> &'static str {
         TypeTag::Docs => "docs",
         TypeTag::Test => "test",
         TypeTag::Chore => "chore",
-        TypeTag::Perf => "perf",
-        TypeTag::Style => "style",
+        TypeTag::Perf => "chore",
+        TypeTag::Style => "chore",
         TypeTag::Mixed => "chore",
     }
 }

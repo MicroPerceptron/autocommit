@@ -88,5 +88,7 @@ pub mod bridge {
         pub fn autocommit_common_sampler_reset(sampler: *mut c_void);
 
         pub fn autocommit_cosine_similarity(a: *const f32, b: *const f32, n: c_int) -> f32;
+
+        pub fn autocommit_common_log_set_verbosity(verbosity: c_int);
     }
 }

@@ -12,6 +12,7 @@
 #include "arg.h"
 #include "common.h"
 #include "download.h"
+#include "log.h"
 #include "sampling.h"
 
 // common.h defines a global `build_info` string derived from these variables.
@@ -596,6 +597,10 @@ void autocommit_common_sampler_reset(autocommit_common_sampler * sampler) {
         return;
     }
     common_sampler_reset(sampler->sampler);
+}
+
+void autocommit_common_log_set_verbosity(int verbosity) {
+    common_log_set_verbosity_thold(verbosity);
 }
 
 } // extern "C"

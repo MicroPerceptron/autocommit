@@ -53,6 +53,9 @@ impl BackendGuard {
                     ffi::llama_log_set(None, std::ptr::null_mut());
                 } else {
                     ffi::llama_log_set(Some(silent_llama_log_callback), std::ptr::null_mut());
+                    // Suppress INFO-level logs from llama.cpp's common library (e.g. download.cpp
+                    // "using cached file" messages) which use a separate logging path.
+                    llama_sys::bridge::autocommit_common_log_set_verbosity(0);
                 }
                 // SAFETY: llama backend init is process-global and intended to be called before runtime usage.
                 ffi::llama_backend_init();

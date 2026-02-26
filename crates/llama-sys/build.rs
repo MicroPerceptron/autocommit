@@ -79,6 +79,11 @@ fn detect_sycl() -> bool {
     println!("cargo:rerun-if-env-changed=GGML_SYCL");
     println!("cargo:rerun-if-env-changed=ONEAPI_ROOT");
 
+    // SYCL/oneAPI is Linux-only
+    if !cfg!(target_os = "linux") {
+        return false;
+    }
+
     // Explicit override via GGML_SYCL env var (supports ON/OFF)
     if let Ok(val) = env::var("GGML_SYCL") {
         return matches!(val.to_ascii_lowercase().as_str(), "1" | "on" | "true");
@@ -86,11 +91,6 @@ fn detect_sycl() -> bool {
 
     // If the user explicitly requested another backend, skip SYCL auto-detection.
     if another_backend_explicitly_requested("GGML_SYCL") {
-        return false;
-    }
-
-    // SYCL/oneAPI is Linux-only
-    if cfg!(target_os = "macos") {
         return false;
     }
 
@@ -440,8 +440,14 @@ fn emit_sycl_link_deps() {
 }
 
 fn emit_vulkan_link_deps() {
-    // Vulkan links dynamically via libvulkan (provided by GPU drivers)
-    println!("cargo:rustc-link-lib=dylib=vulkan");
+    // Vulkan links dynamically via the Vulkan loader (provided by GPU drivers)
+    if cfg!(target_os = "windows") {
+        // On Windows the loader import library is typically vulkan-1.lib
+        println!("cargo:rustc-link-lib=dylib=vulkan-1");
+    } else {
+        // On Unix-like systems the loader is usually libvulkan.so
+        println!("cargo:rustc-link-lib=dylib=vulkan");
+    }
 }
 
 fn emit_link_libs_from_dir(dir: &Path) {

@@ -56,11 +56,11 @@ jobs:
 
       - name: Install deps (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y cmake libclang-dev pkg-config libssl-dev
+        run: sudo apt-get update && sudo apt-get install -y cmake libclang-dev pkg-config libssl-dev libopenblas-dev
 
       - name: Install CUDA toolkit
         if: matrix.cuda
-        uses: Jimver/cuda-toolkit@v0.2.19
+        uses: Jimver/cuda-toolkit@v0.2.22
         with:
           cuda: "12.6.3"
           method: network

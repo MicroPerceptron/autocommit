@@ -48,7 +48,7 @@ jobs:
 
       - name: Install deps (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y cmake libclang-dev pkg-config libssl-dev
+        run: sudo apt-get update && sudo apt-get install -y cmake libclang-dev pkg-config libssl-dev libopenblas-dev
 
       - name: Install Vulkan SDK
         if: matrix.vulkan
@@ -87,7 +87,7 @@ jobs:
 
       - name: Install deps (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y cmake libclang-dev pkg-config libssl-dev
+        run: sudo apt-get update && sudo apt-get install -y cmake libclang-dev pkg-config libssl-dev libopenblas-dev
 
       - name: Install deps (macOS)
         if: runner.os == 'macOS'

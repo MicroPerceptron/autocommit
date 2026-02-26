@@ -217,6 +217,7 @@ fn main() {
             install_dir.to_string_lossy()
         ))
         .arg("-DBUILD_SHARED_LIBS=OFF")
+        .arg("-DCMAKE_POSITION_INDEPENDENT_CODE=ON")
         .arg("-DLLAMA_BUILD_COMMON=ON")
         .arg("-DLLAMA_BUILD_TESTS=OFF")
         .arg("-DLLAMA_BUILD_EXAMPLES=OFF")
@@ -235,6 +236,13 @@ fn main() {
     }
     if use_vulkan {
         configure.arg("-DGGML_VULKAN=ON");
+    }
+    // Enable OpenBLAS for CPU GEMM on x86 Linux (non-SYCL builds).
+    // SYCL already links MKL which provides BLAS. macOS uses Accelerate by default.
+    #[cfg(target_os = "linux")]
+    if !use_sycl {
+        configure.arg("-DGGML_BLAS=ON");
+        configure.arg("-DGGML_BLAS_VENDOR=OpenBLAS");
     }
     if cfg!(target_os = "macos") {
         let deployment_target = env::var("MACOSX_DEPLOYMENT_TARGET")
@@ -274,6 +282,11 @@ fn main() {
     }
     if use_vulkan {
         emit_vulkan_link_deps();
+    }
+    // Link OpenBLAS on Linux when BLAS is enabled (non-SYCL builds).
+    #[cfg(target_os = "linux")]
+    if !use_sycl {
+        println!("cargo:rustc-link-lib=dylib=openblas");
     }
 
     println!(
@@ -373,6 +386,9 @@ fn emit_link_search_paths(install_dir: &Path) {
     #[cfg(target_os = "linux")]
     {
         println!("cargo:rustc-link-lib=dylib=stdc++");
+        // llama.cpp enables OpenMP for the CPU backend on Linux by default.
+        // The static archives contain GOMP symbols that need the runtime.
+        println!("cargo:rustc-link-lib=dylib=gomp");
     }
 }
 

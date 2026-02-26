@@ -84,7 +84,7 @@ dependencies = [
 
 [[package]]
 name = "autocommit-cli"
-version = "0.15.1"
+version = "0.16.0"
 dependencies = [
  "autocommit-core",
  "clap",
@@ -98,7 +98,7 @@ dependencies = [
 
 [[package]]
 name = "autocommit-core"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1407,7 +1407,7 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "llama-runtime"
-version = "0.9.1"
+version = "0.10.0"
 dependencies = [
  "autocommit-core",
  "llama-sys",
@@ -1417,7 +1417,7 @@ dependencies = [
 
 [[package]]
 name = "llama-sys"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "bindgen",
  "cc",

@@ -50,8 +50,8 @@ fn main() {
 }
 
 fn run(args: Vec<String>) -> Result<(), String> {
-    if let Some(first) = args.first() {
-        if first == "help" {
+    if let Some(first) = args.first()
+        && first == "help" {
             if args.len() == 1 {
                 let mut cmd = Cli::command();
                 cmd.print_help()
@@ -63,7 +63,6 @@ fn run(args: Vec<String>) -> Result<(), String> {
             forwarded.extend(args.iter().skip(2).cloned());
             return run(forwarded);
         }
-    }
 
     if args.is_empty() || matches!(args.as_slice(), [flag] if flag == "-h" || flag == "--help") {
         let mut cmd = Cli::command();

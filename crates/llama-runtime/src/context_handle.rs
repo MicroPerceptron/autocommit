@@ -361,7 +361,7 @@ impl ContextHandle {
             ffi::llama_set_warmup(self.ptr, true);
         }
 
-        let result = (|| {
+        let result = {
             let mut tokens = Vec::with_capacity(2);
             let bos = unsafe {
                 // SAFETY: model vocabulary pointer is valid for the context lifetime.
@@ -383,7 +383,7 @@ impl ContextHandle {
             }
 
             self.decode_prompt_tokens(&tokens, 0)
-        })();
+        };
 
         unsafe {
             // SAFETY: context pointer is valid while handle is alive.

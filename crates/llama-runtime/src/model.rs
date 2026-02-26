@@ -112,8 +112,8 @@ impl LoadedRuntime {
         if self.generation_ctx.is_none() {
             let mut ctx = ContextHandle::new_generation(Arc::clone(&self.model), self.cpu_only)?;
 
-            if let Some(state_path) = self.generation_state_path.as_deref() {
-                if state_path.is_file() {
+            if let Some(state_path) = self.generation_state_path.as_deref()
+                && state_path.is_file() {
                     match ctx.load_state_file(state_path) {
                         Ok(tokens) => ctx.set_session_tokens(tokens),
                         Err(err) => {
@@ -126,7 +126,6 @@ impl LoadedRuntime {
                         }
                     }
                 }
-            }
 
             self.generation_ctx = Some(ctx);
         }
@@ -153,14 +152,13 @@ impl LoadedRuntime {
             return;
         }
 
-        if let Err(err) = generation_ctx.save_state_file(state_path, &tokens) {
-            if llama_logs_enabled() {
+        if let Err(err) = generation_ctx.save_state_file(state_path, &tokens)
+            && llama_logs_enabled() {
                 eprintln!(
                     "autocommit warning: failed to save generation state to {}: {err}",
                     state_path.display()
                 );
             }
-        }
     }
 
     fn embed(&mut self, text: &str) -> Result<Vec<f32>, RuntimeError> {
@@ -1198,7 +1196,7 @@ fn aggregate_partials_by_scope(partials: &[PartialReport], indices: &[usize]) ->
     }
 
     // Sort by count descending (largest scope groups first).
-    result.sort_by(|a, b| b.count.cmp(&a.count));
+    result.sort_by_key(|a| std::cmp::Reverse(a.count));
     result
 }
 
@@ -1288,12 +1286,11 @@ fn salvage_reduce_output(raw: &str) -> Option<ReduceModelOutput> {
         } else {
             normalize_commit_message(&cleaned)
         };
-        if commit_message.is_none() {
-            if let Some(commit) = normalized_commit {
+        if commit_message.is_none()
+            && let Some(commit) = normalized_commit {
                 commit_message = Some(commit);
                 continue;
             }
-        }
 
         if summary.is_none() {
             let summary_candidate = if let Some(rest) = lowered
@@ -1640,11 +1637,10 @@ fn extract_json_like_field(raw: &str, key: &str) -> Option<String> {
 
         if bytes[i] == b'"' {
             if let Some(end) = find_string_end(bytes, i + 1) {
-                if let Some(slice) = raw.get(i..=end) {
-                    if let Ok(parsed) = serde_json::from_str::<String>(slice) {
+                if let Some(slice) = raw.get(i..=end)
+                    && let Ok(parsed) = serde_json::from_str::<String>(slice) {
                         return Some(parsed.trim().to_string());
                     }
-                }
                 if let Some(fallback) = raw.get((i + 1)..end) {
                     return Some(fallback.trim().to_string());
                 }
@@ -1682,7 +1678,7 @@ fn find_string_end(bytes: &[u8], mut idx: usize) -> Option<usize> {
                 slash_count += 1;
                 back -= 1;
             }
-            if slash_count % 2 == 0 {
+            if slash_count.is_multiple_of(2) {
                 return Some(idx);
             }
         }
@@ -1911,11 +1907,10 @@ fn extract_hunk_ranges(lines: &[&str]) -> Vec<(usize, usize)> {
             if let Some(start) = current_start.replace(idx) {
                 out.push((start, idx));
             }
-        } else if line.starts_with("diff --git ") {
-            if let Some(start) = current_start.take() {
+        } else if line.starts_with("diff --git ")
+            && let Some(start) = current_start.take() {
                 out.push((start, idx));
             }
-        }
     }
 
     if let Some(start) = current_start {
@@ -2042,11 +2037,10 @@ fn append_head_tail_with_limit(text: &str, out: &mut String, max_chars: usize) {
             return;
         }
     }
-    if head + tail < lines.len() {
-        if !push_line_with_limit(out, "...", max_chars) {
+    if head + tail < lines.len()
+        && !push_line_with_limit(out, "...", max_chars) {
             return;
         }
-    }
     for line in lines.iter().copied().skip(lines.len().saturating_sub(tail)) {
         if !push_line_with_limit(out, line, max_chars) {
             return;
@@ -2536,14 +2530,13 @@ fn merge_summary_subject(first: &str, second: &str) -> String {
     let first_token = leading_action_token(first);
     let second_token = leading_action_token(second);
 
-    if let (Some(a), Some(b)) = (first_token.as_deref(), second_token.as_deref()) {
-        if a == b && is_mergeable_action_token(a) {
+    if let (Some(a), Some(b)) = (first_token.as_deref(), second_token.as_deref())
+        && a == b && is_mergeable_action_token(a) {
             let suffix = drop_leading_action_token(second, a).trim();
             if !suffix.is_empty() {
                 return decapitalize_first(suffix);
             }
         }
-    }
 
     decapitalize_first(second)
 }
@@ -2775,7 +2768,7 @@ fn subject_quality_bonus(subject: &str) -> f32 {
     let word_count = lower.split_whitespace().count();
     if (3..=12).contains(&word_count) {
         score += 0.04;
-    } else if word_count < 2 || word_count > 16 {
+    } else if !(2..=16).contains(&word_count) {
         score -= 0.06;
     }
 
@@ -3087,7 +3080,7 @@ fn looks_like_reducer_meta(value: &str) -> bool {
         .split(|ch: char| !ch.is_ascii_alphanumeric())
         .filter(|token| !token.is_empty())
         .collect::<Vec<_>>();
-    let contains_word = |needle: &str| tokens.iter().any(|token| *token == needle);
+    let contains_word = |needle: &str| tokens.contains(&needle);
 
     let has_analysis = contains_word("analysis") || contains_word("analyses");
     let has_report = contains_word("report") || contains_word("reports");
@@ -3103,10 +3096,9 @@ fn looks_like_reducer_meta(value: &str) -> bool {
         || contains_word("synthesized")
         || contains_word("synthesizes");
 
-    (has_partial && has_analysis)
-        || (has_chunk && has_analysis)
-        || (lower.contains("consolidated report"))
-        || (lower.contains("adaptive reducer"))
+    ((has_partial || has_chunk) && has_analysis)
+        || lower.contains("consolidated report")
+        || lower.contains("adaptive reducer")
         || (has_reduce && (has_analysis || has_report || has_chunk || has_partial))
         || (has_synthesis && (has_analysis || has_report || has_chunk))
 }
@@ -3121,7 +3113,7 @@ fn normalize_reduce_summary(raw: &str) -> Option<String> {
     }
 
     let summary = summary
-        .trim_end_matches(|ch: char| ch == '"' || ch == '\'' || ch == '`')
+        .trim_end_matches(['"', '\'', '`'])
         .trim()
         .to_string();
     if summary.len() < 8 {

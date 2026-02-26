@@ -231,7 +231,9 @@ fn format_cached_models(listing: &llama_runtime::CachedModelList) -> String {
 }
 
 #[cfg(feature = "llama-native")]
-fn prompt_model_selection() -> Result<(Option<String>, Option<String>, Option<String>), String> {
+type ModelSelection = (Option<String>, Option<String>, Option<String>);
+
+fn prompt_model_selection() -> Result<ModelSelection, String> {
     let theme = ColorfulTheme::default();
     let term = Term::stderr();
 

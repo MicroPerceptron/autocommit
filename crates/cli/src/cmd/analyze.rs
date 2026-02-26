@@ -63,12 +63,11 @@ pub fn run(args: &[String]) -> Result<String, String> {
     let repo_paths = repo_cache::maybe_discover_repo_kv_paths();
 
     #[cfg(feature = "llama-native")]
-    if model_path.is_none()
+    if (model_path.is_none()
         || model_hf_repo.is_none()
         || model_cache_dir.is_none()
-        || !runtime_profile_overridden
-    {
-        if let Some(metadata) = repo_paths.as_ref().and_then(repo_cache::read_metadata) {
+        || !runtime_profile_overridden)
+        && let Some(metadata) = repo_paths.as_ref().and_then(repo_cache::read_metadata) {
             if model_path.is_none() && model_hf_repo.is_none() {
                 model_path = metadata.model_path.clone();
                 model_hf_repo = metadata.model_hf_repo.clone();
@@ -80,11 +79,10 @@ pub fn run(args: &[String]) -> Result<String, String> {
                 runtime_profile = metadata.profile;
             }
         }
-    }
 
     let diff_text = load_diff(diff_file.as_deref()).map_err(|err| err.to_string())?;
-    if let Ok(repo) = git::Repo::discover() {
-        if let Some(cache_dir) = repo
+    if let Ok(repo) = git::Repo::discover()
+        && let Some(cache_dir) = repo
             .common_git_dir()
             .join("autocommit/kv/partials")
             .to_str()
@@ -93,22 +91,20 @@ pub fn run(args: &[String]) -> Result<String, String> {
                 std::env::set_var("AUTOCOMMIT_PARTIAL_CACHE_DIR", cache_dir);
             }
         }
-    }
 
     let diff_hash = report_cache::diff_hash(&diff_text);
     let cache_key = report_cache::cache_key("analyze", runtime_profile.as_str(), &diff_hash);
     let cache_path = git::Repo::discover()
         .ok()
         .map(|repo| report_cache::cache_path(repo.common_git_dir()));
-    if let Some(cache_path) = cache_path.as_ref() {
-        if let Some(report) = report_cache::read_cached_report(cache_path, &cache_key) {
+    if let Some(cache_path) = cache_path.as_ref()
+        && let Some(report) = report_cache::read_cached_report(cache_path, &cache_key) {
             return if json {
                 output::json::to_pretty_json(&report).map_err(|err| err.to_string())
             } else {
                 Ok(output::text::render_report(&report))
             };
         }
-    }
 
     #[cfg(feature = "llama-native")]
     let generation_state = repo_paths.map(|paths| paths.generation_state);

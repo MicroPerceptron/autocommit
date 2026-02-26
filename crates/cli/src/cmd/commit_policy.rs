@@ -309,11 +309,10 @@ fn is_conventional_subject(subject: &str) -> bool {
     if !is_valid_type(type_part) {
         return false;
     }
-    if let Some(scope) = scope_part {
-        if !is_valid_scope(scope) {
+    if let Some(scope) = scope_part
+        && !is_valid_scope(scope) {
             return false;
         }
-    }
     true
 }
 

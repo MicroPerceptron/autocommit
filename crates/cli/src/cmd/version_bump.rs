@@ -289,14 +289,13 @@ fn build_recommendation(
         previous_version.and_then(parse_semver),
     );
 
-    if let (Some(previous), Some(current)) = (previous_semver, current_semver) {
-        if current > previous {
+    if let (Some(previous), Some(current)) = (previous_semver, current_semver)
+        && current > previous {
             let actual = bump_distance(previous, current);
-            if let Some(actual) = actual {
-                if actual >= level {
+            if let Some(actual) = actual
+                && actual >= level {
                     return None;
                 }
-            }
             let suggested = previous.bump(level);
             // Pre-1.0 major collapses to minor, so the user's actual version
             // may already meet or exceed the suggestion even when bump levels
@@ -320,7 +319,6 @@ fn build_recommendation(
                 kind,
             });
         }
-    }
 
     if let Some(current) = current_semver {
         let suggested = current.bump(level).to_string();
@@ -364,11 +362,10 @@ fn build_go_mod_recommendation(
     let previous_major = previous_version
         .and_then(parse_semver)
         .map(|semver| semver.major);
-    if let Some(prev) = previous_major {
-        if info.major > prev {
+    if let Some(prev) = previous_major
+        && info.major > prev {
             return None;
         }
-    }
 
     let target_major = if info.major < 2 { 2 } else { info.major + 1 };
     let suggested = format!("v{target_major}");
@@ -1252,13 +1249,12 @@ fn replace_toml_key_in_section(
             continue;
         }
 
-        if current_section.as_deref() == Some(section) {
-            if let Some(next) = replace_assignment_line(line, key, suggested_version, style) {
+        if current_section.as_deref() == Some(section)
+            && let Some(next) = replace_assignment_line(line, key, suggested_version, style) {
                 lines.push(next);
                 changed = true;
                 continue;
             }
-        }
         lines.push(line.to_string());
     }
 
@@ -1515,13 +1511,11 @@ fn parse_go_mod_info(content: &str) -> Option<GoModInfo> {
 }
 
 fn parse_go_mod_path_major(module_path: &str) -> (&str, Option<u64>, bool) {
-    if let Some((base, suffix)) = module_path.rsplit_once("/v") {
-        if let Ok(major) = suffix.parse::<u64>() {
-            if major >= 2 {
+    if let Some((base, suffix)) = module_path.rsplit_once("/v")
+        && let Ok(major) = suffix.parse::<u64>()
+            && major >= 2 {
                 return (base, Some(major), true);
             }
-        }
-    }
     (module_path, None, false)
 }
 

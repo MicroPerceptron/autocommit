@@ -71,13 +71,12 @@ impl Repo {
             append_index_worktree_patch(&self.inner, &mut pipeline, index_state, &mut out, item)?;
         }
 
-        if let Some(mut outcome) = iter.into_outcome() {
-            if let Some(result) = outcome.write_changes() {
+        if let Some(mut outcome) = iter.into_outcome()
+            && let Some(result) = outcome.write_changes() {
                 result.map_err(|err| {
                     CoreError::Io(format!("failed to update index metadata: {err}"))
                 })?;
             }
-        }
 
         Ok(out)
     }
@@ -568,13 +567,12 @@ impl Repo {
             apply_index_worktree_change(&mut pipeline, index_state, &mut editor, item)?;
         }
 
-        if let Some(mut outcome) = iter.into_outcome() {
-            if let Some(result) = outcome.write_changes() {
+        if let Some(mut outcome) = iter.into_outcome()
+            && let Some(result) = outcome.write_changes() {
                 result.map_err(|err| {
                     CoreError::Io(format!("failed to update index metadata: {err}"))
                 })?;
             }
-        }
 
         editor
             .write()
@@ -785,8 +783,8 @@ fn append_index_worktree_patch(
             ..
         } => {
             let dst_path = dirwalk_entry.rela_path.as_bstr();
-            if !copy {
-                if let gix::status::index_worktree::RewriteSource::RewriteFromIndex {
+            if !copy
+                && let gix::status::index_worktree::RewriteSource::RewriteFromIndex {
                     source_rela_path,
                     source_entry,
                     ..
@@ -801,7 +799,6 @@ fn append_index_worktree_patch(
                         None,
                     )?;
                 }
-            }
 
             if let Some((new_id, _, _)) = pipeline
                 .worktree_file_to_object(dst_path, index)
@@ -862,8 +859,8 @@ fn apply_index_worktree_change(
             copy,
             ..
         } => {
-            if !copy {
-                if let gix::status::index_worktree::RewriteSource::RewriteFromIndex {
+            if !copy
+                && let gix::status::index_worktree::RewriteSource::RewriteFromIndex {
                     source_rela_path,
                     ..
                 } = source
@@ -872,7 +869,6 @@ fn apply_index_worktree_change(
                         CoreError::Io(format!("failed to remove tree entry: {err}"))
                     })?;
                 }
-            }
             upsert_worktree_path(pipeline, index, editor, dirwalk_entry.rela_path.as_bstr())?;
         }
     }

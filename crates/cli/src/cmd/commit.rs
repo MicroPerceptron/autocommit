@@ -87,12 +87,11 @@ pub fn run(args: &[String]) -> Result<String, String> {
     let repo_metadata = repo_paths.as_ref().and_then(repo_cache::read_metadata);
 
     #[cfg(feature = "llama-native")]
-    if model_path.is_none()
+    if (model_path.is_none()
         || model_hf_repo.is_none()
         || model_cache_dir.is_none()
-        || !runtime_profile_overridden
-    {
-        if let Some(metadata) = repo_metadata.as_ref() {
+        || !runtime_profile_overridden)
+        && let Some(metadata) = repo_metadata.as_ref() {
             if model_path.is_none() && model_hf_repo.is_none() {
                 model_path = metadata.model_path.clone();
                 model_hf_repo = metadata.model_hf_repo.clone();
@@ -104,7 +103,6 @@ pub fn run(args: &[String]) -> Result<String, String> {
                 runtime_profile = metadata.profile.clone();
             }
         }
-    }
 
     #[cfg(feature = "llama-native")]
     let mut commit_policy_config = repo_metadata
@@ -247,12 +245,10 @@ pub fn run(args: &[String]) -> Result<String, String> {
             None
         };
 
-        let analyze_options = {
-            let mut opts = AnalyzeOptions::default();
-            opts.anchor_cache_dir =
-                Some(repo.common_git_dir().join("autocommit/kv"));
-            opts.progress = progress.as_ref().map(|p| p.callback());
-            opts
+        let analyze_options = AnalyzeOptions {
+            anchor_cache_dir: Some(repo.common_git_dir().join("autocommit/kv")),
+            progress: progress.as_ref().map(|p| p.callback()),
+            ..Default::default()
         };
 
         let report = core_run(&engine, &diff_text, &analyze_options)
@@ -1009,14 +1005,13 @@ fn list_gpg_secret_keys() -> Result<Vec<GpgSecretKey>, CoreError> {
                 });
             }
             "fpr" => {
-                if let Some(key) = current.as_mut() {
-                    if key.fingerprint.is_none() {
+                if let Some(key) = current.as_mut()
+                    && key.fingerprint.is_none() {
                         let value = fields.get(9).copied().unwrap_or_default().trim();
                         if !value.is_empty() {
                             key.fingerprint = Some(value.to_string());
                         }
                     }
-                }
             }
             "uid" => {
                 if let Some(key) = current.as_mut() {
@@ -1509,7 +1504,7 @@ fn infer_embedding_bump_level(
         let similarity = cosine_similarity(&signal_embedding, &anchor_embedding)?;
         match best {
             Some((_, current)) if current >= similarity => {
-                if runner_up.map_or(true, |value| similarity > value) {
+                if runner_up.is_none_or(|value| similarity > value) {
                     runner_up = Some(similarity);
                 }
             }
@@ -2366,7 +2361,7 @@ fn clamp_words(value: &str, max_chars: usize) -> (String, bool) {
 fn ends_with_dangling_joiner(value: &str) -> bool {
     let cleaned = value
         .trim()
-        .trim_end_matches(|ch: char| matches!(ch, '.' | ',' | ';' | ':' | '!' | '?'))
+        .trim_end_matches(['.', ',', ';', ':', '!', '?'])
         .to_ascii_lowercase();
     if cleaned.is_empty() {
         return false;
@@ -2408,7 +2403,7 @@ fn ends_with_dangling_joiner(value: &str) -> bool {
 }
 
 fn rebalance_backticks(value: &str) -> String {
-    if value.matches('`').count() % 2 == 0 {
+    if value.matches('`').count().is_multiple_of(2) {
         value.to_string()
     } else {
         value.replace('`', "")

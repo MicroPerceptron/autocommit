@@ -59,7 +59,8 @@ pub fn analyze_chunks(
             .collect();
     }
 
-    let results: Arc<Mutex<Vec<Option<Result<PartialReport, CoreError>>>>> =
+    type FanoutResults = Vec<Option<Result<PartialReport, CoreError>>>;
+    let results: Arc<Mutex<FanoutResults>> =
         Arc::new(Mutex::new((0..chunks.len()).map(|_| None).collect()));
 
     std::thread::scope(|scope| {

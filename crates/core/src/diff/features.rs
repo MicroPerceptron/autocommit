@@ -10,8 +10,10 @@ pub struct DiffFeatures {
 }
 
 pub fn extract(chunks: &[DiffChunk]) -> DiffFeatures {
-    let mut features = DiffFeatures::default();
-    features.files_changed = chunks.len();
+    let mut features = DiffFeatures {
+        files_changed: chunks.len(),
+        ..Default::default()
+    };
 
     for chunk in chunks {
         features.hunks += chunk.ranges.len();

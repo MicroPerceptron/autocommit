@@ -84,12 +84,11 @@ pub fn run(args: &[String]) -> Result<String, String> {
     let repo_paths = repo_cache::maybe_discover_repo_kv_paths();
 
     #[cfg(feature = "llama-native")]
-    if model_path.is_none()
+    if (model_path.is_none()
         || model_hf_repo.is_none()
         || model_cache_dir.is_none()
-        || !runtime_profile_overridden
-    {
-        if let Some(metadata) = repo_paths.as_ref().and_then(repo_cache::read_metadata) {
+        || !runtime_profile_overridden)
+        && let Some(metadata) = repo_paths.as_ref().and_then(repo_cache::read_metadata) {
             if model_path.is_none() && model_hf_repo.is_none() {
                 model_path = metadata.model_path.clone();
                 model_hf_repo = metadata.model_hf_repo.clone();
@@ -101,7 +100,6 @@ pub fn run(args: &[String]) -> Result<String, String> {
                 runtime_profile = metadata.profile;
             }
         }
-    }
 
     let repo = run_step(
         rich_interactive,
@@ -175,10 +173,9 @@ pub fn run(args: &[String]) -> Result<String, String> {
             None
         };
 
-        let analyze_options = {
-            let mut opts = AnalyzeOptions::default();
-            opts.progress = progress.as_ref().map(|p| p.callback());
-            opts
+        let analyze_options = AnalyzeOptions {
+            progress: progress.as_ref().map(|p| p.callback()),
+            ..Default::default()
         };
 
         let report = core_run(&engine, &diff_text, &analyze_options)
@@ -883,11 +880,10 @@ fn resolve_pr_branches(
 }
 
 fn pick_default_base(branches: &[String], remote_default: Option<&str>) -> Option<String> {
-    if let Some(default) = remote_default {
-        if branches.iter().any(|branch| branch == default) {
+    if let Some(default) = remote_default
+        && branches.iter().any(|branch| branch == default) {
             return Some(default.to_string());
         }
-    }
     for candidate in ["main", "master", "trunk", "develop"] {
         let remote_candidate = format!("origin/{candidate}");
         if branches.iter().any(|branch| branch == &remote_candidate) {
@@ -1294,7 +1290,7 @@ fn clamp_words(value: &str, max_chars: usize) -> (String, bool) {
 fn ends_with_dangling_joiner(value: &str) -> bool {
     let cleaned = value
         .trim()
-        .trim_end_matches(|ch: char| matches!(ch, '.' | ',' | ';' | ':' | '!' | '?'))
+        .trim_end_matches(['.', ',', ';', ':', '!', '?'])
         .to_ascii_lowercase();
     if cleaned.is_empty() {
         return false;
@@ -1336,7 +1332,7 @@ fn ends_with_dangling_joiner(value: &str) -> bool {
 }
 
 fn rebalance_backticks(value: &str) -> String {
-    if value.matches('`').count() % 2 == 0 {
+    if value.matches('`').count().is_multiple_of(2) {
         value.to_string()
     } else {
         value.replace('`', "")

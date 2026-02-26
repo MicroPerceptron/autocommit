@@ -40,11 +40,11 @@ fn detect_cuda() -> bool {
 
     // Auto-detect CUDA Toolkit via CUDA_PATH (set by NVIDIA installer on Windows,
     // commonly set on Linux too)
-    if let Ok(cuda_path) = env::var("CUDA_PATH") {
-        if Path::new(&cuda_path).exists() {
-            println!("cargo:warning=CUDA auto-detected via CUDA_PATH={cuda_path}");
-            return true;
-        }
+    if let Ok(cuda_path) = env::var("CUDA_PATH")
+        && Path::new(&cuda_path).exists()
+    {
+        println!("cargo:warning=CUDA auto-detected via CUDA_PATH={cuda_path}");
+        return true;
     }
 
     // On Linux, check the conventional /usr/local/cuda path
@@ -70,11 +70,11 @@ fn detect_sycl() -> bool {
         return false;
     }
 
-    if let Ok(oneapi_root) = env::var("ONEAPI_ROOT") {
-        if Path::new(&oneapi_root).exists() {
-            println!("cargo:warning=SYCL auto-detected via ONEAPI_ROOT={oneapi_root}");
-            return true;
-        }
+    if let Ok(oneapi_root) = env::var("ONEAPI_ROOT")
+        && Path::new(&oneapi_root).exists()
+    {
+        println!("cargo:warning=SYCL auto-detected via ONEAPI_ROOT={oneapi_root}");
+        return true;
     }
 
     false
@@ -94,12 +94,12 @@ fn detect_vulkan() -> bool {
 
 fn find_intel_compiler(name: &str) -> PathBuf {
     // Check if it's on PATH (user sourced setvars.sh)
-    if let Ok(output) = Command::new("which").arg(name).output() {
-        if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path.is_empty() {
-                return PathBuf::from(path);
-            }
+    if let Ok(output) = Command::new("which").arg(name).output()
+        && output.status.success()
+    {
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !path.is_empty() {
+            return PathBuf::from(path);
         }
     }
 
@@ -337,14 +337,13 @@ fn emit_link_search_paths(install_dir: &Path) {
         if let Ok(output) = Command::new("clang")
             .arg("--print-resource-dir")
             .output()
+            && output.status.success()
         {
-            if output.status.success() {
-                let resource_dir = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                let rt_lib_dir = PathBuf::from(&resource_dir).join("lib").join("darwin");
-                if rt_lib_dir.is_dir() {
-                    println!("cargo:rustc-link-search=native={}", rt_lib_dir.display());
-                    println!("cargo:rustc-link-lib=static=clang_rt.osx");
-                }
+            let resource_dir = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let rt_lib_dir = PathBuf::from(&resource_dir).join("lib").join("darwin");
+            if rt_lib_dir.is_dir() {
+                println!("cargo:rustc-link-search=native={}", rt_lib_dir.display());
+                println!("cargo:rustc-link-lib=static=clang_rt.osx");
             }
         }
     }

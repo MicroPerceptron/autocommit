@@ -122,7 +122,7 @@ fn scope_from_path(path: &str) -> Option<String> {
     }
 }
 
-fn trim_type_prefix<'a>(type_prefix: &str, description: &'a str) -> String {
+fn trim_type_prefix(type_prefix: &str, description: &str) -> String {
     let lower = description.to_ascii_lowercase();
     let prefix_with_space = format!("{type_prefix} ");
     if lower.starts_with(&prefix_with_space) {

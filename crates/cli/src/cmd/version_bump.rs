@@ -297,14 +297,20 @@ fn build_recommendation(
                     return None;
                 }
             }
-            let suggested = previous.bump(level).to_string();
+            let suggested = previous.bump(level);
+            // Pre-1.0 major collapses to minor, so the user's actual version
+            // may already meet or exceed the suggestion even when bump levels
+            // don't compare equal. Check the concrete versions.
+            if current >= suggested {
+                return None;
+            }
             let actual_level = actual.unwrap_or(BumpLevel::Patch);
             return Some(VersionRecommendation {
                 manifest_path: manifest_path.to_string(),
                 ecosystem: kind.ecosystem(),
                 tool: kind.tool(),
                 current_version: current_version.map(ToOwned::to_owned),
-                suggested_version: Some(suggested),
+                suggested_version: Some(suggested.to_string()),
                 level,
                 reason: format!(
                     "version bumped by {}, but detected changes suggest at least a {} bump",
@@ -1917,6 +1923,24 @@ diff --git a/Cargo.toml b/Cargo.toml\n";
         assert_eq!(
             combine_recommended_level(BumpLevel::Patch, Some(BumpLevel::Major)),
             BumpLevel::Major
+        );
+    }
+
+    #[test]
+    fn build_recommendation_skips_when_current_exceeds_suggested_pre_1_0() {
+        // Pre-1.0: major collapses to minor. If previous=0.14.1, current=0.15.1,
+        // and level=Major, suggested would be 0.15.0 — but current already exceeds it.
+        let rec = build_recommendation(
+            "crates/cli/Cargo.toml",
+            ManifestKind::CargoToml,
+            Some("0.15.1"),
+            Some("0.14.1"),
+            true,
+            BumpLevel::Major,
+        );
+        assert!(
+            rec.is_none(),
+            "should skip recommendation when current version already exceeds suggested"
         );
     }
 

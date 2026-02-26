@@ -50,19 +50,19 @@ fn main() {
 }
 
 fn run(args: Vec<String>) -> Result<(), String> {
-    if let Some(first) = args.first() {
-        if first == "help" {
-            if args.len() == 1 {
-                let mut cmd = Cli::command();
-                cmd.print_help()
-                    .map_err(|err| format!("failed to render help output: {err}"))?;
-                println!();
-                return Ok(());
-            }
-            let mut forwarded = vec![args[1].clone(), "--help".to_string()];
-            forwarded.extend(args.iter().skip(2).cloned());
-            return run(forwarded);
+    if let Some(first) = args.first()
+        && first == "help"
+    {
+        if args.len() == 1 {
+            let mut cmd = Cli::command();
+            cmd.print_help()
+                .map_err(|err| format!("failed to render help output: {err}"))?;
+            println!();
+            return Ok(());
         }
+        let mut forwarded = vec![args[1].clone(), "--help".to_string()];
+        forwarded.extend(args.iter().skip(2).cloned());
+        return run(forwarded);
     }
 
     if args.is_empty() || matches!(args.as_slice(), [flag] if flag == "-h" || flag == "--help") {

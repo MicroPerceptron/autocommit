@@ -35,6 +35,9 @@ jobs:
             features: ""
           - os: macos-14
             features: --features llama-native
+          - os: ubuntu-24.04
+            features: --features llama-native
+            vulkan: true
     steps:
       - uses: actions/checkout@v4
         with:
@@ -47,6 +50,10 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y cmake libclang-dev pkg-config libssl-dev
 
+      - name: Install Vulkan SDK
+        if: matrix.vulkan
+        run: sudo apt-get install -y glslc libvulkan-dev
+
       - name: Install deps (macOS)
         if: runner.os == 'macOS'
         run: brew install cmake openssl@3
@@ -57,10 +64,13 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-clippy-
+          key: ${{ runner.os }}${{ matrix.vulkan && '-vulkan' || '' }}-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}${{ matrix.vulkan && '-vulkan' || '' }}-cargo-clippy-
 
-      - run: cargo clippy --workspace ${{ matrix.features }} -- -D warnings
+      - name: Clippy
+        env:
+          GGML_VULKAN: ${{ matrix.vulkan && 'ON' || '' }}
+        run: cargo clippy --workspace ${{ matrix.features }} -- -D warnings
 
   test:
     name: Test (${{ matrix.os }})

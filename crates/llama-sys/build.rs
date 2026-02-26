@@ -24,13 +24,31 @@ fn cmake_parallel_jobs() -> usize {
     std::cmp::max(1, nproc.saturating_mul(2) / 3)
 }
 
+/// Check whether `GGML_<backend>` is explicitly set (to any value).
+fn is_explicitly_set(var: &str) -> bool {
+    env::var(var).is_ok()
+}
+
+/// Returns true if *any other* GPU backend was explicitly requested via env var.
+/// Used to suppress auto-detection: if the user asked for Vulkan, don't auto-detect CUDA.
+fn another_backend_explicitly_requested(this: &str) -> bool {
+    ["GGML_CUDA", "GGML_SYCL", "GGML_VULKAN"]
+        .iter()
+        .any(|&var| var != this && is_explicitly_set(var))
+}
+
 fn detect_cuda() -> bool {
     println!("cargo:rerun-if-env-changed=GGML_CUDA");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
 
-    // Explicit override via GGML_CUDA env var
+    // Explicit override via GGML_CUDA env var (supports ON/OFF)
     if let Ok(val) = env::var("GGML_CUDA") {
         return matches!(val.to_ascii_lowercase().as_str(), "1" | "on" | "true");
+    }
+
+    // If the user explicitly requested another backend, skip CUDA auto-detection.
+    if another_backend_explicitly_requested("GGML_CUDA") {
+        return false;
     }
 
     // macOS uses Metal, not CUDA
@@ -40,11 +58,11 @@ fn detect_cuda() -> bool {
 
     // Auto-detect CUDA Toolkit via CUDA_PATH (set by NVIDIA installer on Windows,
     // commonly set on Linux too)
-    if let Ok(cuda_path) = env::var("CUDA_PATH") {
-        if Path::new(&cuda_path).exists() {
-            println!("cargo:warning=CUDA auto-detected via CUDA_PATH={cuda_path}");
-            return true;
-        }
+    if let Ok(cuda_path) = env::var("CUDA_PATH")
+        && Path::new(&cuda_path).exists()
+    {
+        println!("cargo:warning=CUDA auto-detected via CUDA_PATH={cuda_path}");
+        return true;
     }
 
     // On Linux, check the conventional /usr/local/cuda path
@@ -55,6 +73,76 @@ fn detect_cuda() -> bool {
     }
 
     false
+}
+
+fn detect_sycl() -> bool {
+    println!("cargo:rerun-if-env-changed=GGML_SYCL");
+    println!("cargo:rerun-if-env-changed=ONEAPI_ROOT");
+
+    // SYCL/oneAPI is Linux-only
+    if !cfg!(target_os = "linux") {
+        return false;
+    }
+
+    // Explicit override via GGML_SYCL env var (supports ON/OFF)
+    if let Ok(val) = env::var("GGML_SYCL") {
+        return matches!(val.to_ascii_lowercase().as_str(), "1" | "on" | "true");
+    }
+
+    // If the user explicitly requested another backend, skip SYCL auto-detection.
+    if another_backend_explicitly_requested("GGML_SYCL") {
+        return false;
+    }
+
+    if let Ok(oneapi_root) = env::var("ONEAPI_ROOT")
+        && Path::new(&oneapi_root).exists()
+    {
+        println!("cargo:warning=SYCL auto-detected via ONEAPI_ROOT={oneapi_root}");
+        return true;
+    }
+
+    false
+}
+
+fn detect_vulkan() -> bool {
+    println!("cargo:rerun-if-env-changed=GGML_VULKAN");
+
+    if let Ok(val) = env::var("GGML_VULKAN") {
+        return matches!(val.to_ascii_lowercase().as_str(), "1" | "on" | "true");
+    }
+
+    // No auto-detection — Vulkan SDK is commonly installed on dev machines
+    // that may not intend to use it here. Require explicit opt-in.
+    false
+}
+
+fn find_intel_compiler(name: &str) -> PathBuf {
+    // Check if it's on PATH (user sourced setvars.sh)
+    if let Ok(output) = Command::new("which").arg(name).output()
+        && output.status.success()
+    {
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !path.is_empty() {
+            return PathBuf::from(path);
+        }
+    }
+
+    // Fallback: look under ONEAPI_ROOT
+    if let Ok(oneapi_root) = env::var("ONEAPI_ROOT") {
+        let candidate = PathBuf::from(&oneapi_root)
+            .join("compiler")
+            .join("latest")
+            .join("bin")
+            .join(name);
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+
+    panic!(
+        "Intel compiler '{name}' not found. \
+         Ensure Intel oneAPI is installed and setvars.sh is sourced."
+    );
 }
 
 fn main() {
@@ -95,6 +183,26 @@ fn main() {
     generate_bindings(&source_dir, &out_dir);
 
     let use_cuda = detect_cuda();
+    let use_sycl = detect_sycl();
+    let use_vulkan = detect_vulkan();
+
+    let gpu_backends: Vec<&str> = [
+        use_cuda.then_some("CUDA"),
+        use_sycl.then_some("SYCL"),
+        use_vulkan.then_some("Vulkan"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+
+    if gpu_backends.len() > 1 {
+        panic!(
+            "Multiple GPU backends enabled: {}. Only one may be active at a time. \
+             Set exactly one of GGML_CUDA, GGML_SYCL, or GGML_VULKAN.",
+            gpu_backends.join(", ")
+        );
+    }
+
     let profile = profile_name();
 
     let mut configure = Command::new("cmake");
@@ -116,6 +224,17 @@ fn main() {
         .arg("-DLLAMA_BUILD_SERVER=OFF");
     if use_cuda {
         configure.arg("-DGGML_CUDA=ON");
+    }
+    if use_sycl {
+        configure.arg("-DGGML_SYCL=ON");
+        configure.arg("-DGGML_SYCL_TARGET=INTEL");
+        let icx = find_intel_compiler("icx");
+        let icpx = find_intel_compiler("icpx");
+        configure.arg(format!("-DCMAKE_C_COMPILER={}", icx.display()));
+        configure.arg(format!("-DCMAKE_CXX_COMPILER={}", icpx.display()));
+    }
+    if use_vulkan {
+        configure.arg("-DGGML_VULKAN=ON");
     }
     if cfg!(target_os = "macos") {
         let deployment_target = env::var("MACOSX_DEPLOYMENT_TARGET")
@@ -149,6 +268,12 @@ fn main() {
     emit_link_search_paths(&install_dir);
     if use_cuda {
         emit_cuda_link_deps();
+    }
+    if use_sycl {
+        emit_sycl_link_deps();
+    }
+    if use_vulkan {
+        emit_vulkan_link_deps();
     }
 
     println!(
@@ -233,17 +358,14 @@ fn emit_link_search_paths(install_dir: &Path) {
 
         // Link clang compiler runtime to provide __isPlatformVersionAtLeast
         // needed by @available() checks in llama.cpp's Objective-C Metal code.
-        if let Ok(output) = Command::new("clang")
-            .arg("--print-resource-dir")
-            .output()
+        if let Ok(output) = Command::new("clang").arg("--print-resource-dir").output()
+            && output.status.success()
         {
-            if output.status.success() {
-                let resource_dir = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                let rt_lib_dir = PathBuf::from(&resource_dir).join("lib").join("darwin");
-                if rt_lib_dir.is_dir() {
-                    println!("cargo:rustc-link-search=native={}", rt_lib_dir.display());
-                    println!("cargo:rustc-link-lib=static=clang_rt.osx");
-                }
+            let resource_dir = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let rt_lib_dir = PathBuf::from(&resource_dir).join("lib").join("darwin");
+            if rt_lib_dir.is_dir() {
+                println!("cargo:rustc-link-search=native={}", rt_lib_dir.display());
+                println!("cargo:rustc-link-lib=static=clang_rt.osx");
             }
         }
     }
@@ -286,6 +408,45 @@ fn emit_cuda_link_deps() {
         println!("cargo:rustc-link-lib=static=cublas_static");
         println!("cargo:rustc-link-lib=static=cublasLt_static");
         println!("cargo:rustc-link-lib=dylib=cuda");
+    }
+}
+
+fn emit_sycl_link_deps() {
+    // Add search paths for oneAPI libraries
+    if let Ok(oneapi_root) = env::var("ONEAPI_ROOT") {
+        let compiler_lib = PathBuf::from(&oneapi_root)
+            .join("compiler")
+            .join("latest")
+            .join("lib");
+        if compiler_lib.exists() {
+            println!("cargo:rustc-link-search=native={}", compiler_lib.display());
+        }
+
+        let mkl_lib = PathBuf::from(&oneapi_root)
+            .join("mkl")
+            .join("latest")
+            .join("lib");
+        if mkl_lib.exists() {
+            println!("cargo:rustc-link-search=native={}", mkl_lib.display());
+        }
+    }
+
+    // SYCL runtime and MKL are dynamically linked
+    println!("cargo:rustc-link-lib=dylib=sycl");
+    println!("cargo:rustc-link-lib=dylib=mkl_sycl_blas");
+    println!("cargo:rustc-link-lib=dylib=mkl_intel_ilp64");
+    println!("cargo:rustc-link-lib=dylib=mkl_tbb_thread");
+    println!("cargo:rustc-link-lib=dylib=mkl_core");
+}
+
+fn emit_vulkan_link_deps() {
+    // Vulkan links dynamically via the Vulkan loader (provided by GPU drivers)
+    if cfg!(target_os = "windows") {
+        // On Windows the loader import library is typically vulkan-1.lib
+        println!("cargo:rustc-link-lib=dylib=vulkan-1");
+    } else {
+        // On Unix-like systems the loader is usually libvulkan.so
+        println!("cargo:rustc-link-lib=dylib=vulkan");
     }
 }
 

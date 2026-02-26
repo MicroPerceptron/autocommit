@@ -3,12 +3,12 @@ use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::Command;
 
-use autocommit_core::llm::traits::LlmEngine;
 use autocommit_core::AnalysisReport;
-use autocommit_core::{run as core_run, AnalyzeOptions, CoreError};
+use autocommit_core::llm::traits::LlmEngine;
+use autocommit_core::{AnalyzeOptions, CoreError, run as core_run};
 use clap::Parser;
-use dialoguer::console::{style, Term};
-use dialoguer::{theme::ColorfulTheme, Confirm, Editor, Select};
+use dialoguer::console::{Term, style};
+use dialoguer::{Confirm, Editor, Select, theme::ColorfulTheme};
 use indicatif::{ProgressBar, ProgressStyle};
 
 #[cfg(feature = "llama-native")]
@@ -87,22 +87,21 @@ pub fn run(args: &[String]) -> Result<String, String> {
     let repo_metadata = repo_paths.as_ref().and_then(repo_cache::read_metadata);
 
     #[cfg(feature = "llama-native")]
-    if model_path.is_none()
+    if (model_path.is_none()
         || model_hf_repo.is_none()
         || model_cache_dir.is_none()
-        || !runtime_profile_overridden
+        || !runtime_profile_overridden)
+        && let Some(metadata) = repo_metadata.as_ref()
     {
-        if let Some(metadata) = repo_metadata.as_ref() {
-            if model_path.is_none() && model_hf_repo.is_none() {
-                model_path = metadata.model_path.clone();
-                model_hf_repo = metadata.model_hf_repo.clone();
-            }
-            if model_cache_dir.is_none() {
-                model_cache_dir = metadata.model_cache_dir.clone();
-            }
-            if !runtime_profile_overridden && !metadata.profile.trim().is_empty() {
-                runtime_profile = metadata.profile.clone();
-            }
+        if model_path.is_none() && model_hf_repo.is_none() {
+            model_path = metadata.model_path.clone();
+            model_hf_repo = metadata.model_hf_repo.clone();
+        }
+        if model_cache_dir.is_none() {
+            model_cache_dir = metadata.model_cache_dir.clone();
+        }
+        if !runtime_profile_overridden && !metadata.profile.trim().is_empty() {
+            runtime_profile = metadata.profile.clone();
         }
     }
 
@@ -247,12 +246,10 @@ pub fn run(args: &[String]) -> Result<String, String> {
             None
         };
 
-        let analyze_options = {
-            let mut opts = AnalyzeOptions::default();
-            opts.anchor_cache_dir =
-                Some(repo.common_git_dir().join("autocommit/kv"));
-            opts.progress = progress.as_ref().map(|p| p.callback());
-            opts
+        let analyze_options = AnalyzeOptions {
+            anchor_cache_dir: Some(repo.common_git_dir().join("autocommit/kv")),
+            progress: progress.as_ref().map(|p| p.callback()),
+            ..Default::default()
         };
 
         let report = core_run(&engine, &diff_text, &analyze_options)
@@ -1009,12 +1006,12 @@ fn list_gpg_secret_keys() -> Result<Vec<GpgSecretKey>, CoreError> {
                 });
             }
             "fpr" => {
-                if let Some(key) = current.as_mut() {
-                    if key.fingerprint.is_none() {
-                        let value = fields.get(9).copied().unwrap_or_default().trim();
-                        if !value.is_empty() {
-                            key.fingerprint = Some(value.to_string());
-                        }
+                if let Some(key) = current.as_mut()
+                    && key.fingerprint.is_none()
+                {
+                    let value = fields.get(9).copied().unwrap_or_default().trim();
+                    if !value.is_empty() {
+                        key.fingerprint = Some(value.to_string());
                     }
                 }
             }
@@ -1509,7 +1506,7 @@ fn infer_embedding_bump_level(
         let similarity = cosine_similarity(&signal_embedding, &anchor_embedding)?;
         match best {
             Some((_, current)) if current >= similarity => {
-                if runner_up.map_or(true, |value| similarity > value) {
+                if runner_up.is_none_or(|value| similarity > value) {
                     runner_up = Some(similarity);
                 }
             }
@@ -2366,7 +2363,7 @@ fn clamp_words(value: &str, max_chars: usize) -> (String, bool) {
 fn ends_with_dangling_joiner(value: &str) -> bool {
     let cleaned = value
         .trim()
-        .trim_end_matches(|ch: char| matches!(ch, '.' | ',' | ';' | ':' | '!' | '?'))
+        .trim_end_matches(['.', ',', ';', ':', '!', '?'])
         .to_ascii_lowercase();
     if cleaned.is_empty() {
         return false;
@@ -2408,7 +2405,7 @@ fn ends_with_dangling_joiner(value: &str) -> bool {
 }
 
 fn rebalance_backticks(value: &str) -> String {
-    if value.matches('`').count() % 2 == 0 {
+    if value.matches('`').count().is_multiple_of(2) {
         value.to_string()
     } else {
         value.replace('`', "")
@@ -2618,6 +2615,7 @@ mod tests {
                 lines_changed: 42,
                 hunks: 4,
                 binary_files: 0,
+                whitespace_only_lines: 0,
             },
             dispatch: DispatchDecision {
                 route: DispatchRoute::DraftThenReduce,
@@ -2633,8 +2631,11 @@ mod tests {
         assert!(message.starts_with("feat(core): add detailed commit composition\n\n"));
         assert!(message.contains("Compose commit output from chunk-level analyses."));
         assert!(message.contains("### Changes\n- [`crates/cli/src/cmd/commit.rs`] Compose final commit body: Include per-file details in commit body"));
-        assert!(message
-            .contains("- [`crates/cli/src/output/text.rs` (+1 more)] Refactor output formatting"));
+        assert!(
+            message.contains(
+                "- [`crates/cli/src/output/text.rs` (+1 more)] Refactor output formatting"
+            )
+        );
         assert!(message.contains("### Risk\n- Level: medium"));
         assert!(message.contains("- Generated details were composed from partial analyses."));
         assert!(!message.contains("dispatch:DraftThenReduce"));

@@ -66,10 +66,10 @@ fn is_conventional_commit(message: &str) -> bool {
         (head, None)
     };
 
-    if let Some(scope) = scope {
-        if scope.is_empty() || scope.contains(char::is_whitespace) {
-            return false;
-        }
+    if let Some(scope) = scope
+        && (scope.is_empty() || scope.contains(char::is_whitespace))
+    {
+        return false;
     }
 
     matches!(

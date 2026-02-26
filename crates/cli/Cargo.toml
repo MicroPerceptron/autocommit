@@ -1,6 +1,6 @@
 [package]
 name = "autocommit-cli"
-version = "0.15.0"
+version = "0.16.0"
 edition = "2024"
 
 [[bin]]
@@ -20,7 +20,10 @@ llama-native = ["dep:llama-runtime", "autocommit-core/llama-native"]
 autocommit-core = { path = "../core" }
 clap = { version = "4.5.31", features = ["derive"] }
 dialoguer = "0.12.0"
-gix = { version = "0.79.0", default-features = false, features = ["status", "tree-editor"] }
+gix = { version = "0.79.0", default-features = false, features = [
+    "status",
+    "tree-editor",
+] }
 indicatif = "0.18.2"
 llama-runtime = { path = "../llama-runtime", optional = true }
 serde = { version = "1.0", features = ["derive"] }

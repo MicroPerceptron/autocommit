@@ -5,11 +5,11 @@ use std::path::Path;
 
 use clap::Parser;
 #[cfg(feature = "llama-native")]
+use dialoguer::Confirm;
+#[cfg(feature = "llama-native")]
 use dialoguer::console::Term;
 #[cfg(feature = "llama-native")]
 use dialoguer::theme::ColorfulTheme;
-#[cfg(feature = "llama-native")]
-use dialoguer::Confirm;
 
 #[cfg(feature = "llama-native")]
 use crate::cmd::repo_cache;

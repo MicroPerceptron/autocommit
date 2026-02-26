@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum DispatchRoute {
+    FormatOnly,
     DraftOnly,
     DraftThenReduce,
     FullPipeline,

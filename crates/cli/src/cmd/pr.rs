@@ -5,10 +5,10 @@ use std::process::Command;
 
 #[cfg(not(feature = "llama-native"))]
 use autocommit_core::llm::traits::LlmEngine;
-use autocommit_core::{run as core_run, AnalyzeOptions, CoreError};
+use autocommit_core::{AnalyzeOptions, CoreError, run as core_run};
 use clap::Parser;
-use dialoguer::console::{style, Term};
-use dialoguer::{theme::ColorfulTheme, Confirm, Editor, Select};
+use dialoguer::console::{Term, style};
+use dialoguer::{Confirm, Editor, Select, theme::ColorfulTheme};
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::Deserialize;
 
@@ -88,18 +88,19 @@ pub fn run(args: &[String]) -> Result<String, String> {
         || model_hf_repo.is_none()
         || model_cache_dir.is_none()
         || !runtime_profile_overridden)
-        && let Some(metadata) = repo_paths.as_ref().and_then(repo_cache::read_metadata) {
-            if model_path.is_none() && model_hf_repo.is_none() {
-                model_path = metadata.model_path.clone();
-                model_hf_repo = metadata.model_hf_repo.clone();
-            }
-            if model_cache_dir.is_none() {
-                model_cache_dir = metadata.model_cache_dir.clone();
-            }
-            if !runtime_profile_overridden && !metadata.profile.trim().is_empty() {
-                runtime_profile = metadata.profile;
-            }
+        && let Some(metadata) = repo_paths.as_ref().and_then(repo_cache::read_metadata)
+    {
+        if model_path.is_none() && model_hf_repo.is_none() {
+            model_path = metadata.model_path.clone();
+            model_hf_repo = metadata.model_hf_repo.clone();
         }
+        if model_cache_dir.is_none() {
+            model_cache_dir = metadata.model_cache_dir.clone();
+        }
+        if !runtime_profile_overridden && !metadata.profile.trim().is_empty() {
+            runtime_profile = metadata.profile;
+        }
+    }
 
     let repo = run_step(
         rich_interactive,
@@ -881,9 +882,10 @@ fn resolve_pr_branches(
 
 fn pick_default_base(branches: &[String], remote_default: Option<&str>) -> Option<String> {
     if let Some(default) = remote_default
-        && branches.iter().any(|branch| branch == default) {
-            return Some(default.to_string());
-        }
+        && branches.iter().any(|branch| branch == default)
+    {
+        return Some(default.to_string());
+    }
     for candidate in ["main", "master", "trunk", "develop"] {
         let remote_candidate = format!("origin/{candidate}");
         if branches.iter().any(|branch| branch == &remote_candidate) {

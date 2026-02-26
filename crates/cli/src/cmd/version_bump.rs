@@ -3,8 +3,8 @@ use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use autocommit_core::types::TypeTag;
 use autocommit_core::AnalysisReport;
+use autocommit_core::types::TypeTag;
 use serde::{Deserialize, Serialize};
 
 use crate::cmd::git;
@@ -123,7 +123,10 @@ impl ManifestKind {
     /// Returns the lockfile sync command for this manifest ecosystem.
     /// The `manifest_dir` is used for ecosystems (like JS) where the lockfile
     /// type determines which package manager to invoke.
-    fn lockfile_sync_command(self, manifest_dir: &Path) -> Option<(&'static str, &'static [&'static str])> {
+    fn lockfile_sync_command(
+        self,
+        manifest_dir: &Path,
+    ) -> Option<(&'static str, &'static [&'static str])> {
         match self {
             Self::CargoToml => Some(("cargo", &["generate-lockfile"])),
             Self::PackageJson => detect_js_lockfile_sync(manifest_dir),
@@ -290,35 +293,37 @@ fn build_recommendation(
     );
 
     if let (Some(previous), Some(current)) = (previous_semver, current_semver)
-        && current > previous {
-            let actual = bump_distance(previous, current);
-            if let Some(actual) = actual
-                && actual >= level {
-                    return None;
-                }
-            let suggested = previous.bump(level);
-            // Pre-1.0 major collapses to minor, so the user's actual version
-            // may already meet or exceed the suggestion even when bump levels
-            // don't compare equal. Check the concrete versions.
-            if current >= suggested {
-                return None;
-            }
-            let actual_level = actual.unwrap_or(BumpLevel::Patch);
-            return Some(VersionRecommendation {
-                manifest_path: manifest_path.to_string(),
-                ecosystem: kind.ecosystem(),
-                tool: kind.tool(),
-                current_version: current_version.map(ToOwned::to_owned),
-                suggested_version: Some(suggested.to_string()),
-                level,
-                reason: format!(
-                    "version bumped by {}, but detected changes suggest at least a {} bump",
-                    actual_level.as_str(),
-                    level.as_str(),
-                ),
-                kind,
-            });
+        && current > previous
+    {
+        let actual = bump_distance(previous, current);
+        if let Some(actual) = actual
+            && actual >= level
+        {
+            return None;
         }
+        let suggested = previous.bump(level);
+        // Pre-1.0 major collapses to minor, so the user's actual version
+        // may already meet or exceed the suggestion even when bump levels
+        // don't compare equal. Check the concrete versions.
+        if current >= suggested {
+            return None;
+        }
+        let actual_level = actual.unwrap_or(BumpLevel::Patch);
+        return Some(VersionRecommendation {
+            manifest_path: manifest_path.to_string(),
+            ecosystem: kind.ecosystem(),
+            tool: kind.tool(),
+            current_version: current_version.map(ToOwned::to_owned),
+            suggested_version: Some(suggested.to_string()),
+            level,
+            reason: format!(
+                "version bumped by {}, but detected changes suggest at least a {} bump",
+                actual_level.as_str(),
+                level.as_str(),
+            ),
+            kind,
+        });
+    }
 
     if let Some(current) = current_semver {
         let suggested = current.bump(level).to_string();
@@ -363,9 +368,10 @@ fn build_go_mod_recommendation(
         .and_then(parse_semver)
         .map(|semver| semver.major);
     if let Some(prev) = previous_major
-        && info.major > prev {
-            return None;
-        }
+        && info.major > prev
+    {
+        return None;
+    }
 
     let target_major = if info.major < 2 { 2 } else { info.major + 1 };
     let suggested = format!("v{target_major}");
@@ -1250,11 +1256,12 @@ fn replace_toml_key_in_section(
         }
 
         if current_section.as_deref() == Some(section)
-            && let Some(next) = replace_assignment_line(line, key, suggested_version, style) {
-                lines.push(next);
-                changed = true;
-                continue;
-            }
+            && let Some(next) = replace_assignment_line(line, key, suggested_version, style)
+        {
+            lines.push(next);
+            changed = true;
+            continue;
+        }
         lines.push(line.to_string());
     }
 
@@ -1513,9 +1520,10 @@ fn parse_go_mod_info(content: &str) -> Option<GoModInfo> {
 fn parse_go_mod_path_major(module_path: &str) -> (&str, Option<u64>, bool) {
     if let Some((base, suffix)) = module_path.rsplit_once("/v")
         && let Ok(major) = suffix.parse::<u64>()
-            && major >= 2 {
-                return (base, Some(major), true);
-            }
+        && major >= 2
+    {
+        return (base, Some(major), true);
+    }
     (module_path, None, false)
 }
 
@@ -1812,6 +1820,7 @@ diff --git a/Cargo.toml b/Cargo.toml\n";
                 lines_changed: 40,
                 hunks: 3,
                 binary_files: 0,
+                whitespace_only_lines: 0,
             },
             dispatch: autocommit_core::types::DispatchDecision {
                 route: autocommit_core::types::DispatchRoute::DraftOnly,
@@ -1858,6 +1867,7 @@ diff --git a/Cargo.toml b/Cargo.toml\n";
                 lines_changed: 120,
                 hunks: 8,
                 binary_files: 0,
+                whitespace_only_lines: 0,
             },
             dispatch: autocommit_core::types::DispatchDecision {
                 route: autocommit_core::types::DispatchRoute::DraftOnly,
@@ -1893,6 +1903,7 @@ diff --git a/Cargo.toml b/Cargo.toml\n";
                 lines_changed: 42,
                 hunks: 3,
                 binary_files: 0,
+                whitespace_only_lines: 0,
             },
             dispatch: autocommit_core::types::DispatchDecision {
                 route: autocommit_core::types::DispatchRoute::DraftOnly,
@@ -2063,7 +2074,9 @@ diff --git a/Cargo.toml b/Cargo.toml\n";
 
     #[test]
     fn breaking_signal_fires_on_breaking_change() {
-        assert!(contains_breaking_signal("breaking change: new config format"));
+        assert!(contains_breaking_signal(
+            "breaking change: new config format"
+        ));
     }
 
     #[test]
@@ -2088,13 +2101,19 @@ diff --git a/Cargo.toml b/Cargo.toml\n";
 
     #[test]
     fn breaking_signal_ignores_migration_alone() {
-        assert!(!contains_breaking_signal("migration to new internal pattern"));
+        assert!(!contains_breaking_signal(
+            "migration to new internal pattern"
+        ));
     }
 
     #[test]
     fn lockfile_sync_command_returns_correct_commands() {
         let tmp = create_temp_tree();
-        assert!(ManifestKind::CargoToml.lockfile_sync_command(&tmp).is_some());
+        assert!(
+            ManifestKind::CargoToml
+                .lockfile_sync_command(&tmp)
+                .is_some()
+        );
         assert!(ManifestKind::GoMod.lockfile_sync_command(&tmp).is_some());
         assert!(ManifestKind::SetupPy.lockfile_sync_command(&tmp).is_none());
         assert!(ManifestKind::PomXml.lockfile_sync_command(&tmp).is_none());
@@ -2105,7 +2124,9 @@ diff --git a/Cargo.toml b/Cargo.toml\n";
     fn lockfile_sync_detects_npm_lockfile() {
         let tmp = create_temp_tree();
         write_file(&tmp, "package-lock.json", "{}");
-        let (cmd, _) = ManifestKind::PackageJson.lockfile_sync_command(&tmp).unwrap();
+        let (cmd, _) = ManifestKind::PackageJson
+            .lockfile_sync_command(&tmp)
+            .unwrap();
         assert_eq!(cmd, "npm");
         let _ = fs::remove_dir_all(&tmp);
     }
@@ -2114,7 +2135,9 @@ diff --git a/Cargo.toml b/Cargo.toml\n";
     fn lockfile_sync_detects_pnpm_lockfile() {
         let tmp = create_temp_tree();
         write_file(&tmp, "pnpm-lock.yaml", "");
-        let (cmd, _) = ManifestKind::PackageJson.lockfile_sync_command(&tmp).unwrap();
+        let (cmd, _) = ManifestKind::PackageJson
+            .lockfile_sync_command(&tmp)
+            .unwrap();
         assert_eq!(cmd, "pnpm");
         let _ = fs::remove_dir_all(&tmp);
     }
@@ -2123,7 +2146,9 @@ diff --git a/Cargo.toml b/Cargo.toml\n";
     fn lockfile_sync_detects_yarn_lockfile() {
         let tmp = create_temp_tree();
         write_file(&tmp, "yarn.lock", "");
-        let (cmd, _) = ManifestKind::PackageJson.lockfile_sync_command(&tmp).unwrap();
+        let (cmd, _) = ManifestKind::PackageJson
+            .lockfile_sync_command(&tmp)
+            .unwrap();
         assert_eq!(cmd, "yarn");
         let _ = fs::remove_dir_all(&tmp);
     }
@@ -2131,7 +2156,11 @@ diff --git a/Cargo.toml b/Cargo.toml\n";
     #[test]
     fn lockfile_sync_no_js_lockfile_returns_none() {
         let tmp = create_temp_tree();
-        assert!(ManifestKind::PackageJson.lockfile_sync_command(&tmp).is_none());
+        assert!(
+            ManifestKind::PackageJson
+                .lockfile_sync_command(&tmp)
+                .is_none()
+        );
         let _ = fs::remove_dir_all(&tmp);
     }
 

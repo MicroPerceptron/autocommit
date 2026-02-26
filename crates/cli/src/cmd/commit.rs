@@ -3,12 +3,12 @@ use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::Command;
 
-use autocommit_core::llm::traits::LlmEngine;
 use autocommit_core::AnalysisReport;
-use autocommit_core::{run as core_run, AnalyzeOptions, CoreError};
+use autocommit_core::llm::traits::LlmEngine;
+use autocommit_core::{AnalyzeOptions, CoreError, run as core_run};
 use clap::Parser;
-use dialoguer::console::{style, Term};
-use dialoguer::{theme::ColorfulTheme, Confirm, Editor, Select};
+use dialoguer::console::{Term, style};
+use dialoguer::{Confirm, Editor, Select, theme::ColorfulTheme};
 use indicatif::{ProgressBar, ProgressStyle};
 
 #[cfg(feature = "llama-native")]
@@ -91,18 +91,19 @@ pub fn run(args: &[String]) -> Result<String, String> {
         || model_hf_repo.is_none()
         || model_cache_dir.is_none()
         || !runtime_profile_overridden)
-        && let Some(metadata) = repo_metadata.as_ref() {
-            if model_path.is_none() && model_hf_repo.is_none() {
-                model_path = metadata.model_path.clone();
-                model_hf_repo = metadata.model_hf_repo.clone();
-            }
-            if model_cache_dir.is_none() {
-                model_cache_dir = metadata.model_cache_dir.clone();
-            }
-            if !runtime_profile_overridden && !metadata.profile.trim().is_empty() {
-                runtime_profile = metadata.profile.clone();
-            }
+        && let Some(metadata) = repo_metadata.as_ref()
+    {
+        if model_path.is_none() && model_hf_repo.is_none() {
+            model_path = metadata.model_path.clone();
+            model_hf_repo = metadata.model_hf_repo.clone();
         }
+        if model_cache_dir.is_none() {
+            model_cache_dir = metadata.model_cache_dir.clone();
+        }
+        if !runtime_profile_overridden && !metadata.profile.trim().is_empty() {
+            runtime_profile = metadata.profile.clone();
+        }
+    }
 
     #[cfg(feature = "llama-native")]
     let mut commit_policy_config = repo_metadata
@@ -1006,12 +1007,13 @@ fn list_gpg_secret_keys() -> Result<Vec<GpgSecretKey>, CoreError> {
             }
             "fpr" => {
                 if let Some(key) = current.as_mut()
-                    && key.fingerprint.is_none() {
-                        let value = fields.get(9).copied().unwrap_or_default().trim();
-                        if !value.is_empty() {
-                            key.fingerprint = Some(value.to_string());
-                        }
+                    && key.fingerprint.is_none()
+                {
+                    let value = fields.get(9).copied().unwrap_or_default().trim();
+                    if !value.is_empty() {
+                        key.fingerprint = Some(value.to_string());
                     }
+                }
             }
             "uid" => {
                 if let Some(key) = current.as_mut() {
@@ -2613,6 +2615,7 @@ mod tests {
                 lines_changed: 42,
                 hunks: 4,
                 binary_files: 0,
+                whitespace_only_lines: 0,
             },
             dispatch: DispatchDecision {
                 route: DispatchRoute::DraftThenReduce,
@@ -2628,8 +2631,11 @@ mod tests {
         assert!(message.starts_with("feat(core): add detailed commit composition\n\n"));
         assert!(message.contains("Compose commit output from chunk-level analyses."));
         assert!(message.contains("### Changes\n- [`crates/cli/src/cmd/commit.rs`] Compose final commit body: Include per-file details in commit body"));
-        assert!(message
-            .contains("- [`crates/cli/src/output/text.rs` (+1 more)] Refactor output formatting"));
+        assert!(
+            message.contains(
+                "- [`crates/cli/src/output/text.rs` (+1 more)] Refactor output formatting"
+            )
+        );
         assert!(message.contains("### Risk\n- Level: medium"));
         assert!(message.contains("- Generated details were composed from partial analyses."));
         assert!(!message.contains("dispatch:DraftThenReduce"));

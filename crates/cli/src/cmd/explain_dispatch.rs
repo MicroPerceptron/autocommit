@@ -16,6 +16,7 @@ pub fn run(args: &[String]) -> String {
         hunks: 8,
         binary_files: 0,
         risky_paths: 0,
+        whitespace_only_lines: 0,
     };
 
     let decision = policy::decide(
@@ -47,8 +48,8 @@ struct ExplainDispatchArgs {}
 
 impl ExplainDispatchArgs {
     fn parse_from(args: &[String]) -> Result<ParseOutcome<Self>, String> {
-        let argv = std::iter::once("autocommit explain-dispatch".to_string())
-            .chain(args.iter().cloned());
+        let argv =
+            std::iter::once("autocommit explain-dispatch".to_string()).chain(args.iter().cloned());
         match Self::try_parse_from(argv) {
             Ok(parsed) => Ok(ParseOutcome::Continue(parsed)),
             Err(err) => {

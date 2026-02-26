@@ -24,13 +24,31 @@ fn cmake_parallel_jobs() -> usize {
     std::cmp::max(1, nproc.saturating_mul(2) / 3)
 }
 
+/// Check whether `GGML_<backend>` is explicitly set (to any value).
+fn is_explicitly_set(var: &str) -> bool {
+    env::var(var).is_ok()
+}
+
+/// Returns true if *any other* GPU backend was explicitly requested via env var.
+/// Used to suppress auto-detection: if the user asked for Vulkan, don't auto-detect CUDA.
+fn another_backend_explicitly_requested(this: &str) -> bool {
+    ["GGML_CUDA", "GGML_SYCL", "GGML_VULKAN"]
+        .iter()
+        .any(|&var| var != this && is_explicitly_set(var))
+}
+
 fn detect_cuda() -> bool {
     println!("cargo:rerun-if-env-changed=GGML_CUDA");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
 
-    // Explicit override via GGML_CUDA env var
+    // Explicit override via GGML_CUDA env var (supports ON/OFF)
     if let Ok(val) = env::var("GGML_CUDA") {
         return matches!(val.to_ascii_lowercase().as_str(), "1" | "on" | "true");
+    }
+
+    // If the user explicitly requested another backend, skip CUDA auto-detection.
+    if another_backend_explicitly_requested("GGML_CUDA") {
+        return false;
     }
 
     // macOS uses Metal, not CUDA
@@ -61,8 +79,14 @@ fn detect_sycl() -> bool {
     println!("cargo:rerun-if-env-changed=GGML_SYCL");
     println!("cargo:rerun-if-env-changed=ONEAPI_ROOT");
 
+    // Explicit override via GGML_SYCL env var (supports ON/OFF)
     if let Ok(val) = env::var("GGML_SYCL") {
         return matches!(val.to_ascii_lowercase().as_str(), "1" | "on" | "true");
+    }
+
+    // If the user explicitly requested another backend, skip SYCL auto-detection.
+    if another_backend_explicitly_requested("GGML_SYCL") {
+        return false;
     }
 
     // SYCL/oneAPI is Linux-only
@@ -334,9 +358,7 @@ fn emit_link_search_paths(install_dir: &Path) {
 
         // Link clang compiler runtime to provide __isPlatformVersionAtLeast
         // needed by @available() checks in llama.cpp's Objective-C Metal code.
-        if let Ok(output) = Command::new("clang")
-            .arg("--print-resource-dir")
-            .output()
+        if let Ok(output) = Command::new("clang").arg("--print-resource-dir").output()
             && output.status.success()
         {
             let resource_dir = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -397,10 +419,7 @@ fn emit_sycl_link_deps() {
             .join("latest")
             .join("lib");
         if compiler_lib.exists() {
-            println!(
-                "cargo:rustc-link-search=native={}",
-                compiler_lib.display()
-            );
+            println!("cargo:rustc-link-search=native={}", compiler_lib.display());
         }
 
         let mkl_lib = PathBuf::from(&oneapi_root)

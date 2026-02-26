@@ -72,11 +72,11 @@ impl Repo {
         }
 
         if let Some(mut outcome) = iter.into_outcome()
-            && let Some(result) = outcome.write_changes() {
-                result.map_err(|err| {
-                    CoreError::Io(format!("failed to update index metadata: {err}"))
-                })?;
-            }
+            && let Some(result) = outcome.write_changes()
+        {
+            result
+                .map_err(|err| CoreError::Io(format!("failed to update index metadata: {err}")))?;
+        }
 
         Ok(out)
     }
@@ -568,11 +568,11 @@ impl Repo {
         }
 
         if let Some(mut outcome) = iter.into_outcome()
-            && let Some(result) = outcome.write_changes() {
-                result.map_err(|err| {
-                    CoreError::Io(format!("failed to update index metadata: {err}"))
-                })?;
-            }
+            && let Some(result) = outcome.write_changes()
+        {
+            result
+                .map_err(|err| CoreError::Io(format!("failed to update index metadata: {err}")))?;
+        }
 
         editor
             .write()
@@ -789,16 +789,16 @@ fn append_index_worktree_patch(
                     source_entry,
                     ..
                 } = source
-                {
-                    append_patch(
-                        repo,
-                        out,
-                        Some(source_rela_path.as_ref()),
-                        None,
-                        Some(source_entry.id),
-                        None,
-                    )?;
-                }
+            {
+                append_patch(
+                    repo,
+                    out,
+                    Some(source_rela_path.as_ref()),
+                    None,
+                    Some(source_entry.id),
+                    None,
+                )?;
+            }
 
             if let Some((new_id, _, _)) = pipeline
                 .worktree_file_to_object(dst_path, index)
@@ -864,11 +864,11 @@ fn apply_index_worktree_change(
                     source_rela_path,
                     ..
                 } = source
-                {
-                    editor.remove(source_rela_path.as_bstr()).map_err(|err| {
-                        CoreError::Io(format!("failed to remove tree entry: {err}"))
-                    })?;
-                }
+            {
+                editor
+                    .remove(source_rela_path.as_bstr())
+                    .map_err(|err| CoreError::Io(format!("failed to remove tree entry: {err}")))?;
+            }
             upsert_worktree_path(pipeline, index, editor, dirwalk_entry.rela_path.as_bstr())?;
         }
     }

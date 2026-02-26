@@ -1,11 +1,11 @@
 #[cfg(feature = "llama-native")]
-use dialoguer::console::Term;
-#[cfg(feature = "llama-native")]
-use dialoguer::theme::ColorfulTheme;
-#[cfg(feature = "llama-native")]
 use dialoguer::Input;
 #[cfg(feature = "llama-native")]
 use dialoguer::Select;
+#[cfg(feature = "llama-native")]
+use dialoguer::console::Term;
+#[cfg(feature = "llama-native")]
+use dialoguer::theme::ColorfulTheme;
 #[cfg(feature = "llama-native")]
 use std::io::IsTerminal;
 #[cfg(feature = "llama-native")]
@@ -15,7 +15,7 @@ use clap::Parser;
 
 #[cfg(feature = "llama-native")]
 use crate::cmd::repo_cache::{
-    discover_repo_kv_paths, ensure_cache_dir, write_metadata, RepoKvMetadata,
+    RepoKvMetadata, discover_repo_kv_paths, ensure_cache_dir, write_metadata,
 };
 #[cfg(feature = "llama-native")]
 use crate::cmd::{commit_policy, commit_policy::CommitPolicy};
@@ -233,6 +233,7 @@ fn format_cached_models(listing: &llama_runtime::CachedModelList) -> String {
 #[cfg(feature = "llama-native")]
 type ModelSelection = (Option<String>, Option<String>, Option<String>);
 
+#[cfg(feature = "llama-native")]
 fn prompt_model_selection() -> Result<ModelSelection, String> {
     let theme = ColorfulTheme::default();
     let term = Term::stderr();

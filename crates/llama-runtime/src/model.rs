@@ -113,19 +113,20 @@ impl LoadedRuntime {
             let mut ctx = ContextHandle::new_generation(Arc::clone(&self.model), self.cpu_only)?;
 
             if let Some(state_path) = self.generation_state_path.as_deref()
-                && state_path.is_file() {
-                    match ctx.load_state_file(state_path) {
-                        Ok(tokens) => ctx.set_session_tokens(tokens),
-                        Err(err) => {
-                            if llama_logs_enabled() {
-                                eprintln!(
-                                    "autocommit warning: failed to load generation state from {}: {err}",
-                                    state_path.display()
-                                );
-                            }
+                && state_path.is_file()
+            {
+                match ctx.load_state_file(state_path) {
+                    Ok(tokens) => ctx.set_session_tokens(tokens),
+                    Err(err) => {
+                        if llama_logs_enabled() {
+                            eprintln!(
+                                "autocommit warning: failed to load generation state from {}: {err}",
+                                state_path.display()
+                            );
                         }
                     }
                 }
+            }
 
             self.generation_ctx = Some(ctx);
         }
@@ -153,12 +154,13 @@ impl LoadedRuntime {
         }
 
         if let Err(err) = generation_ctx.save_state_file(state_path, &tokens)
-            && llama_logs_enabled() {
-                eprintln!(
-                    "autocommit warning: failed to save generation state to {}: {err}",
-                    state_path.display()
-                );
-            }
+            && llama_logs_enabled()
+        {
+            eprintln!(
+                "autocommit warning: failed to save generation state to {}: {err}",
+                state_path.display()
+            );
+        }
     }
 
     fn embed(&mut self, text: &str) -> Result<Vec<f32>, RuntimeError> {
@@ -1185,9 +1187,8 @@ fn aggregate_partials_by_scope(partials: &[PartialReport], indices: &[usize]) ->
             titles_str
         };
 
-        let display = format!(
-            "scope={scope} ({file_count} files): {types_str} \u{2014} {titles_compact}"
-        );
+        let display =
+            format!("scope={scope} ({file_count} files): {types_str} \u{2014} {titles_compact}");
 
         result.push(ScopeGroup {
             display,
@@ -1287,10 +1288,11 @@ fn salvage_reduce_output(raw: &str) -> Option<ReduceModelOutput> {
             normalize_commit_message(&cleaned)
         };
         if commit_message.is_none()
-            && let Some(commit) = normalized_commit {
-                commit_message = Some(commit);
-                continue;
-            }
+            && let Some(commit) = normalized_commit
+        {
+            commit_message = Some(commit);
+            continue;
+        }
 
         if summary.is_none() {
             let summary_candidate = if let Some(rest) = lowered
@@ -1638,9 +1640,10 @@ fn extract_json_like_field(raw: &str, key: &str) -> Option<String> {
         if bytes[i] == b'"' {
             if let Some(end) = find_string_end(bytes, i + 1) {
                 if let Some(slice) = raw.get(i..=end)
-                    && let Ok(parsed) = serde_json::from_str::<String>(slice) {
-                        return Some(parsed.trim().to_string());
-                    }
+                    && let Ok(parsed) = serde_json::from_str::<String>(slice)
+                {
+                    return Some(parsed.trim().to_string());
+                }
                 if let Some(fallback) = raw.get((i + 1)..end) {
                     return Some(fallback.trim().to_string());
                 }
@@ -1908,9 +1911,10 @@ fn extract_hunk_ranges(lines: &[&str]) -> Vec<(usize, usize)> {
                 out.push((start, idx));
             }
         } else if line.starts_with("diff --git ")
-            && let Some(start) = current_start.take() {
-                out.push((start, idx));
-            }
+            && let Some(start) = current_start.take()
+        {
+            out.push((start, idx));
+        }
     }
 
     if let Some(start) = current_start {
@@ -2037,10 +2041,9 @@ fn append_head_tail_with_limit(text: &str, out: &mut String, max_chars: usize) {
             return;
         }
     }
-    if head + tail < lines.len()
-        && !push_line_with_limit(out, "...", max_chars) {
-            return;
-        }
+    if head + tail < lines.len() && !push_line_with_limit(out, "...", max_chars) {
+        return;
+    }
     for line in lines.iter().copied().skip(lines.len().saturating_sub(tail)) {
         if !push_line_with_limit(out, line, max_chars) {
             return;
@@ -2531,12 +2534,14 @@ fn merge_summary_subject(first: &str, second: &str) -> String {
     let second_token = leading_action_token(second);
 
     if let (Some(a), Some(b)) = (first_token.as_deref(), second_token.as_deref())
-        && a == b && is_mergeable_action_token(a) {
-            let suffix = drop_leading_action_token(second, a).trim();
-            if !suffix.is_empty() {
-                return decapitalize_first(suffix);
-            }
+        && a == b
+        && is_mergeable_action_token(a)
+    {
+        let suffix = drop_leading_action_token(second, a).trim();
+        if !suffix.is_empty() {
+            return decapitalize_first(suffix);
         }
+    }
 
     decapitalize_first(second)
 }
@@ -3574,6 +3579,7 @@ Summary: Preserve valid commit text when reduce JSON is partially malformed.
             lines_changed: 120,
             hunks: 10,
             binary_files: 0,
+            whitespace_only_lines: 0,
         };
 
         let summary = recover_summary_from_reduce(
@@ -3639,6 +3645,7 @@ Summary: Preserve valid commit text when reduce JSON is partially malformed.
             lines_changed: 100,
             hunks: 4,
             binary_files: 0,
+            whitespace_only_lines: 0,
         };
 
         let summary = synthesize_fallback_summary(&items, &stats);
@@ -3677,6 +3684,7 @@ Summary: Preserve valid commit text when reduce JSON is partially malformed.
             lines_changed: 50,
             hunks: 4,
             binary_files: 0,
+            whitespace_only_lines: 0,
         };
 
         let summary = synthesize_fallback_summary(&items, &stats);

@@ -91,7 +91,11 @@ fn run_inner(
             .as_ref()
             .zip(fingerprint.as_deref())
             .and_then(|(cache, fp)| {
-                cache.load(fp, prompts::DISPATCH_DRAFT_ANCHOR, prompts::DISPATCH_FULL_ANCHOR)
+                cache.load(
+                    fp,
+                    prompts::DISPATCH_DRAFT_ANCHOR,
+                    prompts::DISPATCH_FULL_ANCHOR,
+                )
             });
 
         let (draft_anchor_embedding, full_anchor_embedding) = match anchors {
@@ -135,7 +139,20 @@ fn run_inner(
     let raw_count = raw_chunks.len();
     let chunks = collect::merge_by_scope(raw_chunks, MERGE_MAX_TOKENS);
     if chunks.len() != raw_count {
-        progress::emit(cb, ProgressStage::Merging { from: raw_count, to: chunks.len() });
+        progress::emit(
+            cb,
+            ProgressStage::Merging {
+                from: raw_count,
+                to: chunks.len(),
+            },
+        );
+    }
+
+    // FormatOnly fast path: skip all inference for whitespace-only diffs.
+    if decision.route == DispatchRoute::FormatOnly {
+        let report = reduce::format_only_report(&features, &decision, &stats);
+        progress::emit(cb, ProgressStage::DraftSynthesis);
+        return Ok(report);
     }
 
     // DraftOnly fast path: skip the reduce inference call.
@@ -176,5 +193,6 @@ fn to_stats(features: &DiffFeatures) -> DiffStats {
         lines_changed: features.lines_changed,
         hunks: features.hunks,
         binary_files: features.binary_files,
+        whitespace_only_lines: features.whitespace_only_lines,
     }
 }

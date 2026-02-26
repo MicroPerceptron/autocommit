@@ -4,7 +4,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use autocommit_core::llm::traits::LlmEngine;
-use autocommit_core::{run as core_run, AnalyzeOptions, CoreError};
+use autocommit_core::{AnalyzeOptions, CoreError, run as core_run};
 use clap::Parser;
 
 #[cfg(feature = "llama-native")]
@@ -67,18 +67,19 @@ pub fn run(args: &[String]) -> Result<String, String> {
         || model_hf_repo.is_none()
         || model_cache_dir.is_none()
         || !runtime_profile_overridden)
-        && let Some(metadata) = repo_paths.as_ref().and_then(repo_cache::read_metadata) {
-            if model_path.is_none() && model_hf_repo.is_none() {
-                model_path = metadata.model_path.clone();
-                model_hf_repo = metadata.model_hf_repo.clone();
-            }
-            if model_cache_dir.is_none() {
-                model_cache_dir = metadata.model_cache_dir.clone();
-            }
-            if !runtime_profile_overridden && !metadata.profile.trim().is_empty() {
-                runtime_profile = metadata.profile;
-            }
+        && let Some(metadata) = repo_paths.as_ref().and_then(repo_cache::read_metadata)
+    {
+        if model_path.is_none() && model_hf_repo.is_none() {
+            model_path = metadata.model_path.clone();
+            model_hf_repo = metadata.model_hf_repo.clone();
         }
+        if model_cache_dir.is_none() {
+            model_cache_dir = metadata.model_cache_dir.clone();
+        }
+        if !runtime_profile_overridden && !metadata.profile.trim().is_empty() {
+            runtime_profile = metadata.profile;
+        }
+    }
 
     let diff_text = load_diff(diff_file.as_deref()).map_err(|err| err.to_string())?;
     if let Ok(repo) = git::Repo::discover()
@@ -86,11 +87,11 @@ pub fn run(args: &[String]) -> Result<String, String> {
             .common_git_dir()
             .join("autocommit/kv/partials")
             .to_str()
-        {
-            unsafe {
-                std::env::set_var("AUTOCOMMIT_PARTIAL_CACHE_DIR", cache_dir);
-            }
+    {
+        unsafe {
+            std::env::set_var("AUTOCOMMIT_PARTIAL_CACHE_DIR", cache_dir);
         }
+    }
 
     let diff_hash = report_cache::diff_hash(&diff_text);
     let cache_key = report_cache::cache_key("analyze", runtime_profile.as_str(), &diff_hash);
@@ -98,13 +99,14 @@ pub fn run(args: &[String]) -> Result<String, String> {
         .ok()
         .map(|repo| report_cache::cache_path(repo.common_git_dir()));
     if let Some(cache_path) = cache_path.as_ref()
-        && let Some(report) = report_cache::read_cached_report(cache_path, &cache_key) {
-            return if json {
-                output::json::to_pretty_json(&report).map_err(|err| err.to_string())
-            } else {
-                Ok(output::text::render_report(&report))
-            };
-        }
+        && let Some(report) = report_cache::read_cached_report(cache_path, &cache_key)
+    {
+        return if json {
+            output::json::to_pretty_json(&report).map_err(|err| err.to_string())
+        } else {
+            Ok(output::text::render_report(&report))
+        };
+    }
 
     #[cfg(feature = "llama-native")]
     let generation_state = repo_paths.map(|paths| paths.generation_state);
@@ -136,8 +138,7 @@ pub fn run(args: &[String]) -> Result<String, String> {
     let analyze_options = {
         let mut opts = AnalyzeOptions::default();
         if let Ok(repo) = git::Repo::discover() {
-            opts.anchor_cache_dir =
-                Some(repo.common_git_dir().join("autocommit/kv"));
+            opts.anchor_cache_dir = Some(repo.common_git_dir().join("autocommit/kv"));
         }
         opts
     };
@@ -196,8 +197,7 @@ struct AnalyzeArgs {
 
 impl AnalyzeArgs {
     fn parse_from(args: &[String]) -> Result<ParseOutcome<Self>, String> {
-        let argv =
-            std::iter::once("autocommit analyze".to_string()).chain(args.iter().cloned());
+        let argv = std::iter::once("autocommit analyze".to_string()).chain(args.iter().cloned());
         match Self::try_parse_from(argv) {
             Ok(parsed) => Ok(ParseOutcome::Continue(parsed)),
             Err(err) => {

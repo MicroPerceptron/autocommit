@@ -15,8 +15,8 @@ use dialoguer::{Confirm, Input, Select};
 use crate::cmd::commit_policy;
 #[cfg(feature = "llama-native")]
 use crate::cmd::repo_cache::{
-    discover_repo_kv_paths, ensure_cache_dir, read_metadata, write_metadata, RepoKvMetadata,
-    RepoKvPaths,
+    RepoKvMetadata, RepoKvPaths, discover_repo_kv_paths, ensure_cache_dir, read_metadata,
+    write_metadata,
 };
 #[cfg(feature = "llama-native")]
 use crate::path_util::expand_tilde;
@@ -501,6 +501,7 @@ fn format_cached_models(listing: &llama_runtime::CachedModelList) -> String {
 #[cfg(feature = "llama-native")]
 type ModelSelection = (Option<String>, Option<String>, Option<String>);
 
+#[cfg(feature = "llama-native")]
 fn prompt_model_selection() -> Result<ModelSelection, String> {
     let theme = ColorfulTheme::default();
     let term = Term::stderr();

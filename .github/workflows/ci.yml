@@ -54,10 +54,6 @@ jobs:
         if: matrix.vulkan
         run: sudo apt-get install -y glslc libvulkan-dev
 
-      - name: Install Vulkan SDK
-        if: matrix.vulkan
-        run: sudo apt-get install -y glslc libvulkan-dev
-
       - name: Install deps (macOS)
         if: runner.os == 'macOS'
         run: brew install cmake openssl@3

@@ -453,6 +453,13 @@ fn emit_sycl_link_deps() {
     println!("cargo:rustc-link-lib=dylib=mkl_intel_ilp64");
     println!("cargo:rustc-link-lib=dylib=mkl_tbb_thread");
     println!("cargo:rustc-link-lib=dylib=mkl_core");
+
+    // Intel compiler runtime libraries — icpx injects calls to SVML vectorized
+    // math intrinsics (__svml_*), Intel fast memory ops (_intel_fast_memcpy/memset),
+    // and Intel math functions (__libm_sse2_sincosf) into compiled objects.
+    println!("cargo:rustc-link-lib=dylib=svml");
+    println!("cargo:rustc-link-lib=dylib=irc");
+    println!("cargo:rustc-link-lib=dylib=imf");
 }
 
 fn emit_vulkan_link_deps() {

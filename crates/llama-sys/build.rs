@@ -61,15 +61,14 @@ fn detect_sycl() -> bool {
     println!("cargo:rerun-if-env-changed=GGML_SYCL");
     println!("cargo:rerun-if-env-changed=ONEAPI_ROOT");
 
-    if let Ok(val) = env::var("GGML_SYCL") {
-        return matches!(val.to_ascii_lowercase().as_str(), "1" | "on" | "true");
-    }
-
     // SYCL/oneAPI is Linux-only
-    if cfg!(target_os = "macos") {
+    if !cfg!(target_os = "linux") {
         return false;
     }
 
+    if let Ok(val) = env::var("GGML_SYCL") {
+        return matches!(val.to_ascii_lowercase().as_str(), "1" | "on" | "true");
+    }
     if let Ok(oneapi_root) = env::var("ONEAPI_ROOT")
         && Path::new(&oneapi_root).exists()
     {

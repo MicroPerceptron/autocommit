@@ -35,6 +35,16 @@ jobs:
             target: x86_64-unknown-linux-gnu
             suffix: -cuda
             cuda: true
+          - name: Linux-x86_64-vulkan
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            suffix: -vulkan
+            vulkan: true
+          - name: Linux-x86_64-sycl
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            suffix: -sycl
+            sycl: true
     steps:
       - uses: actions/checkout@v4
         with:
@@ -56,6 +66,23 @@ jobs:
           method: network
           sub-packages: '["nvcc", "cudart", "cublas", "cublas_dev"]'
 
+      - name: Install Vulkan SDK
+        if: matrix.vulkan
+        run: sudo apt-get update && sudo apt-get install -y glslc libvulkan-dev
+
+      - name: Add Intel oneAPI repository
+        if: matrix.sycl
+        run: |
+          cd /tmp
+          wget -qO- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB | sudo gpg --dearmor -o /usr/share/keyrings/intel-oneapi-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/intel-oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" | sudo tee /etc/apt/sources.list.d/intel-oneapi.list
+
+      - name: Install Intel oneAPI
+        if: matrix.sycl
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y intel-oneapi-compiler-dpcpp-cpp intel-oneapi-mkl-devel
+
       - name: Install deps (macOS)
         if: runner.os == 'macOS'
         run: brew install cmake openssl@3
@@ -72,7 +99,13 @@ jobs:
       - name: Build release binary
         env:
           GGML_CUDA: ${{ matrix.cuda && 'ON' || '' }}
-        run: cargo build --release --features llama-native -p autocommit-cli --target ${{ matrix.target }}
+          GGML_SYCL: ${{ matrix.sycl && 'ON' || '' }}
+          GGML_VULKAN: ${{ matrix.vulkan && 'ON' || '' }}
+        run: |
+          if [ "${{ matrix.sycl }}" = "true" ]; then
+            source /opt/intel/oneapi/setvars.sh
+          fi
+          cargo build --release --features llama-native -p autocommit-cli --target ${{ matrix.target }}
 
       - name: Package artifact
         run: |

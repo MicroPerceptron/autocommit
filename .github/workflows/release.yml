@@ -109,7 +109,7 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           TARGET="${{ matrix.target }}"
           SUFFIX="${{ matrix.suffix }}"
-          ARCHIVE="autocommit-${VERSION}-${TARGET}${SUFFIX}.tar.gz"
+          ARCHIVE="autocommit-${TARGET}${SUFFIX}.tar.gz"
 
           mkdir staging
           cp "target/${{ matrix.target }}/release/autocommit" staging/

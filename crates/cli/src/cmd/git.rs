@@ -393,6 +393,11 @@ impl Repo {
         if let Some(parent_id) = parent_id {
             command.arg("-p").arg(parent_id.to_string());
         }
+        // Ensure GPG_TTY is set so gpg-agent/pinentry can find the terminal
+        // for passphrase prompts without requiring manual shell configuration.
+        if std::env::var("GPG_TTY").is_err() {
+            command.env("GPG_TTY", "/dev/tty");
+        }
         command
             .args(["-F", "-"])
             .current_dir(&repo_root)

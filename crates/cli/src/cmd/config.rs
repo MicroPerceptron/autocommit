@@ -533,6 +533,9 @@ fn prompt_model_selection() -> Result<ModelSelection, String> {
                 ("Qwen3 8B", "ggml-org/Qwen3-8B-GGUF"),
                 ("Gemma 3 1B IT", "ggml-org/gemma-3-1b-it-GGUF"),
                 ("Gemma 3n E2B IT", "ggml-org/gemma-3n-E2B-it-GGUF"),
+                ("LFM 2.5 1.2B", "LiquidAI/LFM2.5-1.2B-Instruct-GGUF"),
+                ("BitNet b1.58 2B", "microsoft/bitnet-b1.58-2B-4T-gguf"),
+                ("Ministral 3B", "mistralai/Ministral-3-3B-Instruct-2512-GGUF"),
                 ("Custom HF repo", ""),
             ];
             let repo_labels = repo_options
@@ -558,33 +561,35 @@ fn prompt_model_selection() -> Result<ModelSelection, String> {
 
             let hf_repo = if base_repo.contains(':') {
                 base_repo
+            } else if base_repo.contains("bitnet") {
+                // BitNet is natively 1-bit quantized — no additional quant tag
+                base_repo
             } else {
-                let gemma_3n = base_repo.contains("gemma-3n-E2B");
-                let quant_options: Vec<&str> = if gemma_3n {
-                    vec!["Q8_0 (recommended)", "f16"]
-                } else {
-                    vec!["Q4_K_M (recommended)", "Q8_0", "f16"]
-                };
+                let (labels, quants): (Vec<&str>, Vec<&str>) =
+                    if base_repo.contains("gemma-3n-E2B") {
+                        (
+                            vec!["Q8_0 (recommended)", "F16"],
+                            vec!["Q8_0", "F16"],
+                        )
+                    } else if base_repo.contains("Ministral") {
+                        (
+                            vec!["Q8_0 (recommended)", "Q4_K_M", "BF16"],
+                            vec!["Q8_0", "Q4_K_M", "BF16"],
+                        )
+                    } else {
+                        (
+                            vec!["Q4_K_M (recommended)", "Q8_0", "F16"],
+                            vec!["Q4_K_M", "Q8_0", "F16"],
+                        )
+                    };
                 let quant_selection = Select::with_theme(&theme)
                     .with_prompt("Quantization")
-                    .items(&quant_options)
+                    .items(&labels)
                     .default(0)
                     .interact_on_opt(&term)
                     .map_err(|err| format!("failed to read quant selection: {err}"))?
                     .unwrap_or(0);
-                let quant = if gemma_3n {
-                    match quant_selection {
-                        1 => "f16",
-                        _ => "Q8_0",
-                    }
-                } else {
-                    match quant_selection {
-                        1 => "Q8_0",
-                        2 => "f16",
-                        _ => "Q4_K_M",
-                    }
-                };
-                format!("{base_repo}:{quant}")
+                format!("{base_repo}:{}", quants[quant_selection])
             };
 
             let use_custom_cache = Confirm::with_theme(&theme)

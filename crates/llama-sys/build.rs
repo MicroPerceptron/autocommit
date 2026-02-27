@@ -283,10 +283,26 @@ fn main() {
     if use_vulkan {
         emit_vulkan_link_deps();
     }
-    // Link OpenBLAS on Linux when BLAS is enabled (non-SYCL builds).
+    // Static-link OpenMP and BLAS on non-SYCL Linux for minimal runtime deps.
+    // SYCL uses Intel's iomp5 and MKL instead (linked in emit_sycl_link_deps).
     #[cfg(target_os = "linux")]
     if !use_sycl {
-        println!("cargo:rustc-link-lib=dylib=openblas");
+        // libgomp.a lives in GCC's internal lib dir, not the standard search path.
+        if let Ok(output) = Command::new("cc")
+            .arg("-print-file-name=libgomp.a")
+            .output()
+        {
+            if output.status.success() {
+                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if let Some(dir) = Path::new(&path).parent() {
+                    if dir.is_dir() {
+                        println!("cargo:rustc-link-search=native={}", dir.display());
+                    }
+                }
+            }
+        }
+        println!("cargo:rustc-link-lib=static=gomp");
+        println!("cargo:rustc-link-lib=static=openblas");
     }
 
     println!(
@@ -386,9 +402,6 @@ fn emit_link_search_paths(install_dir: &Path) {
     #[cfg(target_os = "linux")]
     {
         println!("cargo:rustc-link-lib=dylib=stdc++");
-        // llama.cpp enables OpenMP for the CPU backend on Linux by default.
-        // The static archives contain GOMP symbols that need the runtime.
-        println!("cargo:rustc-link-lib=dylib=gomp");
     }
 }
 

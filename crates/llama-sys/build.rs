@@ -24,6 +24,42 @@ fn cmake_parallel_jobs() -> usize {
     std::cmp::max(1, nproc.saturating_mul(2) / 3)
 }
 
+/// Discover the directory containing a static library via the C compiler and add
+/// it as a native link search path. Needed for libraries like `libgomp.a` that
+/// live in GCC's internal lib directory.
+#[cfg(target_os = "linux")]
+fn add_lib_dir_from_compiler(cc: &str, lib_file: &str) {
+    if let Ok(output) = Command::new(cc)
+        .arg(format!("-print-file-name={lib_file}"))
+        .output()
+        && output.status.success()
+    {
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if let Some(dir) = Path::new(&path).parent()
+            && dir.is_dir()
+        {
+            println!("cargo:rustc-link-search=native={}", dir.display());
+        }
+    }
+}
+
+/// Discover the library directory for a package via pkg-config and add it as a
+/// native link search path. Needed for libraries like `libopenblas.a` that live
+/// in variant-specific subdirectories on Debian/Ubuntu.
+#[cfg(target_os = "linux")]
+fn add_lib_dir_from_pkg_config(package: &str) {
+    if let Ok(output) = Command::new("pkg-config")
+        .args(["--variable=libdir", package])
+        .output()
+        && output.status.success()
+    {
+        let dir = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !dir.is_empty() && Path::new(&dir).is_dir() {
+            println!("cargo:rustc-link-search=native={dir}");
+        }
+    }
+}
+
 /// Check whether `GGML_<backend>` is explicitly set (to any value).
 fn is_explicitly_set(var: &str) -> bool {
     env::var(var).is_ok()
@@ -288,20 +324,12 @@ fn main() {
     #[cfg(target_os = "linux")]
     if !use_sycl {
         // libgomp.a lives in GCC's internal lib dir, not the standard search path.
-        if let Ok(output) = Command::new("cc")
-            .arg("-print-file-name=libgomp.a")
-            .output()
-        {
-            if output.status.success() {
-                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if let Some(dir) = Path::new(&path).parent() {
-                    if dir.is_dir() {
-                        println!("cargo:rustc-link-search=native={}", dir.display());
-                    }
-                }
-            }
-        }
+        add_lib_dir_from_compiler("cc", "libgomp.a");
         println!("cargo:rustc-link-lib=static=gomp");
+
+        // libopenblas.a lives in a variant-specific subdir on Ubuntu/Debian
+        // (e.g. /usr/lib/x86_64-linux-gnu/openblas-pthread/). Use pkg-config.
+        add_lib_dir_from_pkg_config("openblas");
         println!("cargo:rustc-link-lib=static=openblas");
     }
 

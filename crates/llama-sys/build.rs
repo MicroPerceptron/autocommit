@@ -407,6 +407,12 @@ fn emit_cuda_link_deps() {
     for dir in &lib_search_dirs {
         if dir.exists() {
             println!("cargo:rustc-link-search=native={}", dir.display());
+            // The CUDA toolkit ships a libcuda.so stub under lib64/stubs/ for
+            // building on machines without a GPU driver (e.g. CI runners).
+            let stubs = dir.join("stubs");
+            if stubs.exists() {
+                println!("cargo:rustc-link-search=native={}", stubs.display());
+            }
         }
     }
 
@@ -460,6 +466,10 @@ fn emit_sycl_link_deps() {
     println!("cargo:rustc-link-lib=dylib=svml");
     println!("cargo:rustc-link-lib=dylib=irc");
     println!("cargo:rustc-link-lib=dylib=imf");
+
+    // Intel OpenMP runtime — icpx uses __kmpc_* symbols (Intel's OpenMP ABI)
+    // instead of GOMP_* (GNU's). libiomp5 provides these.
+    println!("cargo:rustc-link-lib=dylib=iomp5");
 }
 
 fn emit_vulkan_link_deps() {

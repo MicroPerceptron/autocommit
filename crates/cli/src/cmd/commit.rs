@@ -340,7 +340,10 @@ pub fn run(args: &[String]) -> Result<String, String> {
     )
     .map_err(|err| err.to_string())?;
 
-    run_step(rich_interactive, "Creating commit", || {
+    // Disable the spinner when signing — pinentry opens /dev/tty for the
+    // passphrase prompt and the 80ms spinner ticks corrupt its display.
+    let show_commit_spinner = rich_interactive && !commit_policy_config.sign_commits;
+    run_step(show_commit_spinner, "Creating commit", || {
         commit_with_message(
             &repo,
             &final_message,

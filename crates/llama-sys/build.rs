@@ -429,6 +429,8 @@ fn emit_cuda_link_deps() {
         println!("cargo:rustc-link-lib=static=cudart_static");
         println!("cargo:rustc-link-lib=static=cublas_static");
         println!("cargo:rustc-link-lib=static=cublasLt_static");
+        // culibos provides the library loader used internally by static cublas/cublasLt
+        println!("cargo:rustc-link-lib=static=culibos");
         println!("cargo:rustc-link-lib=dylib=cuda");
     }
 }

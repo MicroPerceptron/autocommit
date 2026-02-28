@@ -4,21 +4,19 @@ use crate::tensor::graph::ComputeGraph;
 use crate::tensor::handle::TensorHandle;
 
 /// Look up token embeddings from the embedding weight matrix.
-/// Returns a tensor of shape [n_embd, n_tokens].
+///
+/// Returns `(embedding_output, token_ids_tensor)`. The `token_ids_tensor`
+/// is marked as input and must be filled with token IDs via
+/// `ggml_backend_tensor_set` after graph allocation.
 pub fn embed_tokens(
     graph: &mut ComputeGraph,
-    token_ids: &[i32],
+    n_tokens: i64,
     weights: QuantSlice<'_>,
-) -> TensorHandle {
-    let n_tokens = token_ids.len() as i64;
-
+) -> (TensorHandle, TensorHandle) {
     // Create token ID tensor as I32 (index type for get_rows)
+    // Marked as input so the gallocr preserves it.
     let ids = graph.new_tensor_1d(QuantType::I32, n_tokens);
-    // SAFETY: ids tensor was just allocated as I32 with sufficient size for n_tokens elements.
-    unsafe {
-        let ptr = (*ids.as_ptr()).data as *mut i32;
-        std::ptr::copy_nonoverlapping(token_ids.as_ptr(), ptr, token_ids.len());
-    }
+    graph.set_input(ids);
 
     // Create weight matrix view
     let n_embd = weights.n_cols() as i64;
@@ -29,5 +27,6 @@ pub fn embed_tokens(
     };
 
     // get_rows extracts rows from the weight matrix by token IDs
-    graph.get_rows(embd_weights, ids)
+    let output = graph.get_rows(embd_weights, ids);
+    (output, ids)
 }

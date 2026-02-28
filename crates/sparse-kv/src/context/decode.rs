@@ -1,9 +1,13 @@
+use ggml_sys::ffi;
+
 use crate::arena::kv_arena::KvArena;
 use crate::context::agent::AgentContext;
 use crate::error::InferenceError;
 use crate::forward;
 use crate::gguf::GgufReader;
 use crate::model::config::ModelConfig;
+use crate::quant::QuantType;
+use crate::tensor::backend::Backend;
 use crate::tensor::graph::ComputeGraph;
 
 /// Decode a single token for an agent, returning logits.
@@ -11,31 +15,37 @@ use crate::tensor::graph::ComputeGraph;
 /// This is the core inference loop:
 /// 1. Allocate a KV slot for the new token
 /// 2. Build a ggml compute graph for the full forward pass
-/// 3. Execute the graph
-/// 4. Extract logits
+/// 3. Execute the graph on the backend
+/// 4. Extract logits from the output tensor
 pub fn decode_one(
     agent: &mut AgentContext,
     token_id: i32,
     arena: &mut KvArena,
     reader: &GgufReader,
     config: &ModelConfig,
+    backend: &Backend,
 ) -> Result<Vec<f32>, InferenceError> {
     // Allocate a slot for this token position
     let logical_pos = agent.seq_len as u32;
     let new_slot = arena.alloc_slot(agent.id, logical_pos)?;
     agent.push_slot(new_slot);
 
-    // Build the position map for this agent
-    let position_map = arena.agent_position_map(agent.id);
+    let seq_len = agent.seq_len as i64;
 
-    // Estimate memory needed for the compute graph
-    // Generous allocation: ~256MB should cover most models
-    let mem_size = 256 * 1024 * 1024;
-    let mut graph = ComputeGraph::new(mem_size)?;
+    // Graph context: enough memory for tensor metadata.
+    // With no_alloc=true, the gallocr handles actual buffer allocation.
+    let graph_overhead = 256 * 1024 * 1024; // 256 MB for graph metadata
+    let mut graph = ComputeGraph::new(graph_overhead, true)?;
+
+    // Create position tensor (shared across all layers)
+    // Data will be set after graph allocation, before compute.
+    let pos_tensor = graph.new_tensor_1d(QuantType::I32, 1);
+    graph.set_input(pos_tensor);
 
     // Embedding lookup
     let tok_embd = reader.tensor_data("token_embd.weight")?;
-    let mut hidden = forward::embedding::embed_tokens(&mut graph, &[token_id], tok_embd);
+    let (embedding, ids_tensor) = forward::embedding::embed_tokens(&mut graph, 1, tok_embd);
+    let mut hidden = embedding;
 
     // Per-layer transformer blocks
     for l in 0..config.n_layer {
@@ -59,7 +69,8 @@ pub fn decode_one(
             arena,
             l,
             new_slot,
-            &position_map,
+            pos_tensor,
+            seq_len,
             config,
         );
 
@@ -86,19 +97,53 @@ pub fn decode_one(
 
     // Output projection -> logits
     let output_weight = reader.tensor_data("output.weight")?;
-    let _logits = forward::output::output_projection(&mut graph, hidden, output_weight);
+    let logits = forward::output::output_projection(&mut graph, hidden, output_weight);
 
-    // TODO: Execute the compute graph via ggml_backend_graph_compute
-    // and extract logits from the output tensor.
-    //
-    // For now, return empty logits — the graph is built but not yet
-    // executed. Full execution requires:
-    // 1. ggml_backend initialization (CPU or Metal)
-    // 2. ggml_backend_graph_plan + ggml_backend_graph_compute
-    // 3. Reading the output tensor's data buffer
+    // Mark logits as output so the allocator doesn't free it
+    graph.set_output(logits);
 
-    let logits = vec![0.0f32; config.n_vocab];
-    agent.last_logits = logits.clone();
+    // Build the compute graph
+    graph.build_forward(logits);
 
-    Ok(logits)
+    // Allocate tensors on the backend (no execution yet)
+    graph.alloc_graph(backend)?;
+
+    // Set input data AFTER allocation, BEFORE execution.
+    // Token IDs for embedding lookup.
+    unsafe {
+        ffi::ggml_backend_tensor_set(
+            ids_tensor.as_ptr(),
+            &token_id as *const i32 as *const std::os::raw::c_void,
+            0,
+            std::mem::size_of::<i32>(),
+        );
+    }
+    // The position tensor needs the current logical position.
+    unsafe {
+        ffi::ggml_backend_tensor_set(
+            pos_tensor.as_ptr(),
+            &logical_pos as *const u32 as *const std::os::raw::c_void,
+            0,
+            std::mem::size_of::<i32>(),
+        );
+    }
+
+    // Execute the graph
+    graph.execute(backend)?;
+
+    // Extract logits from the output tensor
+    let n_vocab = config.n_vocab;
+    let mut logits_data = vec![0.0f32; n_vocab];
+    unsafe {
+        ffi::ggml_backend_tensor_get(
+            logits.as_ptr(),
+            logits_data.as_mut_ptr() as *mut std::os::raw::c_void,
+            0,
+            n_vocab * std::mem::size_of::<f32>(),
+        );
+    }
+
+    agent.last_logits = logits_data.clone();
+
+    Ok(logits_data)
 }

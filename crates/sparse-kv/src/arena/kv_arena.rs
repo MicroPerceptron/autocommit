@@ -2,6 +2,8 @@ use crate::arena::position_map::PositionMap;
 use crate::arena::slot::{AgentId, LogicalPos, SlotId, SlotState};
 use crate::error::InferenceError;
 use crate::quant::QuantType;
+use crate::tensor::backend::Backend;
+use crate::tensor::buffer::BackendBuffer;
 
 #[derive(Debug, Clone)]
 pub struct ArenaConfig {
@@ -12,44 +14,61 @@ pub struct ArenaConfig {
     pub dtype: QuantType,
 }
 
-struct LayerBuf {
-    data: Vec<u8>,
-    slot_stride: usize,
+/// Backing storage for one layer's K or V data across all slots.
+enum KvBacking {
+    /// CPU-side Vec<u8> for tests and CPU-only operation.
+    Cpu(Vec<u8>),
+    /// Backend-allocated buffer (Metal, CUDA, etc.).
+    Device(BackendBuffer),
 }
 
-impl LayerBuf {
-    fn new(capacity: usize, slot_stride: usize) -> Self {
-        Self {
-            data: vec![0u8; capacity * slot_stride],
-            slot_stride,
+impl KvBacking {
+    fn base_ptr(&mut self) -> *mut u8 {
+        match self {
+            KvBacking::Cpu(v) => v.as_mut_ptr(),
+            KvBacking::Device(buf) => buf.base_ptr(),
         }
     }
 
-    fn slot_range(&self, slot: usize) -> std::ops::Range<usize> {
-        let start = slot * self.slot_stride;
-        start..start + self.slot_stride
-    }
-
-    fn key_offset(&self, slot: usize) -> usize {
-        slot * self.slot_stride
-    }
-
-    fn val_offset(&self, slot: usize) -> usize {
-        slot * self.slot_stride + self.slot_stride / 2
-    }
-
-    fn half_stride(&self) -> usize {
-        self.slot_stride / 2
+    fn copy_within(&mut self, src_offset: usize, dst_offset: usize, len: usize) {
+        match self {
+            KvBacking::Cpu(v) => {
+                v.copy_within(src_offset..src_offset + len, dst_offset);
+            }
+            KvBacking::Device(buf) => {
+                // For host-accessible device buffers (e.g. Metal shared memory),
+                // we can copy directly through the base pointer.
+                if buf.is_host() {
+                    let ptr = buf.base_ptr();
+                    // SAFETY: caller guarantees non-overlapping or forward copy.
+                    unsafe {
+                        std::ptr::copy(ptr.add(src_offset), ptr.add(dst_offset), len);
+                    }
+                }
+                // For non-host buffers, compaction requires a staging copy via
+                // ggml_backend_tensor_get/set. Not yet implemented — we'll hit
+                // this path only on discrete GPUs.
+            }
+        }
     }
 }
 
-/// Pre-allocated KV cache arena. One contiguous buffer per layer.
+/// Per-layer storage: separate K and V buffers.
+struct LayerKvBuf {
+    key: KvBacking,
+    val: KvBacking,
+    entry_size: usize, // bytes per slot per K or V
+}
+
+/// Pre-allocated KV cache arena. Separate K and V buffers per layer.
 ///
-/// Memory layout per slot: [key_data | val_data]
-/// where key_data and val_data are each `n_kv_head * head_dim` elements
-/// in the configured dtype.
+/// Memory layout per layer:
+///   key_buf: [slot_0_key | slot_1_key | ... | slot_N_key]
+///   val_buf: [slot_0_val | slot_1_val | ... | slot_N_val]
+///
+/// Each entry is `n_kv_head * head_dim` elements in the configured dtype.
 pub struct KvArena {
-    layer_bufs: Vec<LayerBuf>,
+    layers: Vec<LayerKvBuf>,
     slots: Vec<SlotState>,
     capacity: usize,
     n_layer: usize,
@@ -60,21 +79,24 @@ pub struct KvArena {
 }
 
 impl KvArena {
+    /// Create a KV arena with CPU-backed storage (for tests and CPU inference).
     pub fn new(config: &ArenaConfig) -> Self {
         assert!(config.n_layer > 0, "KvArena requires at least 1 layer");
         assert!(config.capacity > 0, "KvArena requires capacity > 0");
-        let kv_elements = config.n_kv_head * config.head_dim;
-        // Each slot stores both K and V, hence *2
-        let slot_stride = config.dtype.row_size(kv_elements) * 2;
+        let entry_size = config.dtype.row_size(config.n_kv_head * config.head_dim);
 
-        let layer_bufs = (0..config.n_layer)
-            .map(|_| LayerBuf::new(config.capacity, slot_stride))
+        let layers = (0..config.n_layer)
+            .map(|_| LayerKvBuf {
+                key: KvBacking::Cpu(vec![0u8; config.capacity * entry_size]),
+                val: KvBacking::Cpu(vec![0u8; config.capacity * entry_size]),
+                entry_size,
+            })
             .collect();
 
         let slots = vec![SlotState::Free; config.capacity];
 
         Self {
-            layer_bufs,
+            layers,
             slots,
             capacity: config.capacity,
             n_layer: config.n_layer,
@@ -83,6 +105,43 @@ impl KvArena {
             dtype: config.dtype,
             free_count: config.capacity,
         }
+    }
+
+    /// Create a KV arena with backend-allocated storage (for GPU inference).
+    pub fn with_backend(
+        config: &ArenaConfig,
+        backend: &Backend,
+    ) -> Result<Self, InferenceError> {
+        assert!(config.n_layer > 0, "KvArena requires at least 1 layer");
+        assert!(config.capacity > 0, "KvArena requires capacity > 0");
+        let entry_size = config.dtype.row_size(config.n_kv_head * config.head_dim);
+        let buf_size = config.capacity * entry_size;
+
+        let mut layers = Vec::with_capacity(config.n_layer);
+        for _ in 0..config.n_layer {
+            let mut key_buf = backend.alloc_buffer(buf_size)?;
+            let mut val_buf = backend.alloc_buffer(buf_size)?;
+            key_buf.clear(0);
+            val_buf.clear(0);
+            layers.push(LayerKvBuf {
+                key: KvBacking::Device(key_buf),
+                val: KvBacking::Device(val_buf),
+                entry_size,
+            });
+        }
+
+        let slots = vec![SlotState::Free; config.capacity];
+
+        Ok(Self {
+            layers,
+            slots,
+            capacity: config.capacity,
+            n_layer: config.n_layer,
+            head_dim: config.head_dim,
+            n_kv_head: config.n_kv_head,
+            dtype: config.dtype,
+            free_count: config.capacity,
+        })
     }
 
     pub fn capacity(&self) -> usize {
@@ -111,6 +170,11 @@ impl KvArena {
 
     pub fn dtype(&self) -> QuantType {
         self.dtype
+    }
+
+    /// Byte size of one K or V entry per slot.
+    pub fn entry_size(&self) -> usize {
+        self.layers[0].entry_size
     }
 
     /// Allocate the next free slot for an agent at a given logical position.
@@ -217,14 +281,13 @@ impl KvArena {
             positions.push(self.slots[read_idx].logical_pos().unwrap());
 
             if write_idx != read_idx {
-                // Move slot data in every layer
-                for layer_buf in &mut self.layer_bufs {
-                    let src = layer_buf.slot_range(read_idx);
-                    let dst_start = layer_buf.slot_range(write_idx).start;
-                    // SAFETY: src and dst ranges do not overlap because
-                    // write_idx < read_idx (write_idx only advances when
-                    // we find an occupied slot, and we skip free ones).
-                    layer_buf.data.copy_within(src, dst_start);
+                let entry_size = self.layers[0].entry_size;
+                // Move slot data in every layer — K and V separately
+                for layer in &mut self.layers {
+                    let src_off = read_idx * entry_size;
+                    let dst_off = write_idx * entry_size;
+                    layer.key.copy_within(src_off, dst_off, entry_size);
+                    layer.val.copy_within(src_off, dst_off, entry_size);
                 }
 
                 self.slots[write_idx] = self.slots[read_idx];
@@ -239,41 +302,43 @@ impl KvArena {
         PositionMap::new(positions)
     }
 
-    /// Get raw pointers to a layer's K and V sub-buffers at a specific slot.
+    /// Get raw pointer to a layer's K buffer for a specific slot.
     ///
     /// # Safety
-    /// Caller must ensure:
-    /// - `layer` < `n_layer`
-    /// - `slot` < `capacity`
-    /// - The returned pointers are not used after `compact()` or `mark_evict()`.
-    pub unsafe fn slot_kv_ptrs(&mut self, layer: usize, slot: SlotId) -> (*mut u8, *mut u8) {
-        let buf = &mut self.layer_bufs[layer];
+    /// Caller must ensure `layer` < `n_layer` and `slot` < `capacity`.
+    /// Pointer is invalidated by `compact()` or `mark_evict()`.
+    pub unsafe fn slot_key_ptr(&mut self, layer: usize, slot: SlotId) -> *mut u8 {
         let idx = slot.0 as usize;
-        // SAFETY: caller guarantees layer/slot bounds and pointer lifetime.
-        unsafe {
-            let key_ptr = buf.data.as_mut_ptr().add(buf.key_offset(idx));
-            let val_ptr = buf.data.as_mut_ptr().add(buf.val_offset(idx));
-            (key_ptr, val_ptr)
-        }
+        let entry_size = self.layers[layer].entry_size;
+        // SAFETY: caller guarantees bounds.
+        unsafe { self.layers[layer].key.base_ptr().add(idx * entry_size) }
     }
 
-    /// Get raw pointer to the entire K buffer for a layer, covering all slots.
-    /// The K data for slot `i` starts at offset `i * kv_element_size`.
+    /// Get raw pointer to a layer's V buffer for a specific slot.
     ///
     /// # Safety
-    /// Same as `slot_kv_ptrs`.
+    /// Same as `slot_key_ptr`.
+    pub unsafe fn slot_val_ptr(&mut self, layer: usize, slot: SlotId) -> *mut u8 {
+        let idx = slot.0 as usize;
+        let entry_size = self.layers[layer].entry_size;
+        // SAFETY: caller guarantees bounds.
+        unsafe { self.layers[layer].val.base_ptr().add(idx * entry_size) }
+    }
+
+    /// Get raw pointer to the entire K buffer for a layer (all slots contiguous).
+    ///
+    /// # Safety
+    /// Same as `slot_key_ptr`.
     pub unsafe fn layer_key_ptr(&mut self, layer: usize) -> *mut u8 {
-        self.layer_bufs[layer].data.as_mut_ptr()
+        self.layers[layer].key.base_ptr()
     }
 
-    /// Byte stride between consecutive slots' key (or value) data.
-    pub fn slot_stride(&self) -> usize {
-        self.layer_bufs[0].slot_stride
-    }
-
-    /// Byte size of one K or V entry per slot.
-    pub fn kv_entry_size(&self) -> usize {
-        self.layer_bufs[0].half_stride()
+    /// Get raw pointer to the entire V buffer for a layer (all slots contiguous).
+    ///
+    /// # Safety
+    /// Same as `slot_key_ptr`.
+    pub unsafe fn layer_val_ptr(&mut self, layer: usize) -> *mut u8 {
+        self.layers[layer].val.base_ptr()
     }
 
     pub fn slot_state(&self, slot: SlotId) -> SlotState {
@@ -419,5 +484,13 @@ mod tests {
 
         // And now it should be full again
         assert!(arena.alloc_slot(agent, 12).is_err());
+    }
+
+    #[test]
+    fn entry_size_consistent() {
+        let config = test_config(4);
+        let arena = KvArena::new(&config);
+        // F16, head_dim=4, n_kv_head=1 → 4 elements × 2 bytes = 8 bytes per entry
+        assert_eq!(arena.entry_size(), 8);
     }
 }

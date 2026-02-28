@@ -111,7 +111,10 @@ impl GgufReader {
             .unwrap_or(32) as u64;
         let data_offset = (header_end + alignment - 1) / alignment * alignment;
 
-        if data_offset + max_tensor_end > file_len {
+        // Only validate data bounds when tensors are present.
+        // Vocab-only GGUF files have no tensors, so the aligned data_offset
+        // may legally exceed the file length.
+        if max_tensor_end > 0 && data_offset + max_tensor_end > file_len {
             return Err(InferenceError::Load(format!(
                 "GGUF data section extends beyond file (data_offset={data_offset}, \
                  max_tensor_end={max_tensor_end}, file_len={file_len})"

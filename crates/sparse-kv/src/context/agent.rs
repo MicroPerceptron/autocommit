@@ -1,11 +1,13 @@
 use crate::arena::slot::{AgentId, SlotId};
+use crate::grammar::GrammarEngine;
 
-#[derive(Debug)]
 pub struct AgentContext {
     pub id: AgentId,
     pub slots: Vec<SlotId>,
     pub seq_len: usize,
     pub last_logits: Vec<f32>,
+    /// Optional grammar constraint for this agent's generation.
+    pub grammar: Option<GrammarEngine>,
 }
 
 impl AgentContext {
@@ -15,6 +17,7 @@ impl AgentContext {
             slots: Vec::new(),
             seq_len: 0,
             last_logits: Vec::new(),
+            grammar: None,
         }
     }
 

@@ -7,3 +7,7 @@ pub mod sparse;
 pub mod tensor;
 pub mod forward;
 pub mod context;
+pub mod tokenizer;
+pub mod sampling;
+pub mod grammar;
+pub mod engine;

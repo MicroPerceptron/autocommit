@@ -1778,6 +1778,7 @@ name = "sparse-kv"
 version = "0.1.0"
 dependencies = [
  "ggml-sys",
+ "heapless",
  "memmap2",
 ]
 

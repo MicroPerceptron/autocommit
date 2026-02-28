@@ -61,6 +61,23 @@ impl GgufValue {
             _ => None,
         }
     }
+
+    pub fn as_i32(&self) -> Option<i32> {
+        match self {
+            Self::I32(v) => Some(*v),
+            Self::U32(v) => i32::try_from(*v).ok(),
+            Self::I64(v) => i32::try_from(*v).ok(),
+            Self::U64(v) => i32::try_from(*v).ok(),
+            _ => None,
+        }
+    }
+
+    pub fn as_array(&self) -> Option<&[GgufValue]> {
+        match self {
+            Self::Array(v) => Some(v.as_slice()),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -87,5 +104,40 @@ impl GgufMetadata {
 
     pub fn get_str(&self, key: &str) -> Option<&str> {
         self.get(key).and_then(|v| v.as_str())
+    }
+
+    pub fn get_bool(&self, key: &str) -> Option<bool> {
+        self.get(key).and_then(|v| v.as_bool())
+    }
+
+    pub fn get_i32(&self, key: &str) -> Option<i32> {
+        self.get(key).and_then(|v| v.as_i32())
+    }
+
+    pub fn get_string_array(&self, key: &str) -> Option<Vec<&str>> {
+        let arr = self.get(key)?.as_array()?;
+        let mut result = Vec::with_capacity(arr.len());
+        for v in arr {
+            result.push(v.as_str()?);
+        }
+        Some(result)
+    }
+
+    pub fn get_f32_array(&self, key: &str) -> Option<Vec<f32>> {
+        let arr = self.get(key)?.as_array()?;
+        let mut result = Vec::with_capacity(arr.len());
+        for v in arr {
+            result.push(v.as_f32()?);
+        }
+        Some(result)
+    }
+
+    pub fn get_i32_array(&self, key: &str) -> Option<Vec<i32>> {
+        let arr = self.get(key)?.as_array()?;
+        let mut result = Vec::with_capacity(arr.len());
+        for v in arr {
+            result.push(v.as_i32()?);
+        }
+        Some(result)
     }
 }

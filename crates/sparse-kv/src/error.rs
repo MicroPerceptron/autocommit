@@ -8,6 +8,7 @@ pub enum InferenceError {
     Compute(String),
     Arena(String),
     Agent(String),
+    Tokenize(String),
 }
 
 impl Display for InferenceError {
@@ -18,6 +19,7 @@ impl Display for InferenceError {
             Self::Compute(msg) => write!(f, "compute error: {msg}"),
             Self::Arena(msg) => write!(f, "arena error: {msg}"),
             Self::Agent(msg) => write!(f, "agent error: {msg}"),
+            Self::Tokenize(msg) => write!(f, "tokenize error: {msg}"),
         }
     }
 }

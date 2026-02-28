@@ -161,6 +161,9 @@ fn generate_bindings(source_dir: &Path, out_dir: &Path) {
     let include_dir = source_dir.join("include");
     let ggml_h = include_dir.join("ggml.h");
     let gguf_h = include_dir.join("gguf.h");
+    let backend_h = include_dir.join("ggml-backend.h");
+    let alloc_h = include_dir.join("ggml-alloc.h");
+    let cpu_h = include_dir.join("ggml-cpu.h");
 
     assert!(
         ggml_h.is_file(),
@@ -179,6 +182,11 @@ fn generate_bindings(source_dir: &Path, out_dir: &Path) {
         .allowlist_var("^GGUF_.*")
         .blocklist_type("^FILE$")
         .blocklist_function("ggml_backend_dev_memory")
+        // ggml_backend_dev_caps has a field named `async` which is a C++ keyword
+        .blocklist_type("ggml_backend_dev_caps")
+        // ggml_backend_dev_props contains ggml_backend_dev_caps
+        .blocklist_type("ggml_backend_dev_props")
+        .blocklist_function("ggml_backend_dev_get_props")
         .raw_line("pub type FILE = std::os::raw::c_void;")
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
         .layout_tests(false)
@@ -186,6 +194,26 @@ fn generate_bindings(source_dir: &Path, out_dir: &Path) {
 
     if gguf_h.is_file() {
         builder = builder.header(gguf_h.to_string_lossy());
+    }
+
+    // Backend infrastructure headers
+    if backend_h.is_file() {
+        builder = builder.header(backend_h.to_string_lossy());
+    }
+    if alloc_h.is_file() {
+        builder = builder.header(alloc_h.to_string_lossy());
+    }
+    if cpu_h.is_file() {
+        builder = builder.header(cpu_h.to_string_lossy());
+    }
+
+    // Metal backend (macOS only)
+    #[cfg(target_os = "macos")]
+    {
+        let metal_h = include_dir.join("ggml-metal.h");
+        if metal_h.is_file() {
+            builder = builder.header(metal_h.to_string_lossy());
+        }
     }
 
     let bindings = builder

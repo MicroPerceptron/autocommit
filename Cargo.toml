@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/core", "crates/cli", "crates/llama-sys", "crates/llama-runtime"]
+members = ["crates/core", "crates/cli", "crates/llama-sys", "crates/llama-runtime", "crates/ggml-sys", "crates/sparse-kv"]
 default-members = ["crates/core", "crates/cli"]
 resolver = "2"
 

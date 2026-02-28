@@ -1,0 +1,8 @@
+[package]
+name = "sparse-kv"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ggml-sys = { path = "../ggml-sys" }
+memmap2 = "0.9"

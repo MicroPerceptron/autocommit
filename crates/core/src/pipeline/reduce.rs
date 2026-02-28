@@ -1,5 +1,6 @@
 use crate::CoreError;
 use crate::diff::features::DiffFeatures;
+use crate::diff::importance::{self, ImportanceTier};
 use crate::llm::traits::LlmEngine;
 use crate::types::{
     AnalysisReport, ChangeItem, DiffStats, DispatchDecision, PartialReport, RiskReport, TypeTag,
@@ -79,8 +80,10 @@ pub fn format_only_report(
 
 fn synthesize_commit_message(items: &[ChangeItem]) -> String {
     let best = items.iter().max_by(|a, b| {
-        a.confidence
-            .partial_cmp(&b.confidence)
+        let a_score = a.confidence + importance_boost(a);
+        let b_score = b.confidence + importance_boost(b);
+        a_score
+            .partial_cmp(&b_score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
@@ -115,6 +118,22 @@ fn synthesize_summary(items: &[ChangeItem], stats: &DiffStats) -> String {
             capitalize_first(item.title.trim())
         ),
         None => format!("Update project code across {file_count} {noun}."),
+    }
+}
+
+/// Importance-based confidence adjustment for the draft path.
+/// Boosts primary code items, penalizes config/infrastructure items.
+fn importance_boost(item: &ChangeItem) -> f32 {
+    let path = item
+        .files
+        .first()
+        .map(|f| f.path.as_str())
+        .unwrap_or("");
+    match importance::classify_path(path) {
+        Some(ImportanceTier::Primary) => 0.1,
+        Some(ImportanceTier::Secondary) => -0.1,
+        Some(ImportanceTier::Supporting) => -0.3,
+        None => 0.0, // ambiguous — no adjustment in draft path
     }
 }
 
@@ -225,6 +244,7 @@ mod tests {
             hunks: 1,
             binary_files: 0,
             whitespace_only_lines: 0,
+            ..Default::default()
         };
 
         let report = synthesize_draft_report(&partials, &decision, &stats);
@@ -253,6 +273,7 @@ mod tests {
             hunks: 10,
             binary_files: 0,
             whitespace_only_lines: 118,
+            ..Default::default()
         };
 
         let report = format_only_report(&features, &decision, &stats);
@@ -283,6 +304,7 @@ mod tests {
             hunks: 1,
             binary_files: 0,
             whitespace_only_lines: 10,
+            ..Default::default()
         };
 
         let report = format_only_report(&features, &decision, &stats);

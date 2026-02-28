@@ -2619,6 +2619,7 @@ mod tests {
                 hunks: 4,
                 binary_files: 0,
                 whitespace_only_lines: 0,
+                ..Default::default()
             },
             dispatch: DispatchDecision {
                 route: DispatchRoute::DraftThenReduce,

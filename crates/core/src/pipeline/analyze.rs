@@ -4,6 +4,7 @@ use crate::CoreError;
 use crate::cache::anchor_embeddings::{self, AnchorEmbeddingCache};
 use crate::diff::collect;
 use crate::diff::features::{self, DiffFeatures};
+use crate::diff::signals;
 use crate::dispatch::{embedding_gate, heuristics, policy};
 use crate::llm::prompts;
 use crate::llm::traits::LlmEngine;
@@ -79,7 +80,8 @@ fn run_inner(
 
     // Feature extraction uses the original per-file chunks for accuracy.
     let features = features::extract(&raw_chunks);
-    let stats = to_stats(&features);
+    let key_symbols = signals::extract_key_symbols(&raw_chunks);
+    let stats = to_stats(&features, key_symbols);
 
     let heuristic = heuristics::score(&features);
     let embedding_hint = if embedding_gate::should_run_embedding(heuristic) {
@@ -187,12 +189,13 @@ fn resolve_anchor_cache(options: &AnalyzeOptions) -> Option<AnchorEmbeddingCache
     anchor_embeddings::anchor_cache_from_env()
 }
 
-fn to_stats(features: &DiffFeatures) -> DiffStats {
+fn to_stats(features: &DiffFeatures, key_symbols: Vec<String>) -> DiffStats {
     DiffStats {
         files_changed: features.files_changed,
         lines_changed: features.lines_changed,
         hunks: features.hunks,
         binary_files: features.binary_files,
         whitespace_only_lines: features.whitespace_only_lines,
+        key_symbols,
     }
 }

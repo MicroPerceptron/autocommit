@@ -23,6 +23,9 @@ Guidelines:
 pub const DISPATCH_DRAFT_ANCHOR: &str = "Small, low-risk diff limited to a few files with straightforward behavior updates, docs, or tests and no high-impact migration or workflow changes.";
 pub const DISPATCH_FULL_ANCHOR: &str = "Large or risky diff with cross-cutting code changes, migrations, workflow updates, manifests, and potentially high-impact behavior changes that need full analysis.";
 
+pub const IMPORTANCE_PRIMARY_ANCHOR: &str = "Primary code change that defines the feature, fix, or refactoring. Introduces new logic, modifies behavior, adds APIs, or restructures core modules.";
+pub const IMPORTANCE_SUPPORTING_ANCHOR: &str = "Supporting infrastructure or configuration change. Updates manifests, build scripts, CI workflows, dependency versions, or project settings without introducing new behavior.";
+
 pub fn build_analyze_prompt(chunk: &DiffChunk) -> String {
     format!(
         "/no_think\n\
@@ -53,6 +56,9 @@ Rules:\n\
 - commit_message must not mention analysis process words like: reduce, reducer, analysis, analyses, report, chunk, or partial\n\
 - commit_message should reflect the dominant weighted theme (scope + change type), not a single minor edit\n\
 - if scopes/types conflict, prefer the majority pattern shown in scope_distribution and type_distribution\n\
+- the PRIMARY changes section defines the commit's purpose — the commit title MUST describe these changes\n\
+- NEVER make the commit title about infrastructure or config when primary code changes are present\n\
+- use the Key symbols list (if present) for concrete nouns in the commit title\n\
 - do not use backticks in commit_message\n\
 - commit_message and summary must describe the overall intent and outcome, not enumerate individual files or list per-file changes\n\
 - summary must be one sentence about the code change outcome\n\

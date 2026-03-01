@@ -258,10 +258,113 @@ impl KvArena {
         result
     }
 
+    /// Get all evictable slots: occupied (not pinned, not free) with logical positions.
+    pub fn evictable_slots(&self) -> Vec<(SlotId, LogicalPos)> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| {
+                if let SlotState::Occupied { logical_pos, .. } = s {
+                    Some((SlotId(i as u32), *logical_pos))
+                } else {
+                    None // Free and Pinned are not evictable
+                }
+            })
+            .collect()
+    }
+
     /// Build a position map for an agent's current slots.
     pub fn agent_position_map(&self, agent: AgentId) -> PositionMap {
         let slots = self.agent_slots(agent);
         PositionMap::new(slots.iter().map(|(_, pos)| *pos).collect())
+    }
+
+    /// Compact the arena so that `target` agent's slots occupy positions 0..n_target,
+    /// followed by other agents' occupied slots. Free slots fill the rest.
+    ///
+    /// Returns `(0, n_target)` — the target agent's slots are at indices 0..n_target.
+    /// This ensures the target agent's KV data is contiguous for attention.
+    pub fn compact_for_agent(&mut self, target: AgentId) -> (usize, usize) {
+        // Build desired ordering: target agent first, others after, each sorted by logical_pos
+        let mut target_indices: Vec<usize> = Vec::new();
+        let mut other_indices: Vec<usize> = Vec::new();
+
+        for (i, s) in self.slots.iter().enumerate() {
+            if s.is_free() {
+                continue;
+            }
+            if s.agent() == Some(target) {
+                target_indices.push(i);
+            } else {
+                other_indices.push(i);
+            }
+        }
+
+        target_indices.sort_by_key(|&i| self.slots[i].logical_pos().unwrap());
+        other_indices.sort_by_key(|&i| self.slots[i].logical_pos().unwrap());
+
+        let n_target = target_indices.len();
+        let desired: Vec<usize> = target_indices
+            .iter()
+            .chain(other_indices.iter())
+            .copied()
+            .collect();
+        let n_total = desired.len();
+
+        // Check if already in the correct order (common single-agent case)
+        let already_ordered = desired.iter().enumerate().all(|(i, &src)| i == src);
+        if already_ordered {
+            self.free_count = self.capacity - n_total;
+            return (0, n_target);
+        }
+
+        // Apply permutation using temporary buffers
+        let entry_size = self.layers[0].entry_size;
+        let new_states: Vec<SlotState> = desired.iter().map(|&i| self.slots[i]).collect();
+
+        for layer in &mut self.layers {
+            let mut temp_k = vec![0u8; n_total * entry_size];
+            let mut temp_v = vec![0u8; n_total * entry_size];
+
+            let k_ptr = layer.key.base_ptr();
+            let v_ptr = layer.val.base_ptr();
+
+            for (dst_idx, &src_idx) in desired.iter().enumerate() {
+                let src_off = src_idx * entry_size;
+                let dst_off = dst_idx * entry_size;
+                // SAFETY: src_idx < capacity, dst_idx < n_total, both within allocated bounds.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        k_ptr.add(src_off),
+                        temp_k.as_mut_ptr().add(dst_off),
+                        entry_size,
+                    );
+                    std::ptr::copy_nonoverlapping(
+                        v_ptr.add(src_off),
+                        temp_v.as_mut_ptr().add(dst_off),
+                        entry_size,
+                    );
+                }
+            }
+
+            // Write back to positions 0..n_total
+            // SAFETY: n_total <= capacity, temp buffers are correctly sized.
+            unsafe {
+                std::ptr::copy_nonoverlapping(temp_k.as_ptr(), k_ptr, n_total * entry_size);
+                std::ptr::copy_nonoverlapping(temp_v.as_ptr(), v_ptr, n_total * entry_size);
+            }
+        }
+
+        // Update slot states
+        for (i, state) in new_states.into_iter().enumerate() {
+            self.slots[i] = state;
+        }
+        for i in n_total..self.capacity {
+            self.slots[i] = SlotState::Free;
+        }
+
+        self.free_count = self.capacity - n_total;
+        (0, n_target)
     }
 
     /// Compact: move all occupied slots to a contiguous prefix.
@@ -492,5 +595,122 @@ mod tests {
         let arena = KvArena::new(&config);
         // F16, head_dim=4, n_kv_head=1 → 4 elements × 2 bytes = 8 bytes per entry
         assert_eq!(arena.entry_size(), 8);
+    }
+
+    #[test]
+    fn compact_for_agent_orders_target_first() {
+        let mut arena = KvArena::new(&test_config(8));
+        let a0 = AgentId(0);
+        let a1 = AgentId(1);
+
+        // Interleaved allocation: A0, A1, A0, A1
+        arena.alloc_slot(a0, 0).unwrap();
+        arena.alloc_slot(a1, 0).unwrap();
+        arena.alloc_slot(a0, 1).unwrap();
+        arena.alloc_slot(a1, 1).unwrap();
+
+        let (start, count) = arena.compact_for_agent(a0);
+        assert_eq!(start, 0);
+        assert_eq!(count, 2);
+
+        // Verify a0's slots are at positions 0..2
+        let a0_slots = arena.agent_slots(a0);
+        assert_eq!(a0_slots.len(), 2);
+        assert_eq!(a0_slots[0].0, SlotId(0));
+        assert_eq!(a0_slots[1].0, SlotId(1));
+
+        // Verify a1's slots follow at positions 2..4
+        let a1_slots = arena.agent_slots(a1);
+        assert_eq!(a1_slots.len(), 2);
+        assert_eq!(a1_slots[0].0, SlotId(2));
+        assert_eq!(a1_slots[1].0, SlotId(3));
+
+        assert_eq!(arena.free_slots(), 4);
+    }
+
+    #[test]
+    fn compact_for_agent_single_agent_noop() {
+        let mut arena = KvArena::new(&test_config(8));
+        let agent = AgentId(0);
+
+        // Single agent, contiguous allocation
+        for pos in 0u32..4 {
+            arena.alloc_slot(agent, pos).unwrap();
+        }
+
+        let (start, count) = arena.compact_for_agent(agent);
+        assert_eq!(start, 0);
+        assert_eq!(count, 4);
+
+        let slots = arena.agent_slots(agent);
+        let positions: Vec<LogicalPos> = slots.iter().map(|(_, p)| *p).collect();
+        assert_eq!(positions, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn compact_for_agent_with_gaps() {
+        let mut arena = KvArena::new(&test_config(8));
+        let a0 = AgentId(0);
+        let a1 = AgentId(1);
+
+        // Allocate interleaved with gaps
+        arena.alloc_slot(a0, 0).unwrap();
+        arena.alloc_slot(a1, 0).unwrap();
+        let evict_slot = arena.alloc_slot(a0, 1).unwrap();
+        arena.alloc_slot(a1, 1).unwrap();
+        arena.alloc_slot(a0, 2).unwrap();
+
+        // Evict one of a0's slots to create a gap
+        arena.mark_evict(&[evict_slot]);
+
+        let (start, count) = arena.compact_for_agent(a1);
+        assert_eq!(start, 0);
+        assert_eq!(count, 2); // a1 has 2 slots
+
+        // a1 at front, a0 (remaining 2 slots) after
+        let a1_slots = arena.agent_slots(a1);
+        assert_eq!(a1_slots.len(), 2);
+        assert_eq!(a1_slots[0].0, SlotId(0));
+        assert_eq!(a1_slots[1].0, SlotId(1));
+    }
+
+    #[test]
+    fn compact_for_agent_preserves_kv_data() {
+        let mut arena = KvArena::new(&test_config(4));
+        let a0 = AgentId(0);
+        let a1 = AgentId(1);
+
+        // Allocate interleaved
+        let s_a0_0 = arena.alloc_slot(a0, 0).unwrap();
+        let s_a1_0 = arena.alloc_slot(a1, 0).unwrap();
+
+        // Write recognizable patterns to each slot's K buffer (layer 0)
+        let entry_size = arena.entry_size();
+        unsafe {
+            let ptr_a0 = arena.slot_key_ptr(0, s_a0_0);
+            std::ptr::write_bytes(ptr_a0, 0xAA, entry_size);
+
+            let ptr_a1 = arena.slot_key_ptr(0, s_a1_0);
+            std::ptr::write_bytes(ptr_a1, 0xBB, entry_size);
+        }
+
+        // Compact for a1 — a1 should move to front
+        arena.compact_for_agent(a1);
+
+        // After compaction: a1 at slot 0, a0 at slot 1
+        let a1_slots = arena.agent_slots(a1);
+        let a0_slots = arena.agent_slots(a0);
+
+        // Verify data moved correctly
+        unsafe {
+            let ptr_a1_new = arena.slot_key_ptr(0, a1_slots[0].0);
+            let mut buf = vec![0u8; entry_size];
+            std::ptr::copy_nonoverlapping(ptr_a1_new, buf.as_mut_ptr(), entry_size);
+            assert!(buf.iter().all(|&b| b == 0xBB), "a1 data should be 0xBB");
+
+            let ptr_a0_new = arena.slot_key_ptr(0, a0_slots[0].0);
+            std::ptr::copy_nonoverlapping(ptr_a0_new, buf.as_mut_ptr(), entry_size);
+            assert!(buf.iter().all(|&b| b == 0xAA), "a0 data should be 0xAA");
+        }
     }
 }

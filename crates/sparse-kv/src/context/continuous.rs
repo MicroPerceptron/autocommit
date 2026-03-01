@@ -36,6 +36,7 @@ pub fn decode_continuous_batch(
     config: &ModelConfig,
     backend: &Backend,
     total_kv_len: usize,
+    shared_len: usize,
 ) -> Result<Vec<Vec<f32>>, InferenceError> {
     let n_agents = token_ids.len();
     assert_eq!(n_agents, positions.len());
@@ -53,9 +54,17 @@ pub fn decode_continuous_batch(
     let pos_tensor = graph.new_tensor_1d(QuantType::I32, n_agents_i64);
     graph.set_input(pos_tensor);
 
-    // Block-diagonal mask for agent isolation
-    let (mask_tensor, mask_data) =
-        forward::mask::block_diagonal_mask(&mut graph, ranges, total_kv_len_i64);
+    // Block-diagonal mask for agent isolation (shared-aware when shared prefix exists)
+    let (mask_tensor, mask_data) = if shared_len > 0 {
+        forward::mask::block_diagonal_mask_with_shared(
+            &mut graph,
+            shared_len,
+            ranges,
+            total_kv_len_i64,
+        )
+    } else {
+        forward::mask::block_diagonal_mask(&mut graph, ranges, total_kv_len_i64)
+    };
 
     // Embedding lookup for n_agents tokens
     let tok_embd = reader.tensor_data("token_embd.weight")?;

@@ -41,7 +41,7 @@ pub struct BatchConstraints {
 /// sequentially until continuous batching (multi-agent single graph)
 /// is implemented. Order matters — first agent gets lowest-latency
 /// decode (no compaction needed if it was already at front).
-pub trait Scheduler {
+pub trait Scheduler: Send {
     /// Select which agents participate in this step's batch.
     ///
     /// Must respect `constraints.max_agents` — exceeding it is a bug.

@@ -70,6 +70,42 @@ pub fn block_diagonal_mask(
     (mask_tensor, data)
 }
 
+/// Build a mask for continuous batching with a shared prefix region.
+///
+/// Each agent sees:
+/// - The shared prefix at `[0, shared_len)` (common to all agents)
+/// - Its own private KV range at `[private_offset, private_offset + private_len)`
+///
+/// Shape: [total_kv_len, n_agents] (F32)
+///
+/// When `shared_len == 0`, this degenerates to `block_diagonal_mask`
+/// with contiguous ranges.
+pub fn block_diagonal_mask_with_shared(
+    graph: &mut ComputeGraph,
+    shared_len: usize,
+    private_ranges: &[(usize, usize)], // (offset, private_len) per agent
+    total_kv_len: i64,
+) -> (TensorHandle, Vec<f32>) {
+    let n_agents = private_ranges.len() as i64;
+    let mask_tensor = graph.new_tensor_2d(QuantType::F32, total_kv_len, n_agents);
+    graph.set_input(mask_tensor);
+
+    let mut data = vec![f32::NEG_INFINITY; (total_kv_len * n_agents) as usize];
+    for (q, &(offset, private_len)) in private_ranges.iter().enumerate() {
+        let row = q * (total_kv_len as usize);
+        // Allow shared prefix
+        for kv in 0..shared_len {
+            data[row + kv] = 0.0;
+        }
+        // Allow private range
+        for kv in offset..offset + private_len {
+            data[row + kv] = 0.0;
+        }
+    }
+
+    (mask_tensor, data)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,6 +239,59 @@ mod tests {
         // Agent 2: sees [6] only
         assert_eq!(data[2 * 7 + 5], f32::NEG_INFINITY);
         assert_eq!(data[2 * 7 + 6], 0.0);
+    }
+
+    // ── Shared prefix mask ─────────────────────────────────────
+
+    #[test]
+    fn shared_prefix_two_agents() {
+        let graph_size = 1024 * 1024;
+        let mut graph = ComputeGraph::new(graph_size, true).unwrap();
+
+        // Shared prefix: 3 slots at [0..3)
+        // Agent 0 private: [3..5)  (2 slots)
+        // Agent 1 private: [5..8)  (3 slots)
+        // total_kv = 8
+        let private_ranges = vec![(3, 2), (5, 3)];
+        let (_, data) = block_diagonal_mask_with_shared(&mut graph, 3, &private_ranges, 8);
+
+        assert_eq!(data.len(), 8 * 2);
+
+        // Agent 0: sees [0..3) shared + [3..5) private, blocked [5..8)
+        for kv in 0..5 {
+            assert_eq!(data[0 * 8 + kv], 0.0, "agent 0 should see kv={kv}");
+        }
+        for kv in 5..8 {
+            assert_eq!(data[0 * 8 + kv], f32::NEG_INFINITY, "agent 0 blocked at kv={kv}");
+        }
+
+        // Agent 1: sees [0..3) shared + [5..8) private, blocked [3..5)
+        for kv in 0..3 {
+            assert_eq!(data[1 * 8 + kv], 0.0, "agent 1 should see shared kv={kv}");
+        }
+        for kv in 3..5 {
+            assert_eq!(data[1 * 8 + kv], f32::NEG_INFINITY, "agent 1 blocked at kv={kv}");
+        }
+        for kv in 5..8 {
+            assert_eq!(data[1 * 8 + kv], 0.0, "agent 1 should see private kv={kv}");
+        }
+    }
+
+    #[test]
+    fn shared_only_no_private() {
+        let graph_size = 1024 * 1024;
+        let mut graph = ComputeGraph::new(graph_size, true).unwrap();
+
+        // Agents with shared prefix only, no private slots yet
+        let private_ranges = vec![(3, 0), (3, 0)];
+        let (_, data) = block_diagonal_mask_with_shared(&mut graph, 3, &private_ranges, 3);
+
+        // Both agents see only the shared prefix [0..3)
+        for q in 0..2 {
+            for kv in 0..3 {
+                assert_eq!(data[q * 3 + kv], 0.0);
+            }
+        }
     }
 
     #[test]

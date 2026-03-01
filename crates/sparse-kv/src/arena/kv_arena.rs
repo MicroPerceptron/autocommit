@@ -1,9 +1,18 @@
 use crate::arena::position_map::PositionMap;
-use crate::arena::slot::{AgentId, LogicalPos, SlotId, SlotState};
+use crate::arena::slot::{AgentId, LogicalPos, SharedRegionId, SlotId, SlotState};
 use crate::error::InferenceError;
 use crate::quant::QuantType;
 use crate::tensor::backend::Backend;
 use crate::tensor::buffer::BackendBuffer;
+
+/// Metadata for a shared KV region (immutable prefix shared across agents).
+struct SharedRegion {
+    id: SharedRegionId,
+    /// Arena slot indices belonging to this region, in logical order.
+    slot_indices: Vec<u32>,
+    /// Number of agents currently referencing this region.
+    ref_count: usize,
+}
 
 #[derive(Debug, Clone)]
 pub struct ArenaConfig {
@@ -76,6 +85,8 @@ pub struct KvArena {
     n_kv_head: usize,
     dtype: QuantType,
     free_count: usize,
+    shared_regions: Vec<SharedRegion>,
+    next_shared_id: u32,
 }
 
 impl KvArena {
@@ -104,6 +115,8 @@ impl KvArena {
             n_kv_head: config.n_kv_head,
             dtype: config.dtype,
             free_count: config.capacity,
+            shared_regions: Vec::new(),
+            next_shared_id: 0,
         }
     }
 
@@ -141,6 +154,8 @@ impl KvArena {
             n_kv_head: config.n_kv_head,
             dtype: config.dtype,
             free_count: config.capacity,
+            shared_regions: Vec::new(),
+            next_shared_id: 0,
         })
     }
 
@@ -232,7 +247,11 @@ impl KvArena {
     pub fn mark_evict(&mut self, slots: &[SlotId]) {
         for &slot in slots {
             let idx = slot.0 as usize;
-            if idx < self.capacity && !self.slots[idx].is_pinned() && !self.slots[idx].is_free() {
+            if idx < self.capacity
+                && !self.slots[idx].is_pinned()
+                && !self.slots[idx].is_free()
+                && !self.slots[idx].is_shared()
+            {
                 self.slots[idx] = SlotState::Free;
                 self.free_count += 1;
             }
@@ -400,6 +419,142 @@ impl KvArena {
         result
     }
 
+    /// Compact arena with shared regions placed at offset 0.
+    ///
+    /// Layout after compaction:
+    ///   [SHARED_SLOTS | A0_private | A1_private | ... | other_occupied | FREE...]
+    ///
+    /// Returns `(shared_len, Vec<(AgentId, private_offset, private_count)>)`.
+    /// `shared_len` is the total number of shared region slots at the front.
+    pub fn compact_for_batch_with_shared(
+        &mut self,
+        agents: &[AgentId],
+        shared_regions: &[SharedRegionId],
+    ) -> (usize, Vec<(AgentId, usize, usize)>) {
+        // 1. Collect shared region slot indices (sorted by region order, then logical_pos)
+        let mut shared_indices: Vec<usize> = Vec::new();
+        for &region_id in shared_regions {
+            if let Some(indices) = self.shared_region_slot_indices(region_id) {
+                shared_indices.extend(indices.iter().map(|&i| i as usize));
+            }
+        }
+
+        let shared_set: Vec<usize> = shared_indices.clone();
+        let listed_set: Vec<AgentId> = agents.to_vec();
+
+        // 2. Collect private slot indices per agent (excluding shared slots)
+        let mut per_agent: Vec<Vec<usize>> = Vec::with_capacity(agents.len());
+        for &agent in agents {
+            let mut indices: Vec<usize> = self
+                .slots
+                .iter()
+                .enumerate()
+                .filter(|(i, s)| {
+                    !s.is_free()
+                        && s.agent() == Some(agent)
+                        && !shared_set.contains(i)
+                })
+                .map(|(i, _)| i)
+                .collect();
+            indices.sort_by_key(|&i| self.slots[i].logical_pos().unwrap());
+            per_agent.push(indices);
+        }
+
+        // 3. Collect other occupied slots (not shared, not listed agents)
+        let mut other_indices: Vec<usize> = self
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(i, s)| {
+                !s.is_free()
+                    && !shared_set.contains(i)
+                    && s.agent().map_or(true, |a| !listed_set.contains(&a))
+            })
+            .map(|(i, _)| i)
+            .collect();
+        other_indices.sort_by_key(|&i| self.slots[i].logical_pos().unwrap());
+
+        // 4. Build desired permutation and result
+        let shared_len = shared_indices.len();
+        let mut desired: Vec<usize> = Vec::new();
+        desired.extend_from_slice(&shared_indices);
+
+        let mut result = Vec::with_capacity(agents.len());
+        for (agent_idx, indices) in per_agent.iter().enumerate() {
+            let offset = desired.len();
+            desired.extend_from_slice(indices);
+            result.push((agents[agent_idx], offset, indices.len()));
+        }
+        desired.extend_from_slice(&other_indices);
+        let n_total = desired.len();
+
+        // 5. Fast path: already ordered
+        let already_ordered = desired.iter().enumerate().all(|(i, &src)| i == src);
+        if already_ordered {
+            self.free_count = self.capacity - n_total;
+            return (shared_len, result);
+        }
+
+        // 6. Apply permutation using temporary buffers
+        let entry_size = self.layers[0].entry_size;
+        let new_states: Vec<SlotState> = desired.iter().map(|&i| self.slots[i]).collect();
+
+        for layer in &mut self.layers {
+            let mut temp_k = vec![0u8; n_total * entry_size];
+            let mut temp_v = vec![0u8; n_total * entry_size];
+
+            let k_ptr = layer.key.base_ptr();
+            let v_ptr = layer.val.base_ptr();
+
+            for (dst_idx, &src_idx) in desired.iter().enumerate() {
+                let src_off = src_idx * entry_size;
+                let dst_off = dst_idx * entry_size;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        k_ptr.add(src_off),
+                        temp_k.as_mut_ptr().add(dst_off),
+                        entry_size,
+                    );
+                    std::ptr::copy_nonoverlapping(
+                        v_ptr.add(src_off),
+                        temp_v.as_mut_ptr().add(dst_off),
+                        entry_size,
+                    );
+                }
+            }
+
+            unsafe {
+                std::ptr::copy_nonoverlapping(temp_k.as_ptr(), k_ptr, n_total * entry_size);
+                std::ptr::copy_nonoverlapping(temp_v.as_ptr(), v_ptr, n_total * entry_size);
+            }
+        }
+
+        // 7. Update slot states
+        for (i, state) in new_states.into_iter().enumerate() {
+            self.slots[i] = state;
+        }
+        for i in n_total..self.capacity {
+            self.slots[i] = SlotState::Free;
+        }
+
+        // 8. Update shared region slot indices to reflect new positions
+        for &region_id in shared_regions {
+            if let Some(region) = self.shared_regions.iter_mut().find(|r| r.id == region_id) {
+                // Find new positions of this region's slots
+                region.slot_indices = self
+                    .slots
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| s.region() == Some(region_id))
+                    .map(|(i, _)| i as u32)
+                    .collect();
+            }
+        }
+
+        self.free_count = self.capacity - n_total;
+        (shared_len, result)
+    }
+
     /// Compact: move all occupied slots to a contiguous prefix.
     /// Returns a PositionMap reflecting the new dense layout.
     ///
@@ -479,6 +634,107 @@ impl KvArena {
 
     pub fn slot_state(&self, slot: SlotId) -> SlotState {
         self.slots[slot.0 as usize]
+    }
+
+    // ── Shared region management ─────────────────────────────────
+
+    /// Create a new shared region by allocating `n_slots` slots.
+    ///
+    /// Returns the region ID and slot IDs for the caller to prefill K/V data.
+    /// The region starts with `ref_count = 0`; attach it to agents with
+    /// `ref_shared_region()`.
+    pub fn create_shared_region(
+        &mut self,
+        n_slots: usize,
+    ) -> Result<(SharedRegionId, Vec<SlotId>), InferenceError> {
+        if n_slots == 0 {
+            return Err(InferenceError::Arena("shared region must have at least 1 slot".into()));
+        }
+        if self.free_count < n_slots {
+            return Err(InferenceError::Arena(format!(
+                "not enough free slots for shared region: need {n_slots}, have {}",
+                self.free_count
+            )));
+        }
+
+        let region_id = SharedRegionId(self.next_shared_id);
+        self.next_shared_id += 1;
+
+        let mut slot_ids = Vec::with_capacity(n_slots);
+        let mut slot_indices = Vec::with_capacity(n_slots);
+
+        for pos in 0..n_slots {
+            let idx = self
+                .slots
+                .iter()
+                .position(|s| s.is_free())
+                .expect("free_count check guarantees a free slot exists");
+
+            self.slots[idx] = SlotState::Shared {
+                region: region_id,
+                logical_pos: pos as u32,
+            };
+            self.free_count -= 1;
+            slot_ids.push(SlotId(idx as u32));
+            slot_indices.push(idx as u32);
+        }
+
+        self.shared_regions.push(SharedRegion {
+            id: region_id,
+            slot_indices,
+            ref_count: 0,
+        });
+
+        Ok((region_id, slot_ids))
+    }
+
+    /// Increment reference count for a shared region.
+    pub fn ref_shared_region(&mut self, id: SharedRegionId) -> Result<(), InferenceError> {
+        let region = self
+            .shared_regions
+            .iter_mut()
+            .find(|r| r.id == id)
+            .ok_or_else(|| InferenceError::Arena(format!("shared region {:?} not found", id)))?;
+        region.ref_count += 1;
+        Ok(())
+    }
+
+    /// Decrement reference count. If it reaches 0, free all slots in the region.
+    pub fn unref_shared_region(&mut self, id: SharedRegionId) -> Result<(), InferenceError> {
+        let region = self
+            .shared_regions
+            .iter_mut()
+            .find(|r| r.id == id)
+            .ok_or_else(|| InferenceError::Arena(format!("shared region {:?} not found", id)))?;
+
+        region.ref_count = region.ref_count.saturating_sub(1);
+
+        if region.ref_count == 0 {
+            // Free all slots belonging to this region
+            for &idx in &region.slot_indices {
+                self.slots[idx as usize] = SlotState::Free;
+                self.free_count += 1;
+            }
+            self.shared_regions.retain(|r| r.id != id);
+        }
+
+        Ok(())
+    }
+
+    /// Get the sequence length (number of slots) of a shared region.
+    pub fn shared_region_len(&self, id: SharedRegionId) -> Option<usize> {
+        self.shared_regions
+            .iter()
+            .find(|r| r.id == id)
+            .map(|r| r.slot_indices.len())
+    }
+
+    /// Get the slot indices for a shared region (in logical order).
+    pub fn shared_region_slot_indices(&self, id: SharedRegionId) -> Option<&[u32]> {
+        self.shared_regions
+            .iter()
+            .find(|r| r.id == id)
+            .map(|r| r.slot_indices.as_slice())
     }
 }
 
@@ -791,6 +1047,164 @@ mod tests {
         let ranges = arena.compact_for_batch(&[a0, a1]);
         assert_eq!(ranges[0], (a0, 0, 2));
         assert_eq!(ranges[1], (a1, 2, 2));
+    }
+
+    // ── Shared region tests ────────────────────────────────────
+
+    #[test]
+    fn create_shared_region_allocates_slots() {
+        let mut arena = KvArena::new(&test_config(8));
+        let (region, slots) = arena.create_shared_region(3).unwrap();
+        assert_eq!(slots.len(), 3);
+        assert_eq!(arena.free_slots(), 5);
+        assert_eq!(arena.shared_region_len(region), Some(3));
+
+        // Verify slots are marked Shared
+        for &sid in &slots {
+            assert!(arena.slot_state(sid).is_shared());
+            assert_eq!(arena.slot_state(sid).region(), Some(region));
+        }
+    }
+
+    #[test]
+    fn shared_slots_not_evictable() {
+        let mut arena = KvArena::new(&test_config(8));
+        let a0 = AgentId(0);
+
+        let (region, shared_slots) = arena.create_shared_region(2).unwrap();
+        let _ = region;
+        let agent_slot = arena.alloc_slot(a0, 0).unwrap();
+
+        // Only agent slot should be evictable
+        let candidates = arena.evictable_slots();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].0, agent_slot);
+
+        // mark_evict should skip shared slots
+        arena.mark_evict(&[shared_slots[0], shared_slots[1], agent_slot]);
+        assert!(arena.slot_state(shared_slots[0]).is_shared()); // still shared
+        assert!(arena.slot_state(shared_slots[1]).is_shared()); // still shared
+        assert!(arena.slot_state(agent_slot).is_free()); // evicted
+    }
+
+    #[test]
+    fn shared_region_ref_counting() {
+        let mut arena = KvArena::new(&test_config(8));
+        let (region, _slots) = arena.create_shared_region(3).unwrap();
+
+        arena.ref_shared_region(region).unwrap();
+        arena.ref_shared_region(region).unwrap();
+        assert_eq!(arena.free_slots(), 5);
+
+        // First unref: count goes to 1, slots stay
+        arena.unref_shared_region(region).unwrap();
+        assert_eq!(arena.free_slots(), 5);
+        assert_eq!(arena.shared_region_len(region), Some(3));
+
+        // Second unref: count goes to 0, slots freed
+        arena.unref_shared_region(region).unwrap();
+        assert_eq!(arena.free_slots(), 8);
+        assert_eq!(arena.shared_region_len(region), None); // region gone
+    }
+
+    #[test]
+    fn free_agent_ignores_shared_slots() {
+        let mut arena = KvArena::new(&test_config(8));
+        let a0 = AgentId(0);
+
+        let (_region, _shared_slots) = arena.create_shared_region(2).unwrap();
+        arena.alloc_slot(a0, 0).unwrap();
+        arena.alloc_slot(a0, 1).unwrap();
+        assert_eq!(arena.free_slots(), 4);
+
+        arena.free_agent(a0);
+        assert_eq!(arena.free_slots(), 6); // only agent slots freed, shared remain
+        assert_eq!(arena.occupied_count(), 2); // shared slots still occupied
+    }
+
+    #[test]
+    fn compact_with_shared_at_front() {
+        let mut arena = KvArena::new(&test_config(12));
+        let a0 = AgentId(0);
+        let a1 = AgentId(1);
+
+        // Create shared region first, then agent slots interleaved
+        let (region, _shared_slots) = arena.create_shared_region(3).unwrap();
+        arena.alloc_slot(a0, 0).unwrap();
+        arena.alloc_slot(a1, 0).unwrap();
+        arena.alloc_slot(a0, 1).unwrap();
+        arena.alloc_slot(a1, 1).unwrap();
+
+        let (shared_len, ranges) =
+            arena.compact_for_batch_with_shared(&[a0, a1], &[region]);
+
+        assert_eq!(shared_len, 3);
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(ranges[0], (a0, 3, 2)); // a0 private at offset 3
+        assert_eq!(ranges[1], (a1, 5, 2)); // a1 private at offset 5
+
+        // Verify shared slots at front (indices 0, 1, 2)
+        for i in 0..3 {
+            assert!(arena.slots[i].is_shared());
+        }
+        // Verify agent slots follow
+        assert_eq!(arena.slots[3].agent(), Some(a0));
+        assert_eq!(arena.slots[4].agent(), Some(a0));
+        assert_eq!(arena.slots[5].agent(), Some(a1));
+        assert_eq!(arena.slots[6].agent(), Some(a1));
+    }
+
+    #[test]
+    fn compact_with_shared_preserves_data() {
+        let mut arena = KvArena::new(&test_config(8));
+        let a0 = AgentId(0);
+
+        // Create shared region and agent slot interleaved
+        let (region, shared_slots) = arena.create_shared_region(2).unwrap();
+        let agent_slot = arena.alloc_slot(a0, 0).unwrap();
+
+        // Write patterns
+        let entry_size = arena.entry_size();
+        unsafe {
+            std::ptr::write_bytes(arena.slot_key_ptr(0, shared_slots[0]), 0xCC, entry_size);
+            std::ptr::write_bytes(arena.slot_key_ptr(0, shared_slots[1]), 0xDD, entry_size);
+            std::ptr::write_bytes(arena.slot_key_ptr(0, agent_slot), 0xEE, entry_size);
+        }
+
+        let (shared_len, ranges) =
+            arena.compact_for_batch_with_shared(&[a0], &[region]);
+
+        assert_eq!(shared_len, 2);
+        assert_eq!(ranges[0], (a0, 2, 1));
+
+        // Verify data integrity after compaction
+        unsafe {
+            let mut buf = vec![0u8; entry_size];
+
+            // Shared slot 0 should be at index 0
+            std::ptr::copy_nonoverlapping(
+                arena.slot_key_ptr(0, SlotId(0)),
+                buf.as_mut_ptr(),
+                entry_size,
+            );
+            assert!(buf.iter().all(|&b| b == 0xCC));
+
+            // Shared slot 1 should be at index 1
+            std::ptr::copy_nonoverlapping(
+                arena.slot_key_ptr(0, SlotId(1)),
+                buf.as_mut_ptr(),
+                entry_size,
+            );
+            assert!(buf.iter().all(|&b| b == 0xDD));
+
+            // Agent slot should be at index 2
+            std::ptr::copy_nonoverlapping(
+                arena.slot_key_ptr(0, SlotId(2)),
+                buf.as_mut_ptr(),
+                entry_size,
+            );
+            assert!(buf.iter().all(|&b| b == 0xEE));
+        }
     }
 
     #[test]

@@ -31,8 +31,8 @@ pub fn decode_one(
 ) -> Result<Vec<f32>, InferenceError> {
     // Agent state already updated by caller: seq_len includes the new token.
     // logical_pos = the new token's position in the sequence.
-    let logical_pos = (agent.seq_len - 1) as u32;
-    let seq_len = agent.seq_len as i64;
+    let logical_pos = (agent.effective_seq_len() - 1) as u32;
+    let seq_len = agent.effective_seq_len() as i64;
 
     // Graph context: enough memory for tensor metadata.
     // With no_alloc=true, the gallocr handles actual buffer allocation.

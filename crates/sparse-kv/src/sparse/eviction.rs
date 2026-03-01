@@ -1,7 +1,7 @@
 use crate::arena::slot::{LogicalPos, SlotId};
 
 /// Policy for selecting which KV cache slots to evict when the arena is full.
-pub trait EvictionPolicy {
+pub trait EvictionPolicy: Send {
     /// Select slots to evict from `candidates` to free at least `need` slots.
     /// `candidates` contains (SlotId, LogicalPos) for all non-pinned occupied slots.
     fn select(&self, candidates: &[(SlotId, LogicalPos)], need: usize) -> Vec<SlotId>;

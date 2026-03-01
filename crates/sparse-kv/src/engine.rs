@@ -4,8 +4,9 @@ use crate::arena::kv_arena::{ArenaConfig, KvArena};
 use crate::arena::slot::AgentId;
 use crate::context::agent::AgentContext;
 use crate::context::batch;
+use crate::context::continuous;
 use crate::context::decode;
-use crate::context::scheduler::{Scheduler, SchedulerEntry};
+use crate::context::scheduler::{BatchConstraints, Scheduler, SchedulerEntry};
 use crate::error::InferenceError;
 use crate::gguf::GgufReader;
 use crate::model::config::ModelConfig;
@@ -128,25 +129,25 @@ impl InferenceEngine {
     /// compact the arena (no data movement). Sets `arena_dirty` so the next
     /// decode/decode_batch call handles compaction if needed.
     fn run_eviction(&mut self) {
-        let (trigger_threshold, evict_fraction) = match &self.eviction {
-            Some(e) => (e.trigger_threshold, e.evict_fraction),
+        let eviction = match &self.eviction {
+            Some(e) => e,
             None => return,
         };
 
         let capacity = self.arena.capacity();
         let free_ratio = self.arena.free_slots() as f32 / capacity as f32;
-        if free_ratio >= trigger_threshold {
+        if free_ratio >= eviction.trigger_threshold {
             return;
         }
 
         let occupied = self.arena.occupied_count();
-        let need = (evict_fraction * occupied as f32).ceil() as usize;
+        let need = (eviction.evict_fraction * occupied as f32).ceil() as usize;
         if need == 0 {
             return;
         }
 
         let candidates = self.arena.evictable_slots();
-        let to_evict = self.eviction.as_ref().unwrap().policy.select(&candidates, need);
+        let to_evict = eviction.policy.select(&candidates, need);
 
         self.arena.mark_evict(&to_evict);
         self.arena_dirty = true;
@@ -205,15 +206,22 @@ impl InferenceEngine {
                 .agents
                 .iter()
                 .find(|a| a.id == agent_id)
-                .unwrap();
-            (offset, *agent.slots.last().unwrap())
+                .ok_or_else(|| {
+                    InferenceError::Agent(format!("agent {:?} lost during compaction", agent_id))
+                })?;
+            let last_slot = *agent.slots.last().ok_or_else(|| {
+                InferenceError::Arena("agent has no slots after compaction".into())
+            })?;
+            (offset, last_slot)
         } else {
             // Single agent, clean arena: no data movement needed
             let agent = self
                 .agents
                 .iter_mut()
                 .find(|a| a.id == agent_id)
-                .unwrap();
+                .ok_or_else(|| {
+                    InferenceError::Agent(format!("agent {:?} not found", agent_id))
+                })?;
             agent.push_slot(new_slot);
             (0, new_slot)
         };
@@ -222,7 +230,9 @@ impl InferenceEngine {
             .agents
             .iter_mut()
             .find(|a| a.id == agent_id)
-            .unwrap();
+            .ok_or_else(|| {
+                InferenceError::Agent(format!("agent {:?} not found", agent_id))
+            })?;
 
         decode::decode_one(
             agent,
@@ -280,7 +290,9 @@ impl InferenceEngine {
                 .agents
                 .iter()
                 .find(|a| a.id == agent_id)
-                .unwrap();
+                .ok_or_else(|| {
+                    InferenceError::Agent(format!("agent {:?} lost during compaction", agent_id))
+                })?;
             let slots = agent.slots[seq_len_before..].to_vec();
 
             // Reset agent state — batch::decode_batch will re-push
@@ -288,7 +300,9 @@ impl InferenceEngine {
                 .agents
                 .iter_mut()
                 .find(|a| a.id == agent_id)
-                .unwrap();
+                .ok_or_else(|| {
+                    InferenceError::Agent(format!("agent {:?} lost during compaction", agent_id))
+                })?;
             agent.slots.truncate(seq_len_before);
             agent.seq_len = seq_len_before;
 
@@ -302,7 +316,9 @@ impl InferenceEngine {
             .agents
             .iter_mut()
             .find(|a| a.id == agent_id)
-            .unwrap();
+            .ok_or_else(|| {
+                InferenceError::Agent(format!("agent {:?} not found", agent_id))
+            })?;
 
         batch::decode_batch(
             agent,
@@ -455,10 +471,19 @@ impl InferenceEngine {
     }
 
     /// Clear grammar constraint for an agent.
-    pub fn clear_grammar(&mut self, agent_id: AgentId) {
-        if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
-            agent.grammar = None;
-        }
+    pub fn clear_grammar(
+        &mut self,
+        agent_id: AgentId,
+    ) -> Result<(), InferenceError> {
+        let agent = self
+            .agents
+            .iter_mut()
+            .find(|a| a.id == agent_id)
+            .ok_or_else(|| {
+                InferenceError::Agent(format!("agent {:?} not found", agent_id))
+            })?;
+        agent.grammar = None;
+        Ok(())
     }
 
     /// Generate tokens with grammar-constrained sampling.
@@ -495,7 +520,10 @@ impl InferenceEngine {
             let recent = &context[start..];
 
             // Build grammar mask if grammar is set
-            let agent = self.agents.iter_mut().find(|a| a.id == agent_id).unwrap();
+            let agent = self.agents.iter_mut().find(|a| a.id == agent_id)
+                .ok_or_else(|| {
+                    InferenceError::Agent(format!("agent {:?} not found", agent_id))
+                })?;
             let token = if let Some(ref mut grammar) = agent.grammar {
                 let trie = self.tokenizer.as_ref()
                     .ok_or_else(|| InferenceError::Tokenize("no tokenizer for grammar masking".into()))?
@@ -511,7 +539,10 @@ impl InferenceEngine {
             }
 
             // Advance grammar state
-            let agent = self.agents.iter_mut().find(|a| a.id == agent_id).unwrap();
+            let agent = self.agents.iter_mut().find(|a| a.id == agent_id)
+                .ok_or_else(|| {
+                    InferenceError::Agent(format!("agent {:?} not found", agent_id))
+                })?;
             if let Some(ref mut grammar) = agent.grammar {
                 if let Some(tok_data) = self.tokenizer.as_ref().and_then(|t| t.token_data(token)) {
                     grammar.accept_token(tok_data)?;
@@ -539,30 +570,56 @@ impl InferenceEngine {
     }
 
     /// Set scheduling priority for an agent. Higher = more important.
-    pub fn set_priority(&mut self, agent_id: AgentId, priority: i32) {
-        if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
-            agent.priority = priority;
-        }
+    pub fn set_priority(
+        &mut self,
+        agent_id: AgentId,
+        priority: i32,
+    ) -> Result<(), InferenceError> {
+        let agent = self
+            .agents
+            .iter_mut()
+            .find(|a| a.id == agent_id)
+            .ok_or_else(|| {
+                InferenceError::Agent(format!("agent {:?} not found", agent_id))
+            })?;
+        agent.priority = priority;
+        Ok(())
     }
 
     /// Enqueue a token for an agent. Consumed by the next `step()` call
     /// that selects this agent.
-    pub fn enqueue_token(&mut self, agent_id: AgentId, token: i32) {
-        if let Some(agent) = self.agents.iter_mut().find(|a| a.id == agent_id) {
-            agent.pending_token = Some(token);
-        }
+    pub fn enqueue_token(
+        &mut self,
+        agent_id: AgentId,
+        token: i32,
+    ) -> Result<(), InferenceError> {
+        let agent = self
+            .agents
+            .iter_mut()
+            .find(|a| a.id == agent_id)
+            .ok_or_else(|| {
+                InferenceError::Agent(format!("agent {:?} not found", agent_id))
+            })?;
+        agent.pending_token = Some(token);
+        Ok(())
     }
 
-    /// Scheduler-driven decode step.
+    /// Scheduler-driven batch decode step (continuous batching).
     ///
-    /// Asks the scheduler which agent should run next, consumes that
-    /// agent's pending token, and returns `(agent_id, logits)`.
+    /// Asks the scheduler to assemble a batch of agents, then decodes
+    /// all agents in a single ggml graph. The FFN/MLP compute is shared
+    /// across all agents; a block-diagonal attention mask isolates each
+    /// agent's KV context.
     ///
-    /// Returns `Ok(None)` if no agent has pending work or no scheduler is set.
-    pub fn step(&mut self) -> Result<Option<(AgentId, Vec<f32>)>, InferenceError> {
+    /// **Single-agent optimization**: When only one agent is selected,
+    /// falls back to `decode()` which skips masking overhead.
+    ///
+    /// Returns `(agent_id, logits)` pairs in scheduler batch order.
+    /// Returns empty vec if no scheduler is set or no agents are ready.
+    pub fn step(&mut self) -> Result<Vec<(AgentId, Vec<f32>)>, InferenceError> {
         let scheduler = match &mut self.scheduler {
             Some(s) => s,
-            None => return Ok(None),
+            None => return Ok(Vec::new()),
         };
 
         let entries: Vec<SchedulerEntry> = self
@@ -573,27 +630,125 @@ impl InferenceEngine {
                 priority: a.priority,
                 seq_len: a.seq_len,
                 has_pending: a.pending_token.is_some(),
+                kv_slots: a.slots.len(),
+                resident: true,
             })
             .collect();
 
-        let agent_id = match scheduler.next(&entries) {
-            Some(id) => id,
-            None => return Ok(None),
+        let constraints = BatchConstraints {
+            max_agents: self.arena.free_slots(),
+            arena_free: self.arena.free_slots(),
+            arena_capacity: self.arena.capacity(),
         };
 
-        let token = self
-            .agents
-            .iter_mut()
-            .find(|a| a.id == agent_id)
-            .and_then(|a| a.pending_token.take())
-            .ok_or_else(|| {
+        let batch = scheduler.assemble_batch(&entries, &constraints);
+        if batch.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Single-agent fast path: skip mask overhead
+        if batch.len() == 1 {
+            let agent_id = batch[0];
+            let token = self
+                .agents
+                .iter_mut()
+                .find(|a| a.id == agent_id)
+                .and_then(|a| a.pending_token.take())
+                .ok_or_else(|| {
+                    InferenceError::Agent(format!(
+                        "scheduler selected agent {:?} but no pending token",
+                        agent_id
+                    ))
+                })?;
+            let logits = self.decode(agent_id, token)?;
+            return Ok(vec![(agent_id, logits)]);
+        }
+
+        // ── Multi-agent continuous batching ──────────────────────
+
+        self.run_eviction();
+
+        // Collect token_ids and positions before allocation
+        let mut token_ids = Vec::with_capacity(batch.len());
+        let mut positions = Vec::with_capacity(batch.len());
+        for &agent_id in &batch {
+            let agent = self
+                .agents
+                .iter_mut()
+                .find(|a| a.id == agent_id)
+                .ok_or_else(|| {
+                    InferenceError::Agent(format!("agent {:?} not found", agent_id))
+                })?;
+            let token = agent.pending_token.take().ok_or_else(|| {
                 InferenceError::Agent(format!(
                     "scheduler selected agent {:?} but no pending token",
                     agent_id
                 ))
             })?;
+            token_ids.push(token);
+            positions.push(agent.seq_len as i32);
+        }
 
-        let logits = self.decode(agent_id, token)?;
-        Ok(Some((agent_id, logits)))
+        // Allocate 1 slot per agent
+        let mut new_slots = Vec::with_capacity(batch.len());
+        for (i, &agent_id) in batch.iter().enumerate() {
+            let logical_pos = positions[i] as u32;
+            new_slots.push(self.arena.alloc_slot(agent_id, logical_pos)?);
+        }
+
+        // Compact arena: group agents contiguously in batch order
+        let compact_ranges = self.arena.compact_for_batch(&batch);
+        self.arena_dirty = false;
+        for agent in &mut self.agents {
+            agent.rebuild_slots(&self.arena);
+        }
+
+        // Build ranges for the mask: (offset, kv_len) per agent
+        // After compaction + rebuild, each agent's count includes the new slot
+        let ranges: Vec<(usize, usize)> = compact_ranges
+            .iter()
+            .map(|&(_, offset, count)| (offset, count))
+            .collect();
+
+        let total_kv_len = ranges
+            .last()
+            .map(|&(off, cnt)| off + cnt)
+            .unwrap_or(0);
+
+        // Find final slot IDs after compaction (last slot in each agent's block)
+        let mut final_slots = Vec::with_capacity(batch.len());
+        for &aid in &batch {
+            let agent = self.agents.iter().find(|a| a.id == aid).ok_or_else(|| {
+                InferenceError::Agent(format!("agent {:?} lost during compaction", aid))
+            })?;
+            let slot = agent.slots.last().copied().ok_or_else(|| {
+                InferenceError::Arena("agent has no slots after compaction".into())
+            })?;
+            final_slots.push(slot);
+        }
+
+        // Execute single-graph multi-agent decode
+        let all_logits = continuous::decode_continuous_batch(
+            &token_ids,
+            &positions,
+            &final_slots,
+            &ranges,
+            &mut self.arena,
+            &self.reader,
+            &self.config,
+            &self.backend,
+            total_kv_len,
+        )?;
+
+        // Update agent state
+        for (i, &agent_id) in batch.iter().enumerate() {
+            let agent = self.agents.iter_mut().find(|a| a.id == agent_id)
+                .ok_or_else(|| {
+                    InferenceError::Agent(format!("agent {:?} lost after decode", agent_id))
+                })?;
+            agent.last_logits = all_logits[i].clone();
+        }
+
+        Ok(batch.into_iter().zip(all_logits).collect())
     }
 }

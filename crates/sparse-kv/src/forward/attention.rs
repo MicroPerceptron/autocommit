@@ -267,6 +267,130 @@ pub fn attention_layer_batched(
     graph.mul_mat(wo, attn_out)
 }
 
+/// Attention layer for continuous batching (multi-agent, 1 token each).
+///
+/// Like `attention_layer_batched` but with **scattered K/V writes** — each
+/// agent's new K/V goes to a different arena slot (not consecutive).
+///
+/// - `input`: [n_embd, n_agents]
+/// - `new_slots`: one SlotId per agent (NOT necessarily consecutive)
+/// - `pos_tensor`: I32 [n_agents] with heterogeneous positions
+/// - `total_kv_len`: total KV entries visible in the arena after compaction
+/// - `mask`: block-diagonal mask [total_kv_len, n_agents]
+pub fn attention_layer_continuous(
+    graph: &mut ComputeGraph,
+    input: TensorHandle,
+    weights: &AttentionWeights<'_>,
+    arena: &mut KvArena,
+    layer: usize,
+    new_slots: &[SlotId],
+    pos_tensor: TensorHandle,
+    total_kv_len: i64,
+    mask: TensorHandle,
+    config: &ModelConfig,
+) -> TensorHandle {
+    let n_embd = config.n_embd as i64;
+    let n_head = config.n_head as i64;
+    let n_kv_head = config.n_kv_head as i64;
+    let head_dim = config.head_dim as i64;
+    let n_agents = new_slots.len() as i64;
+    let entry_size = arena.entry_size();
+    let kv_dtype = arena.dtype();
+
+    // Q, K, V projections: input is [n_embd, n_agents]
+    let wq = weight_view(graph, weights.wq);
+    let wk = weight_view(graph, weights.wk);
+    let wv = weight_view(graph, weights.wv);
+    let wo = weight_view(graph, weights.wo);
+
+    let q = graph.mul_mat(wq, input);
+    let k_new = graph.mul_mat(wk, input);
+    let v_new = graph.mul_mat(wv, input);
+
+    // Reshape for multi-head layout
+    let q = graph.reshape_3d(q, head_dim, n_head, n_agents);
+    let k_new = graph.reshape_3d(k_new, head_dim, n_kv_head, n_agents);
+    let v_new = graph.reshape_3d(v_new, head_dim, n_kv_head, n_agents);
+
+    // Apply RoPE (heterogeneous positions handled natively)
+    let q = graph.rope_ext(q, pos_tensor, head_dim as i32, config.rope_theta);
+    let k_new = graph.rope_ext(k_new, pos_tensor, head_dim as i32, config.rope_theta);
+
+    // Arena buffer views for this layer
+    let k_arena_full = unsafe {
+        graph.view_tensor_1d(
+            kv_dtype,
+            (arena.capacity() as i64) * head_dim * n_kv_head,
+            arena.layer_key_ptr(layer),
+        )
+    };
+    graph.set_input(k_arena_full);
+
+    let v_arena_full = unsafe {
+        graph.view_tensor_1d(
+            kv_dtype,
+            (arena.capacity() as i64) * head_dim * n_kv_head,
+            arena.layer_val_ptr(layer),
+        )
+    };
+    graph.set_input(v_arena_full);
+
+    // Scattered K/V writes: one copy per agent
+    let entry_elements = head_dim * n_kv_head;
+    let k_new_flat = graph.reshape_2d(k_new, entry_elements, n_agents);
+    let v_new_flat = graph.reshape_2d(v_new, entry_elements, n_agents);
+
+    for i in 0..new_slots.len() {
+        let slot_idx = new_slots[i].0 as usize;
+        let slot_byte_offset = slot_idx * entry_size;
+        let token_byte_offset = i * entry_size;
+
+        // Extract token i's K and copy to its arena slot
+        let k_token = graph.view_1d(k_new_flat, entry_elements, token_byte_offset);
+        let k_slot = graph.view_1d(k_arena_full, entry_elements, slot_byte_offset);
+        let _k_cpy = graph.cpy(k_token, k_slot);
+
+        // Extract token i's V and copy to its arena slot
+        let v_token = graph.view_1d(v_new_flat, entry_elements, token_byte_offset);
+        let v_slot = graph.view_1d(v_arena_full, entry_elements, slot_byte_offset);
+        let _v_cpy = graph.cpy(v_token, v_slot);
+    }
+
+    // Full K/V context: all agents' KV contiguous after compaction
+    let elem_bytes = kv_dtype.row_size(1);
+    let nb1_kv = (head_dim * n_kv_head) as usize * elem_bytes;
+
+    let k_full = graph.view_3d(
+        k_arena_full,
+        head_dim,
+        n_kv_head,
+        total_kv_len,
+        head_dim as usize * elem_bytes,
+        nb1_kv,
+        0, // offset 0: all agents start from the beginning after compact_for_batch
+    );
+
+    let v_full = graph.view_3d(
+        v_arena_full,
+        head_dim,
+        n_kv_head,
+        total_kv_len,
+        head_dim as usize * elem_bytes,
+        nb1_kv,
+        0,
+    );
+
+    // Flash attention with block-diagonal mask
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let attn_out = graph.flash_attn_ext(q, k_full, v_full, Some(mask), scale);
+
+    // [head_dim, n_head, n_agents] → [n_embd, n_agents]
+    let attn_out = graph.reshape_2d(attn_out, n_embd, n_agents);
+
+    // Output projection
+    graph.mul_mat(wo, attn_out)
+}
+
 fn weight_view(graph: &mut ComputeGraph, w: QuantSlice<'_>) -> TensorHandle {
     let ne0 = w.n_cols() as i64;
     let ne1 = w.n_rows() as i64;

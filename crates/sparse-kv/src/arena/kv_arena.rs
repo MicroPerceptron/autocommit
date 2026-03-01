@@ -285,37 +285,70 @@ impl KvArena {
     /// Returns `(0, n_target)` — the target agent's slots are at indices 0..n_target.
     /// This ensures the target agent's KV data is contiguous for attention.
     pub fn compact_for_agent(&mut self, target: AgentId) -> (usize, usize) {
-        // Build desired ordering: target agent first, others after, each sorted by logical_pos
-        let mut target_indices: Vec<usize> = Vec::new();
-        let mut other_indices: Vec<usize> = Vec::new();
+        let ranges = self.compact_for_batch(&[target]);
+        if ranges.is_empty() {
+            return (0, 0);
+        }
+        (ranges[0].1, ranges[0].2)
+    }
 
-        for (i, s) in self.slots.iter().enumerate() {
-            if s.is_free() {
-                continue;
-            }
-            if s.agent() == Some(target) {
-                target_indices.push(i);
-            } else {
-                other_indices.push(i);
-            }
+    /// Compact arena so multiple agents' slots are contiguous and grouped.
+    ///
+    /// After compaction, the arena layout is:
+    ///   [A0_slots | A1_slots | ... | AN_slots | other_occupied | FREE...]
+    ///
+    /// Each agent's slots are sorted by logical_pos within their block.
+    /// The ordering of agents follows the input `agents` slice order
+    /// (scheduler priority order). Any occupied slots not belonging to
+    /// a listed agent are placed after the listed agents' blocks.
+    ///
+    /// Returns `Vec<(AgentId, offset, count)>` for each agent in the input.
+    pub fn compact_for_batch(&mut self, agents: &[AgentId]) -> Vec<(AgentId, usize, usize)> {
+        // Collect slot indices per agent, sorted by logical_pos
+        let mut per_agent: Vec<Vec<usize>> = Vec::with_capacity(agents.len());
+        let listed_set: Vec<AgentId> = agents.to_vec();
+
+        for &agent in agents {
+            let mut indices: Vec<usize> = self
+                .slots
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| !s.is_free() && s.agent() == Some(agent))
+                .map(|(i, _)| i)
+                .collect();
+            indices.sort_by_key(|&i| self.slots[i].logical_pos().unwrap());
+            per_agent.push(indices);
         }
 
-        target_indices.sort_by_key(|&i| self.slots[i].logical_pos().unwrap());
+        // Collect any occupied slots NOT in the listed agents
+        let mut other_indices: Vec<usize> = self
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| {
+                !s.is_free() && s.agent().map_or(true, |a| !listed_set.contains(&a))
+            })
+            .map(|(i, _)| i)
+            .collect();
         other_indices.sort_by_key(|&i| self.slots[i].logical_pos().unwrap());
 
-        let n_target = target_indices.len();
-        let desired: Vec<usize> = target_indices
-            .iter()
-            .chain(other_indices.iter())
-            .copied()
-            .collect();
+        // Build desired permutation and result ranges
+        let mut desired: Vec<usize> = Vec::new();
+        let mut result = Vec::with_capacity(agents.len());
+
+        for (agent_idx, indices) in per_agent.iter().enumerate() {
+            let offset = desired.len();
+            desired.extend_from_slice(indices);
+            result.push((agents[agent_idx], offset, indices.len()));
+        }
+        desired.extend_from_slice(&other_indices);
         let n_total = desired.len();
 
-        // Check if already in the correct order (common single-agent case)
+        // Check if already in the correct order (common fast path)
         let already_ordered = desired.iter().enumerate().all(|(i, &src)| i == src);
         if already_ordered {
             self.free_count = self.capacity - n_total;
-            return (0, n_target);
+            return result;
         }
 
         // Apply permutation using temporary buffers
@@ -364,7 +397,7 @@ impl KvArena {
         }
 
         self.free_count = self.capacity - n_total;
-        (0, n_target)
+        result
     }
 
     /// Compact: move all occupied slots to a contiguous prefix.
@@ -672,6 +705,92 @@ mod tests {
         assert_eq!(a1_slots.len(), 2);
         assert_eq!(a1_slots[0].0, SlotId(0));
         assert_eq!(a1_slots[1].0, SlotId(1));
+    }
+
+    #[test]
+    fn compact_for_batch_two_agents() {
+        let mut arena = KvArena::new(&test_config(8));
+        let a0 = AgentId(0);
+        let a1 = AgentId(1);
+
+        // Interleaved: A0, A1, A0, A1
+        arena.alloc_slot(a0, 0).unwrap();
+        arena.alloc_slot(a1, 0).unwrap();
+        arena.alloc_slot(a0, 1).unwrap();
+        arena.alloc_slot(a1, 1).unwrap();
+
+        let ranges = arena.compact_for_batch(&[a1, a0]); // a1 first (scheduler priority)
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(ranges[0], (a1, 0, 2)); // a1 at offset 0, count 2
+        assert_eq!(ranges[1], (a0, 2, 2)); // a0 at offset 2, count 2
+
+        // Verify physical positions
+        let a1_slots = arena.agent_slots(a1);
+        assert_eq!(a1_slots[0].0, SlotId(0));
+        assert_eq!(a1_slots[1].0, SlotId(1));
+
+        let a0_slots = arena.agent_slots(a0);
+        assert_eq!(a0_slots[0].0, SlotId(2));
+        assert_eq!(a0_slots[1].0, SlotId(3));
+    }
+
+    #[test]
+    fn compact_for_batch_three_agents_priority_order() {
+        let mut arena = KvArena::new(&test_config(12));
+        let a0 = AgentId(0);
+        let a1 = AgentId(1);
+        let a2 = AgentId(2);
+
+        // Allocate interleaved
+        for pos in 0u32..3 {
+            arena.alloc_slot(a0, pos).unwrap();
+            arena.alloc_slot(a1, pos).unwrap();
+            arena.alloc_slot(a2, pos).unwrap();
+        }
+
+        // Priority order: a2, a0, a1
+        let ranges = arena.compact_for_batch(&[a2, a0, a1]);
+        assert_eq!(ranges[0], (a2, 0, 3));
+        assert_eq!(ranges[1], (a0, 3, 3));
+        assert_eq!(ranges[2], (a1, 6, 3));
+    }
+
+    #[test]
+    fn compact_for_batch_single_degenerates() {
+        let mut arena = KvArena::new(&test_config(8));
+        let a0 = AgentId(0);
+        let a1 = AgentId(1);
+
+        arena.alloc_slot(a0, 0).unwrap();
+        arena.alloc_slot(a1, 0).unwrap();
+        arena.alloc_slot(a0, 1).unwrap();
+
+        let ranges = arena.compact_for_batch(&[a0]);
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0], (a0, 0, 2));
+
+        // a0 at front, a1 follows
+        let a0_slots = arena.agent_slots(a0);
+        assert_eq!(a0_slots[0].0, SlotId(0));
+        assert_eq!(a0_slots[1].0, SlotId(1));
+    }
+
+    #[test]
+    fn compact_for_batch_already_ordered() {
+        let mut arena = KvArena::new(&test_config(8));
+        let a0 = AgentId(0);
+        let a1 = AgentId(1);
+
+        // Allocate in order: a0 then a1
+        arena.alloc_slot(a0, 0).unwrap();
+        arena.alloc_slot(a0, 1).unwrap();
+        arena.alloc_slot(a1, 0).unwrap();
+        arena.alloc_slot(a1, 1).unwrap();
+
+        // Already in the right order — should hit fast path
+        let ranges = arena.compact_for_batch(&[a0, a1]);
+        assert_eq!(ranges[0], (a0, 0, 2));
+        assert_eq!(ranges[1], (a1, 2, 2));
     }
 
     #[test]

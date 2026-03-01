@@ -37,6 +37,39 @@ pub fn causal_prefill_mask(
     (mask_tensor, data)
 }
 
+/// Build a block-diagonal mask for continuous batching (multi-agent decode).
+///
+/// Shape: [total_kv_len, n_agents] (F32)
+/// - 0.0 where attention is allowed
+/// - -inf where blocked
+///
+/// Agent i (query column i) can only attend to KV positions
+/// in `[ranges[i].0, ranges[i].0 + ranges[i].1)`.
+///
+/// `ranges`: one per agent, `(kv_offset, kv_len)` where `kv_len` includes
+/// the new token being decoded in this step.
+///
+/// `total_kv_len`: total number of occupied KV entries visible in the arena
+/// (must be >= max(offset + kv_len) across all agents).
+pub fn block_diagonal_mask(
+    graph: &mut ComputeGraph,
+    ranges: &[(usize, usize)],
+    total_kv_len: i64,
+) -> (TensorHandle, Vec<f32>) {
+    let n_agents = ranges.len() as i64;
+    let mask_tensor = graph.new_tensor_2d(QuantType::F32, total_kv_len, n_agents);
+    graph.set_input(mask_tensor);
+
+    let mut data = vec![f32::NEG_INFINITY; (total_kv_len * n_agents) as usize];
+    for (q, &(offset, kv_len)) in ranges.iter().enumerate() {
+        for kv in offset..offset + kv_len {
+            data[q * (total_kv_len as usize) + kv] = 0.0;
+        }
+    }
+
+    (mask_tensor, data)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,5 +144,78 @@ mod tests {
         let mut graph = ComputeGraph::new(graph_size, true).unwrap();
         let (_, data) = causal_prefill_mask(&mut graph, 5, 3);
         assert_eq!(data.len(), 8 * 3); // kv_len=8, n_tokens=3
+    }
+
+    // ── Block-diagonal mask ──────────────────────────────────────
+
+    #[test]
+    fn block_diag_two_agents() {
+        let graph_size = 1024 * 1024;
+        let mut graph = ComputeGraph::new(graph_size, true).unwrap();
+
+        // Agent 0: KV at [0..3), Agent 1: KV at [3..6)
+        let ranges = vec![(0, 3), (3, 3)];
+        let total_kv = 6i64;
+        let (_, data) = block_diagonal_mask(&mut graph, &ranges, total_kv);
+
+        assert_eq!(data.len(), 6 * 2);
+
+        // Query 0 (agent 0): sees kv 0,1,2; blocked 3,4,5
+        assert_eq!(data[0 * 6 + 0], 0.0);
+        assert_eq!(data[0 * 6 + 1], 0.0);
+        assert_eq!(data[0 * 6 + 2], 0.0);
+        assert_eq!(data[0 * 6 + 3], f32::NEG_INFINITY);
+        assert_eq!(data[0 * 6 + 4], f32::NEG_INFINITY);
+        assert_eq!(data[0 * 6 + 5], f32::NEG_INFINITY);
+
+        // Query 1 (agent 1): blocked 0,1,2; sees 3,4,5
+        assert_eq!(data[1 * 6 + 0], f32::NEG_INFINITY);
+        assert_eq!(data[1 * 6 + 1], f32::NEG_INFINITY);
+        assert_eq!(data[1 * 6 + 2], f32::NEG_INFINITY);
+        assert_eq!(data[1 * 6 + 3], 0.0);
+        assert_eq!(data[1 * 6 + 4], 0.0);
+        assert_eq!(data[1 * 6 + 5], 0.0);
+    }
+
+    #[test]
+    fn block_diag_three_agents() {
+        let graph_size = 1024 * 1024;
+        let mut graph = ComputeGraph::new(graph_size, true).unwrap();
+
+        // Different KV lengths: 2, 4, 1
+        let ranges = vec![(0, 2), (2, 4), (6, 1)];
+        let total_kv = 7i64;
+        let (_, data) = block_diagonal_mask(&mut graph, &ranges, total_kv);
+
+        assert_eq!(data.len(), 7 * 3);
+
+        // Agent 0: sees [0,1], blocked rest
+        assert_eq!(data[0 * 7 + 0], 0.0);
+        assert_eq!(data[0 * 7 + 1], 0.0);
+        assert_eq!(data[0 * 7 + 2], f32::NEG_INFINITY);
+
+        // Agent 1: sees [2,3,4,5], blocked rest
+        assert_eq!(data[1 * 7 + 1], f32::NEG_INFINITY);
+        assert_eq!(data[1 * 7 + 2], 0.0);
+        assert_eq!(data[1 * 7 + 5], 0.0);
+        assert_eq!(data[1 * 7 + 6], f32::NEG_INFINITY);
+
+        // Agent 2: sees [6] only
+        assert_eq!(data[2 * 7 + 5], f32::NEG_INFINITY);
+        assert_eq!(data[2 * 7 + 6], 0.0);
+    }
+
+    #[test]
+    fn block_diag_single_agent() {
+        let graph_size = 1024 * 1024;
+        let mut graph = ComputeGraph::new(graph_size, true).unwrap();
+
+        let ranges = vec![(0, 5)];
+        let (_, data) = block_diagonal_mask(&mut graph, &ranges, 5);
+
+        // Single agent sees everything
+        for kv in 0..5 {
+            assert_eq!(data[kv], 0.0);
+        }
     }
 }

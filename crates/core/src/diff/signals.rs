@@ -1,9 +1,9 @@
-/// Extracts key symbol declarations from diff `+` lines.
-///
-/// Scans added lines for common declaration patterns (functions, structs,
-/// traits, classes, etc.) across multiple languages. Returns up to 10
-/// deduplicated symbol names that can be used in the reduce prompt to
-/// give the LLM concrete nouns/verbs for the commit title.
+//! Extracts key symbol declarations from diff `+` lines.
+//!
+//! Scans added lines for common declaration patterns (functions, structs,
+//! traits, classes, etc.) across multiple languages. Returns up to 10
+//! deduplicated symbol names that can be used in the reduce prompt to
+//! give the LLM concrete nouns/verbs for the commit title.
 
 use crate::types::DiffChunk;
 
@@ -31,12 +31,13 @@ pub fn extract_key_symbols(chunks: &[DiffChunk]) -> Vec<String> {
                 continue;
             }
 
-            if let Some(name) = extract_symbol(trimmed) {
-                if !name.is_empty() && seen.insert(name.clone()) {
-                    symbols.push(name);
-                    if symbols.len() >= MAX_SYMBOLS {
-                        return symbols;
-                    }
+            if let Some(name) = extract_symbol(trimmed)
+                && !name.is_empty()
+                && seen.insert(name.clone())
+            {
+                symbols.push(name);
+                if symbols.len() >= MAX_SYMBOLS {
+                    return symbols;
                 }
             }
         }
@@ -76,12 +77,15 @@ fn extract_symbol(line: &str) -> Option<String> {
     {
         return extract_identifier(rest);
     }
-    if let Some(rest) = line.strip_prefix("pub mod ").or_else(|| line.strip_prefix("mod ")) {
+    if let Some(rest) = line
+        .strip_prefix("pub mod ")
+        .or_else(|| line.strip_prefix("mod "))
+    {
         return extract_identifier(rest);
     }
     if let Some(rest) = line.strip_prefix("impl ") {
         // Skip lifetime/generic prefix to get the type name.
-        let rest = rest.trim_start_matches(|c: char| c == '<' || c == '\'');
+        let rest = rest.trim_start_matches(['<', '\'']);
         return extract_identifier(rest);
     }
 
@@ -191,7 +195,13 @@ mod tests {
         let symbols = extract_key_symbols(&[chunk_with_diff(diff)]);
         assert_eq!(
             symbols,
-            vec!["validate_input", "McpServer", "Handler", "Status", "internal"]
+            vec![
+                "validate_input",
+                "McpServer",
+                "Handler",
+                "Status",
+                "internal"
+            ]
         );
     }
 
@@ -203,7 +213,10 @@ mod tests {
 +async def fetch_data(url):
 ";
         let symbols = extract_key_symbols(&[chunk_with_diff(diff)]);
-        assert_eq!(symbols, vec!["process_request", "RequestHandler", "fetch_data"]);
+        assert_eq!(
+            symbols,
+            vec!["process_request", "RequestHandler", "fetch_data"]
+        );
     }
 
     #[test]

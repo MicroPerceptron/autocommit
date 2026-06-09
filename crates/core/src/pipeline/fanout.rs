@@ -40,7 +40,7 @@ pub fn analyze_chunks(
                 .collect::<Result<Vec<_>, _>>()?
         };
 
-        for (slot, report) in missing.into_iter().zip(analyzed.into_iter()) {
+        for (slot, report) in missing.into_iter().zip(analyzed) {
             cached[slot] = Some(report.clone());
             cache.store(&chunks[slot], &report);
         }

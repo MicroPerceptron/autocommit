@@ -1,9 +1,9 @@
-/// Classifies file paths by their semantic importance to a commit message.
-///
-/// `classify_path` returns `Some(tier)` for cases where the path alone is
-/// decisive, and `None` for ambiguous paths that need embedding-based
-/// classification (e.g., manifests that could be adding a core dependency
-/// or just bumping a dev tool version).
+//! Classifies file paths by their semantic importance to a commit message.
+//!
+//! `classify_path` returns `Some(tier)` for cases where the path alone is
+//! decisive, and `None` for ambiguous paths that need embedding-based
+//! classification (e.g., manifests that could be adding a core dependency
+//! or just bumping a dev tool version).
 
 use serde::{Deserialize, Serialize};
 
@@ -172,30 +172,57 @@ mod tests {
 
     #[test]
     fn source_code_is_primary() {
-        assert_eq!(classify_path("crates/core/src/lib.rs"), Some(ImportanceTier::Primary));
+        assert_eq!(
+            classify_path("crates/core/src/lib.rs"),
+            Some(ImportanceTier::Primary)
+        );
         assert_eq!(classify_path("src/main.py"), Some(ImportanceTier::Primary));
-        assert_eq!(classify_path("lib/handler.ts"), Some(ImportanceTier::Primary));
-        assert_eq!(classify_path("cmd/server/main.go"), Some(ImportanceTier::Primary));
+        assert_eq!(
+            classify_path("lib/handler.ts"),
+            Some(ImportanceTier::Primary)
+        );
+        assert_eq!(
+            classify_path("cmd/server/main.go"),
+            Some(ImportanceTier::Primary)
+        );
     }
 
     #[test]
     fn lock_files_are_supporting() {
-        assert_eq!(classify_path("Cargo.lock"), Some(ImportanceTier::Supporting));
-        assert_eq!(classify_path("package-lock.json"), Some(ImportanceTier::Supporting));
+        assert_eq!(
+            classify_path("Cargo.lock"),
+            Some(ImportanceTier::Supporting)
+        );
+        assert_eq!(
+            classify_path("package-lock.json"),
+            Some(ImportanceTier::Supporting)
+        );
         assert_eq!(classify_path("yarn.lock"), Some(ImportanceTier::Supporting));
     }
 
     #[test]
     fn dotfiles_are_supporting() {
-        assert_eq!(classify_path(".claude/settings.json"), Some(ImportanceTier::Supporting));
+        assert_eq!(
+            classify_path(".claude/settings.json"),
+            Some(ImportanceTier::Supporting)
+        );
         assert_eq!(classify_path(".mcp.json"), Some(ImportanceTier::Supporting));
-        assert_eq!(classify_path(".gitignore"), Some(ImportanceTier::Supporting));
+        assert_eq!(
+            classify_path(".gitignore"),
+            Some(ImportanceTier::Supporting)
+        );
     }
 
     #[test]
     fn tests_are_secondary() {
-        assert_eq!(classify_path("tests/integration.rs"), Some(ImportanceTier::Secondary));
-        assert_eq!(classify_path("src/handler.test.ts"), Some(ImportanceTier::Secondary));
+        assert_eq!(
+            classify_path("tests/integration.rs"),
+            Some(ImportanceTier::Secondary)
+        );
+        assert_eq!(
+            classify_path("src/handler.test.ts"),
+            Some(ImportanceTier::Secondary)
+        );
         assert_eq!(
             classify_path("crates/core/tests/fanout.rs"),
             Some(ImportanceTier::Secondary)
@@ -204,7 +231,10 @@ mod tests {
 
     #[test]
     fn docs_are_secondary() {
-        assert_eq!(classify_path("docs/api.md"), Some(ImportanceTier::Secondary));
+        assert_eq!(
+            classify_path("docs/api.md"),
+            Some(ImportanceTier::Secondary)
+        );
         assert_eq!(classify_path("README.md"), Some(ImportanceTier::Secondary));
     }
 
@@ -229,7 +259,10 @@ mod tests {
 
     #[test]
     fn generated_files_are_supporting() {
-        assert_eq!(classify_path("generated.rs"), Some(ImportanceTier::Supporting));
+        assert_eq!(
+            classify_path("generated.rs"),
+            Some(ImportanceTier::Supporting)
+        );
         assert_eq!(
             classify_path("src/api.generated.ts"),
             Some(ImportanceTier::Supporting)

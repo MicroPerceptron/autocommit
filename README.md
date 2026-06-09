@@ -1,5 +1,11 @@
 # autocommit
 
+[![GitHub release (latest SemVer)](https://img.shields.io/github/v/release/MicroPerceptron/autocommit.svg)](https://github.com/MicroPerceptron/autocommit/releases/latest)
+[![GitHub last commit](https://img.shields.io/github/last-commit/MicroPerceptron/autocommit.svg)](https://github.com/MicroPerceptron/autocommit/commits/main)
+[![GitHub coverage](https://img.shields.io/codecov/c/github/MicroPerceptron/autocommit.svg)](https://codecov.io/gh/MicroPerceptron/autocommit)
+[![GitHub license](https://img.shields.io/github/license/MicroPerceptron/autocommit.svg)](https://github.com/MicroPerceptron/autocommit/blob/main/LICENSE)
+[![GitHub issues](https://img.shields.io/github/issues/MicroPerceptron/autocommit.svg)](https://github.com/MicroPerceptron/autocommit/issues)
+
 AI-powered commit and pull request generation that runs entirely on your machine. Analyzes local git diffs using a bundled LLM and drafts structured, high-signal commit messages and PR descriptions through an interactive terminal workflow.
 
 No API keys. No cloud. Fully local inference powered by [llama.cpp](https://github.com/ggml-org/llama.cpp).

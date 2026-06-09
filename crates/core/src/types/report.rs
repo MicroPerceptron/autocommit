@@ -47,6 +47,9 @@ pub struct DiffStats {
     pub lines_changed: usize,
     pub hunks: usize,
     pub binary_files: usize,
+    pub whitespace_only_lines: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub key_symbols: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

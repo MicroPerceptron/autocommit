@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use autocommit_core::CoreError;
+use autocommit_core::diff::importance::{self, ImportanceTier};
 use autocommit_core::llm::traits::LlmEngine;
 use autocommit_core::llm::{grammar, prompts};
 use autocommit_core::types::{
@@ -112,17 +113,17 @@ impl LoadedRuntime {
         if self.generation_ctx.is_none() {
             let mut ctx = ContextHandle::new_generation(Arc::clone(&self.model), self.cpu_only)?;
 
-            if let Some(state_path) = self.generation_state_path.as_deref() {
-                if state_path.is_file() {
-                    match ctx.load_state_file(state_path) {
-                        Ok(tokens) => ctx.set_session_tokens(tokens),
-                        Err(err) => {
-                            if llama_logs_enabled() {
-                                eprintln!(
-                                    "autocommit warning: failed to load generation state from {}: {err}",
-                                    state_path.display()
-                                );
-                            }
+            if let Some(state_path) = self.generation_state_path.as_deref()
+                && state_path.is_file()
+            {
+                match ctx.load_state_file(state_path) {
+                    Ok(tokens) => ctx.set_session_tokens(tokens),
+                    Err(err) => {
+                        if llama_logs_enabled() {
+                            eprintln!(
+                                "autocommit warning: failed to load generation state from {}: {err}",
+                                state_path.display()
+                            );
                         }
                     }
                 }
@@ -153,13 +154,13 @@ impl LoadedRuntime {
             return;
         }
 
-        if let Err(err) = generation_ctx.save_state_file(state_path, &tokens) {
-            if llama_logs_enabled() {
-                eprintln!(
-                    "autocommit warning: failed to save generation state to {}: {err}",
-                    state_path.display()
-                );
-            }
+        if let Err(err) = generation_ctx.save_state_file(state_path, &tokens)
+            && llama_logs_enabled()
+        {
+            eprintln!(
+                "autocommit warning: failed to save generation state to {}: {err}",
+                state_path.display()
+            );
         }
     }
 
@@ -374,22 +375,21 @@ impl LoadedRuntime {
                 }
             },
             Err(err) => {
-                if err
-                    .to_string()
-                    .contains("grammar rejected all sampled candidates")
-                {
-                    let retry_raw = generation_ctx.generate_text(
-                        &prompt,
-                        None,
-                        max_tokens.saturating_add(48),
-                    )?;
-                    parse_reduce_output(&retry_raw).map_err(|retry_err| {
+                // Retry without grammar on any inference error (decode failure,
+                // grammar rejection, KV cache exhaustion, etc.).
+                match generation_ctx.generate_text(
+                    &prompt,
+                    None,
+                    max_tokens.saturating_add(48),
+                ) {
+                    Ok(retry_raw) => parse_reduce_output(&retry_raw).map_err(|retry_err| {
                         RuntimeError::Inference(format!(
-                            "reduce grammar pass failed ({err}); unconstrained retry parse failed ({retry_err})"
+                            "reduce generation failed ({err}); unconstrained retry parse failed ({retry_err})"
                         ))
-                    })
-                } else {
-                    Err(err)
+                    }),
+                    Err(retry_err) => Err(RuntimeError::Inference(format!(
+                        "reduce generation failed ({err}); unconstrained retry also failed ({retry_err})"
+                    ))),
                 }
             }
         };
@@ -466,6 +466,7 @@ pub struct Engine {
     generation_state_path: Option<PathBuf>,
     runtime: Mutex<Option<LoadedRuntime>>,
     progress: Mutex<Option<ProgressCallback>>,
+    cached_importance_anchors: Mutex<Option<(Vec<f32>, Vec<f32>)>>,
 }
 
 impl std::fmt::Debug for Engine {
@@ -508,6 +509,7 @@ impl Engine {
             generation_state_path,
             runtime: Mutex::new(None),
             progress: Mutex::new(None),
+            cached_importance_anchors: Mutex::new(None),
         })
     }
 
@@ -625,7 +627,8 @@ impl LlmEngine for Engine {
             items.extend(partial.items.clone());
         }
 
-        let reduce_plan = build_reduce_prompt_plan(partials, decision, stats);
+        let importance = classify_partials_importance(self, partials);
+        let reduce_plan = build_reduce_prompt_plan(partials, decision, stats, &importance);
         let generated_result = self.reduce_output_with_runtime(&reduce_plan);
         let generated = generated_result.as_ref().ok();
         let generated_commit_candidate = generated
@@ -827,6 +830,7 @@ fn build_reduce_prompt_plan(
     partials: &[PartialReport],
     decision: &DispatchDecision,
     stats: &DiffStats,
+    importance: &[ImportanceTier],
 ) -> ReducePromptPlan {
     let total = partials.len();
     let max_tokens = reduce_token_budget(stats, total);
@@ -855,19 +859,53 @@ fn build_reduce_prompt_plan(
     if !type_distribution.is_empty() {
         prompt.push_str(&format!("- type_distribution={type_distribution}\n"));
     }
-    // Pre-aggregate by scope for more generalized output.
+
+    // Pre-aggregate by scope, then split by importance tier.
     let aggregated = aggregate_partials_by_scope(partials, &indices);
-    prompt.push_str("Scope summary:\n");
+    let (primary_groups, supporting_groups) =
+        split_groups_by_importance(&aggregated, partials, importance, &indices);
 
     let mut sampled = 0usize;
-    for group in &aggregated {
-        if prompt.len() >= max_prompt_chars {
-            break;
+
+    if !primary_groups.is_empty() {
+        prompt.push_str("Primary changes (define the commit's purpose):\n");
+        for group in &primary_groups {
+            if prompt.len() >= max_prompt_chars {
+                break;
+            }
+            sampled += group.count;
+            prompt.push_str("- ");
+            prompt.push_str(&group.display);
+            prompt.push('\n');
         }
-        sampled += group.count;
-        prompt.push_str("- ");
-        prompt.push_str(&group.display);
-        prompt.push('\n');
+    }
+
+    if !supporting_groups.is_empty() {
+        prompt.push_str("Supporting changes (config/infrastructure):\n");
+        for group in &supporting_groups {
+            if prompt.len() >= max_prompt_chars {
+                break;
+            }
+            sampled += group.count;
+            prompt.push_str("- ");
+            prompt.push_str(&group.display);
+            prompt.push('\n');
+        }
+    }
+
+    // Fallback: if importance didn't produce any groups (e.g., empty importance slice),
+    // emit all aggregated groups in the old flat format.
+    if primary_groups.is_empty() && supporting_groups.is_empty() {
+        prompt.push_str("Scope summary:\n");
+        for group in &aggregated {
+            if prompt.len() >= max_prompt_chars {
+                break;
+            }
+            sampled += group.count;
+            prompt.push_str("- ");
+            prompt.push_str(&group.display);
+            prompt.push('\n');
+        }
     }
 
     if sampled < total {
@@ -875,6 +913,12 @@ fn build_reduce_prompt_plan(
             "- NOTE: {} additional items omitted for brevity. Infer the dominant theme.\n",
             total - sampled
         ));
+    }
+
+    // Append key symbols extracted from the diff.
+    if !stats.key_symbols.is_empty() {
+        let symbols: Vec<&str> = stats.key_symbols.iter().take(10).map(|s| s.as_str()).collect();
+        prompt.push_str(&format!("Key symbols added: {}\n", symbols.join(", ")));
     }
 
     ReducePromptPlan {
@@ -1175,14 +1219,20 @@ fn aggregate_partials_by_scope(partials: &[PartialReport], indices: &[usize]) ->
 
         let titles_str = titles.join("; ");
         let titles_compact = if titles_str.len() > 120 {
-            format!("{}...", &titles_str[..117])
+            // Find the largest valid UTF-8 boundary at or before byte index 117.
+            let cutoff = titles_str
+                .char_indices()
+                .take_while(|(i, _)| *i <= 117)
+                .map(|(i, _)| i)
+                .last()
+                .unwrap_or(0);
+            format!("{}...", &titles_str[..cutoff])
         } else {
             titles_str
         };
 
-        let display = format!(
-            "scope={scope} ({file_count} files): {types_str} \u{2014} {titles_compact}"
-        );
+        let display =
+            format!("scope={scope} ({file_count} files): {types_str} \u{2014} {titles_compact}");
 
         result.push(ScopeGroup {
             display,
@@ -1191,8 +1241,216 @@ fn aggregate_partials_by_scope(partials: &[PartialReport], indices: &[usize]) ->
     }
 
     // Sort by count descending (largest scope groups first).
-    result.sort_by(|a, b| b.count.cmp(&a.count));
+    result.sort_by_key(|a| std::cmp::Reverse(a.count));
     result
+}
+
+/// Classify all partials by importance, using heuristics for obvious paths
+/// and embedding-based classification for ambiguous ones (e.g., manifests).
+fn classify_partials_importance(engine: &Engine, partials: &[PartialReport]) -> Vec<ImportanceTier> {
+    if partials.is_empty() {
+        return Vec::new();
+    }
+
+    // First pass: try pure heuristics for all partials.
+    let mut results: Vec<Option<ImportanceTier>> = partials
+        .iter()
+        .map(|p| classify_partial_by_path(p))
+        .collect();
+
+    // Check if any partials are ambiguous (need embedding).
+    let ambiguous_indices: Vec<usize> = results
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.is_none())
+        .map(|(i, _)| i)
+        .collect();
+
+    if !ambiguous_indices.is_empty() {
+        // Get or compute cached importance anchor embeddings.
+        let anchors = get_importance_anchors(engine);
+
+        if let Some((primary_emb, supporting_emb)) = anchors {
+            for idx in ambiguous_indices {
+                let signal = build_importance_signal(&partials[idx]);
+                if let Ok(signal_emb) = engine.embed_with_runtime(&signal) {
+                    results[idx] = classify_importance_embedding(
+                        engine,
+                        &signal_emb,
+                        &primary_emb,
+                        &supporting_emb,
+                    );
+                }
+            }
+        }
+    }
+
+    // Fill remaining None values with Primary (conservative default).
+    results
+        .into_iter()
+        .map(|r| r.unwrap_or(ImportanceTier::Primary))
+        .collect()
+}
+
+/// Try to classify a partial by its file paths alone. Returns None if ambiguous.
+fn classify_partial_by_path(partial: &PartialReport) -> Option<ImportanceTier> {
+    let tiers: Vec<Option<ImportanceTier>> = partial
+        .items
+        .iter()
+        .flat_map(|item| item.files.iter())
+        .map(|f| importance::classify_path(&f.path))
+        .collect();
+
+    if tiers.is_empty() {
+        return Some(ImportanceTier::Primary);
+    }
+
+    // If any path is ambiguous, the whole partial is ambiguous.
+    if tiers.iter().any(|t| t.is_none()) {
+        return None;
+    }
+
+    // If all paths agree, use that tier.
+    let first = tiers[0];
+    if tiers.iter().all(|t| *t == first) {
+        return first;
+    }
+
+    // Mixed tiers within one partial — use the highest priority (Primary > Secondary > Supporting).
+    tiers.into_iter().flatten().min()
+}
+
+/// Get cached importance anchor embeddings, computing them on first use.
+fn get_importance_anchors(engine: &Engine) -> Option<(Vec<f32>, Vec<f32>)> {
+    {
+        let guard = engine.cached_importance_anchors.lock().ok()?;
+        if let Some(cached) = guard.as_ref() {
+            return Some(cached.clone());
+        }
+    }
+
+    // Compute anchor embeddings.
+    let primary_emb = engine
+        .embed_with_runtime(prompts::IMPORTANCE_PRIMARY_ANCHOR)
+        .ok()?;
+    let supporting_emb = engine
+        .embed_with_runtime(prompts::IMPORTANCE_SUPPORTING_ANCHOR)
+        .ok()?;
+
+    if primary_emb.is_empty() || supporting_emb.is_empty() {
+        return None;
+    }
+
+    let result = (primary_emb, supporting_emb);
+
+    // Cache for subsequent calls.
+    if let Ok(mut guard) = engine.cached_importance_anchors.lock() {
+        *guard = Some(result.clone());
+    }
+
+    Some(result)
+}
+
+/// Build a signal string from a partial's semantic content for embedding.
+fn build_importance_signal(partial: &PartialReport) -> String {
+    let mut signal = String::with_capacity(256);
+    signal.push_str("summary: ");
+    signal.push_str(partial.summary.trim());
+
+    for item in partial.items.iter().take(3) {
+        signal.push_str("\ntitle: ");
+        signal.push_str(item.title.trim());
+        signal.push_str("\nintent: ");
+        signal.push_str(item.intent.trim());
+
+        if let Some(f) = item.files.first() {
+            signal.push_str("\npath: ");
+            signal.push_str(&f.path);
+        }
+    }
+
+    // Cap signal length to keep embedding focused.
+    if signal.len() > 512 {
+        signal.truncate(512);
+    }
+    signal
+}
+
+/// Classify an embedding signal against primary/supporting anchors.
+/// Returns None if confidence is too low (falls back to heuristic default).
+fn classify_importance_embedding(
+    engine: &Engine,
+    signal_emb: &[f32],
+    primary_emb: &[f32],
+    supporting_emb: &[f32],
+) -> Option<ImportanceTier> {
+    let primary_sim = engine.cosine_similarity(signal_emb, primary_emb)?;
+    let supporting_sim = engine.cosine_similarity(signal_emb, supporting_emb)?;
+
+    let best_score = primary_sim.max(supporting_sim);
+    let margin = (primary_sim - supporting_sim).abs();
+
+    // Require modest confidence before overriding heuristic.
+    if best_score < 0.55 || margin < 0.05 {
+        return None;
+    }
+
+    if primary_sim > supporting_sim {
+        Some(ImportanceTier::Primary)
+    } else {
+        Some(ImportanceTier::Supporting)
+    }
+}
+
+/// Split scope groups into primary and supporting based on their constituent
+/// partials' importance tiers.
+fn split_groups_by_importance<'a>(
+    groups: &'a [ScopeGroup],
+    partials: &[PartialReport],
+    importance: &[ImportanceTier],
+    indices: &[usize],
+) -> (Vec<&'a ScopeGroup>, Vec<&'a ScopeGroup>) {
+    // Build a map of scope → dominant importance tier from the sampled partials.
+    let mut scope_tiers: std::collections::BTreeMap<String, ImportanceTier> =
+        std::collections::BTreeMap::new();
+
+    for &idx in indices {
+        if idx >= partials.len() || idx >= importance.len() {
+            continue;
+        }
+        let scope = reduce_partial_scope_key(&partials[idx]);
+        let tier = importance[idx];
+
+        let entry = scope_tiers.entry(scope).or_insert(tier);
+        // Promote to the highest priority tier seen for this scope.
+        if tier < *entry {
+            *entry = tier;
+        }
+    }
+
+    let mut primary = Vec::new();
+    let mut supporting = Vec::new();
+
+    for group in groups {
+        // Extract the scope name from the display string: "scope=X (...)"
+        let scope = group
+            .display
+            .strip_prefix("scope=")
+            .and_then(|s| s.split(' ').next())
+            .unwrap_or("");
+
+        let tier = scope_tiers
+            .get(scope)
+            .copied()
+            .unwrap_or(ImportanceTier::Primary);
+
+        match tier {
+            ImportanceTier::Primary | ImportanceTier::Secondary => primary.push(group),
+            ImportanceTier::Supporting => supporting.push(group),
+        }
+    }
+
+    (primary, supporting)
 }
 
 #[allow(dead_code)]
@@ -1281,11 +1539,11 @@ fn salvage_reduce_output(raw: &str) -> Option<ReduceModelOutput> {
         } else {
             normalize_commit_message(&cleaned)
         };
-        if commit_message.is_none() {
-            if let Some(commit) = normalized_commit {
-                commit_message = Some(commit);
-                continue;
-            }
+        if commit_message.is_none()
+            && let Some(commit) = normalized_commit
+        {
+            commit_message = Some(commit);
+            continue;
         }
 
         if summary.is_none() {
@@ -1633,10 +1891,10 @@ fn extract_json_like_field(raw: &str, key: &str) -> Option<String> {
 
         if bytes[i] == b'"' {
             if let Some(end) = find_string_end(bytes, i + 1) {
-                if let Some(slice) = raw.get(i..=end) {
-                    if let Ok(parsed) = serde_json::from_str::<String>(slice) {
-                        return Some(parsed.trim().to_string());
-                    }
+                if let Some(slice) = raw.get(i..=end)
+                    && let Ok(parsed) = serde_json::from_str::<String>(slice)
+                {
+                    return Some(parsed.trim().to_string());
                 }
                 if let Some(fallback) = raw.get((i + 1)..end) {
                     return Some(fallback.trim().to_string());
@@ -1675,7 +1933,7 @@ fn find_string_end(bytes: &[u8], mut idx: usize) -> Option<usize> {
                 slash_count += 1;
                 back -= 1;
             }
-            if slash_count % 2 == 0 {
+            if slash_count.is_multiple_of(2) {
                 return Some(idx);
             }
         }
@@ -1904,10 +2162,10 @@ fn extract_hunk_ranges(lines: &[&str]) -> Vec<(usize, usize)> {
             if let Some(start) = current_start.replace(idx) {
                 out.push((start, idx));
             }
-        } else if line.starts_with("diff --git ") {
-            if let Some(start) = current_start.take() {
-                out.push((start, idx));
-            }
+        } else if line.starts_with("diff --git ")
+            && let Some(start) = current_start.take()
+        {
+            out.push((start, idx));
         }
     }
 
@@ -2035,10 +2293,8 @@ fn append_head_tail_with_limit(text: &str, out: &mut String, max_chars: usize) {
             return;
         }
     }
-    if head + tail < lines.len() {
-        if !push_line_with_limit(out, "...", max_chars) {
-            return;
-        }
+    if head + tail < lines.len() && !push_line_with_limit(out, "...", max_chars) {
+        return;
     }
     for line in lines.iter().copied().skip(lines.len().saturating_sub(tail)) {
         if !push_line_with_limit(out, line, max_chars) {
@@ -2529,12 +2785,13 @@ fn merge_summary_subject(first: &str, second: &str) -> String {
     let first_token = leading_action_token(first);
     let second_token = leading_action_token(second);
 
-    if let (Some(a), Some(b)) = (first_token.as_deref(), second_token.as_deref()) {
-        if a == b && is_mergeable_action_token(a) {
-            let suffix = drop_leading_action_token(second, a).trim();
-            if !suffix.is_empty() {
-                return decapitalize_first(suffix);
-            }
+    if let (Some(a), Some(b)) = (first_token.as_deref(), second_token.as_deref())
+        && a == b
+        && is_mergeable_action_token(a)
+    {
+        let suffix = drop_leading_action_token(second, a).trim();
+        if !suffix.is_empty() {
+            return decapitalize_first(suffix);
         }
     }
 
@@ -2647,7 +2904,8 @@ fn top_subject_candidates(items: &[ChangeItem], limit: usize) -> Vec<SubjectCand
             let score = item.confidence
                 + bonus
                 + subject_quality_bonus(&candidate_raw)
-                + subject_context_bonus(&candidate_raw, primary_path);
+                + subject_context_bonus(&candidate_raw, primary_path)
+                + path_importance_boost(primary_path);
             if best_for_item
                 .as_ref()
                 .map(|existing| score > existing.score)
@@ -2768,7 +3026,7 @@ fn subject_quality_bonus(subject: &str) -> f32 {
     let word_count = lower.split_whitespace().count();
     if (3..=12).contains(&word_count) {
         score += 0.04;
-    } else if word_count < 2 || word_count > 16 {
+    } else if !(2..=16).contains(&word_count) {
         score -= 0.06;
     }
 
@@ -2855,6 +3113,21 @@ fn subject_context_bonus(subject: &str, file_path: Option<&str>) -> f32 {
     }
 
     score
+}
+
+/// Boost/penalize candidates based on the importance tier of their primary file path.
+/// Ensures the fallback commit message describes code changes, not config files.
+fn path_importance_boost(file_path: Option<&str>) -> f32 {
+    let path = match file_path {
+        Some(p) => p,
+        None => return 0.0,
+    };
+    match importance::classify_path(path) {
+        Some(ImportanceTier::Primary) => 0.10,
+        Some(ImportanceTier::Secondary) => -0.10,
+        Some(ImportanceTier::Supporting) => -0.30,
+        None => 0.0,
+    }
 }
 
 fn is_low_information_subject(subject: &str) -> bool {
@@ -3080,7 +3353,7 @@ fn looks_like_reducer_meta(value: &str) -> bool {
         .split(|ch: char| !ch.is_ascii_alphanumeric())
         .filter(|token| !token.is_empty())
         .collect::<Vec<_>>();
-    let contains_word = |needle: &str| tokens.iter().any(|token| *token == needle);
+    let contains_word = |needle: &str| tokens.contains(&needle);
 
     let has_analysis = contains_word("analysis") || contains_word("analyses");
     let has_report = contains_word("report") || contains_word("reports");
@@ -3096,10 +3369,9 @@ fn looks_like_reducer_meta(value: &str) -> bool {
         || contains_word("synthesized")
         || contains_word("synthesizes");
 
-    (has_partial && has_analysis)
-        || (has_chunk && has_analysis)
-        || (lower.contains("consolidated report"))
-        || (lower.contains("adaptive reducer"))
+    ((has_partial || has_chunk) && has_analysis)
+        || lower.contains("consolidated report")
+        || lower.contains("adaptive reducer")
         || (has_reduce && (has_analysis || has_report || has_chunk || has_partial))
         || (has_synthesis && (has_analysis || has_report || has_chunk))
 }
@@ -3114,7 +3386,7 @@ fn normalize_reduce_summary(raw: &str) -> Option<String> {
     }
 
     let summary = summary
-        .trim_end_matches(|ch: char| ch == '"' || ch == '\'' || ch == '`')
+        .trim_end_matches(['"', '\'', '`'])
         .trim()
         .to_string();
     if summary.len() < 8 {
@@ -3575,6 +3847,8 @@ Summary: Preserve valid commit text when reduce JSON is partially malformed.
             lines_changed: 120,
             hunks: 10,
             binary_files: 0,
+            whitespace_only_lines: 0,
+            ..Default::default()
         };
 
         let summary = recover_summary_from_reduce(
@@ -3640,6 +3914,8 @@ Summary: Preserve valid commit text when reduce JSON is partially malformed.
             lines_changed: 100,
             hunks: 4,
             binary_files: 0,
+            whitespace_only_lines: 0,
+            ..Default::default()
         };
 
         let summary = synthesize_fallback_summary(&items, &stats);
@@ -3678,6 +3954,8 @@ Summary: Preserve valid commit text when reduce JSON is partially malformed.
             lines_changed: 50,
             hunks: 4,
             binary_files: 0,
+            whitespace_only_lines: 0,
+            ..Default::default()
         };
 
         let summary = synthesize_fallback_summary(&items, &stats);

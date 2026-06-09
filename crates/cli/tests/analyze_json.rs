@@ -5,7 +5,7 @@ use std::process::Command;
 fn analyze_json_roundtrip() {
     let diff = "diff --git a/src/lib.rs b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n";
     let path = std::env::temp_dir().join(format!(
-        "autocommit-cli-test-{}-{}.diff",
+        "autocommit-test-{}-{}.diff",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -14,7 +14,7 @@ fn analyze_json_roundtrip() {
     ));
     fs::write(&path, diff).expect("write diff fixture");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_autocommit-cli"))
+    let output = Command::new(env!("CARGO_BIN_EXE_autocommit"))
         .args([
             "analyze",
             "--json",

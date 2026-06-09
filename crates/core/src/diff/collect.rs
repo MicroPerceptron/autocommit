@@ -117,9 +117,10 @@ fn scope_key(path: &str) -> String {
         return path.to_string();
     }
     match parts[0] {
-        "crates" | "src" | "packages" | "libs" => {
-            parts.get(1).map(|s| format!("{}/{}", parts[0], s)).unwrap_or_else(|| parts[0].to_string())
-        }
+        "crates" | "src" | "packages" | "libs" => parts
+            .get(1)
+            .map(|s| format!("{}/{}", parts[0], s))
+            .unwrap_or_else(|| parts[0].to_string()),
         "tests" | "test" => "tests".to_string(),
         "docs" => "docs".to_string(),
         "third_party" | "vendor" => "third_party".to_string(),

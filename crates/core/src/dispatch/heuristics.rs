@@ -8,8 +8,9 @@ pub struct HeuristicScore {
 }
 
 pub fn score(features: &DiffFeatures) -> HeuristicScore {
+    let effective_lines = features.lines_changed - features.whitespace_only_lines;
     let complexity = features.files_changed as f32 * 0.35
-        + features.lines_changed as f32 * 0.005
+        + effective_lines as f32 * 0.005
         + features.hunks as f32 * 0.2
         + features.risky_paths as f32 * 0.7;
 
@@ -35,6 +36,7 @@ mod tests {
             hunks: 2,
             binary_files: 0,
             risky_paths: 1,
+            whitespace_only_lines: 0,
         };
         let score = score(&features);
         assert!(score.risky);

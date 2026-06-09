@@ -612,8 +612,8 @@ fn legacy_context_shift_override(common_default: bool) -> bool {
         .as_deref()
         .map(str::trim)
     {
-        Some(v) if matches!(v, "1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON") => true,
-        Some(v) if matches!(v, "0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF") => false,
+        Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON") => true,
+        Some("0" | "false" | "FALSE" | "no" | "NO" | "off" | "OFF") => false,
         _ => common_default,
     }
 }

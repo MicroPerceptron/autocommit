@@ -138,8 +138,29 @@ impl ContextHandle {
             let ctx = ffi::llama_init_from_model(model.as_ptr(), cparams);
             if !ctx.is_null() {
                 ffi::llama_set_embeddings(ctx, mode == ContextMode::Embedding);
+                return ctx;
             }
-            ctx
+
+            // Quantized KV cache (Q8_0, Q4_0, etc.) requires Flash Attention, which
+            // some backends (SYCL on iGPU, Vulkan) do not support. When the initial
+            // context creation fails, retry with F16 KV cache and FA explicitly
+            // disabled so the context can still be created on those backends.
+            let needs_fa_downgrade = cparams.type_k != ffi::ggml_type_GGML_TYPE_F16
+                || cparams.type_v != ffi::ggml_type_GGML_TYPE_F16;
+            if needs_fa_downgrade {
+                cparams.type_k = ffi::ggml_type_GGML_TYPE_F16;
+                cparams.type_v = ffi::ggml_type_GGML_TYPE_F16;
+                cparams.flash_attn_type =
+                    ffi::llama_flash_attn_type_LLAMA_FLASH_ATTN_TYPE_DISABLED;
+
+                let ctx = ffi::llama_init_from_model(model.as_ptr(), cparams);
+                if !ctx.is_null() {
+                    ffi::llama_set_embeddings(ctx, mode == ContextMode::Embedding);
+                    return ctx;
+                }
+            }
+
+            std::ptr::null_mut()
         }
     }
 
@@ -361,7 +382,7 @@ impl ContextHandle {
             ffi::llama_set_warmup(self.ptr, true);
         }
 
-        let result = (|| {
+        let result = {
             let mut tokens = Vec::with_capacity(2);
             let bos = unsafe {
                 // SAFETY: model vocabulary pointer is valid for the context lifetime.
@@ -383,7 +404,7 @@ impl ContextHandle {
             }
 
             self.decode_prompt_tokens(&tokens, 0)
-        })();
+        };
 
         unsafe {
             // SAFETY: context pointer is valid while handle is alive.

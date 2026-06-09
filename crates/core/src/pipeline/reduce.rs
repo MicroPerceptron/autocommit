@@ -1,4 +1,6 @@
 use crate::CoreError;
+use crate::diff::features::DiffFeatures;
+use crate::diff::importance::{self, ImportanceTier};
 use crate::llm::traits::LlmEngine;
 use crate::types::{
     AnalysisReport, ChangeItem, DiffStats, DispatchDecision, PartialReport, RiskReport, TypeTag,
@@ -45,20 +47,52 @@ pub fn synthesize_draft_report(
     }
 }
 
+/// Build a report for format-only diffs without any LLM inference.
+pub fn format_only_report(
+    features: &DiffFeatures,
+    decision: &DispatchDecision,
+    stats: &DiffStats,
+) -> AnalysisReport {
+    let noun = if features.files_changed == 1 {
+        "file"
+    } else {
+        "files"
+    };
+    AnalysisReport {
+        schema_version: "1.0".to_string(),
+        commit_message: format!(
+            "style: format code across {} {}",
+            features.files_changed, noun
+        ),
+        summary: format!(
+            "Formatting changes across {} {} ({} lines).",
+            features.files_changed, noun, features.lines_changed
+        ),
+        items: Vec::new(),
+        risk: RiskReport {
+            level: "low".to_string(),
+            notes: vec!["commit_source:format_only".to_string()],
+        },
+        stats: stats.clone(),
+        dispatch: decision.clone(),
+    }
+}
+
 fn synthesize_commit_message(items: &[ChangeItem]) -> String {
-    let best = items
-        .iter()
-        .max_by(|a, b| a.confidence.partial_cmp(&b.confidence).unwrap_or(std::cmp::Ordering::Equal));
+    let best = items.iter().max_by(|a, b| {
+        let a_score = a.confidence + importance_boost(a);
+        let b_score = b.confidence + importance_boost(b);
+        a_score
+            .partial_cmp(&b_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     let Some(best) = best else {
         return "chore: update project code".to_string();
     };
 
     let type_prefix = type_tag_prefix(best.type_tag.clone());
-    let scope = best
-        .files
-        .first()
-        .and_then(|f| scope_from_path(&f.path));
+    let scope = best.files.first().and_then(|f| scope_from_path(&f.path));
     let description = decapitalize_first(best.title.trim());
     let description = trim_type_prefix(type_prefix, &description);
 
@@ -72,9 +106,11 @@ fn synthesize_summary(items: &[ChangeItem], stats: &DiffStats) -> String {
     let file_count = stats.files_changed.max(1);
     let noun = if file_count == 1 { "file" } else { "files" };
 
-    let best = items
-        .iter()
-        .max_by(|a, b| a.confidence.partial_cmp(&b.confidence).unwrap_or(std::cmp::Ordering::Equal));
+    let best = items.iter().max_by(|a, b| {
+        a.confidence
+            .partial_cmp(&b.confidence)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     match best {
         Some(item) => format!(
@@ -82,6 +118,22 @@ fn synthesize_summary(items: &[ChangeItem], stats: &DiffStats) -> String {
             capitalize_first(item.title.trim())
         ),
         None => format!("Update project code across {file_count} {noun}."),
+    }
+}
+
+/// Importance-based confidence adjustment for the draft path.
+/// Boosts primary code items, penalizes config/infrastructure items.
+fn importance_boost(item: &ChangeItem) -> f32 {
+    let path = item
+        .files
+        .first()
+        .map(|f| f.path.as_str())
+        .unwrap_or("");
+    match importance::classify_path(path) {
+        Some(ImportanceTier::Primary) => 0.1,
+        Some(ImportanceTier::Secondary) => -0.1,
+        Some(ImportanceTier::Supporting) => -0.3,
+        None => 0.0, // ambiguous — no adjustment in draft path
     }
 }
 
@@ -122,7 +174,7 @@ fn scope_from_path(path: &str) -> Option<String> {
     }
 }
 
-fn trim_type_prefix<'a>(type_prefix: &str, description: &'a str) -> String {
+fn trim_type_prefix(type_prefix: &str, description: &str) -> String {
     let lower = description.to_ascii_lowercase();
     let prefix_with_space = format!("{type_prefix} ");
     if lower.starts_with(&prefix_with_space) {
@@ -191,10 +243,72 @@ mod tests {
             lines_changed: 20,
             hunks: 1,
             binary_files: 0,
+            whitespace_only_lines: 0,
+            ..Default::default()
         };
 
         let report = synthesize_draft_report(&partials, &decision, &stats);
         assert!(report.commit_message.starts_with("feat(core):"));
         assert_eq!(report.risk.level, "low");
+    }
+
+    #[test]
+    fn format_only_report_produces_style_commit() {
+        let features = DiffFeatures {
+            files_changed: 5,
+            lines_changed: 120,
+            hunks: 10,
+            binary_files: 0,
+            risky_paths: 0,
+            whitespace_only_lines: 118,
+        };
+        let decision = DispatchDecision {
+            route: DispatchRoute::FormatOnly,
+            reason_codes: vec!["format_only".to_string()],
+            estimated_cost_tokens: 0,
+        };
+        let stats = DiffStats {
+            files_changed: 5,
+            lines_changed: 120,
+            hunks: 10,
+            binary_files: 0,
+            whitespace_only_lines: 118,
+            ..Default::default()
+        };
+
+        let report = format_only_report(&features, &decision, &stats);
+        assert!(report.commit_message.starts_with("style:"));
+        assert!(report.commit_message.contains("5 files"));
+        assert_eq!(report.risk.level, "low");
+        assert!(report.risk.notes.contains(&"commit_source:format_only".to_string()));
+    }
+
+    #[test]
+    fn format_only_report_singular_file() {
+        let features = DiffFeatures {
+            files_changed: 1,
+            lines_changed: 10,
+            hunks: 1,
+            binary_files: 0,
+            risky_paths: 0,
+            whitespace_only_lines: 10,
+        };
+        let decision = DispatchDecision {
+            route: DispatchRoute::FormatOnly,
+            reason_codes: vec!["format_only".to_string()],
+            estimated_cost_tokens: 0,
+        };
+        let stats = DiffStats {
+            files_changed: 1,
+            lines_changed: 10,
+            hunks: 1,
+            binary_files: 0,
+            whitespace_only_lines: 10,
+            ..Default::default()
+        };
+
+        let report = format_only_report(&features, &decision, &stats);
+        assert!(report.commit_message.contains("1 file"));
+        assert!(!report.commit_message.contains("1 files"));
     }
 }

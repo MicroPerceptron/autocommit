@@ -71,12 +71,11 @@ impl Repo {
             append_index_worktree_patch(&self.inner, &mut pipeline, index_state, &mut out, item)?;
         }
 
-        if let Some(mut outcome) = iter.into_outcome() {
-            if let Some(result) = outcome.write_changes() {
-                result.map_err(|err| {
-                    CoreError::Io(format!("failed to update index metadata: {err}"))
-                })?;
-            }
+        if let Some(mut outcome) = iter.into_outcome()
+            && let Some(result) = outcome.write_changes()
+        {
+            result
+                .map_err(|err| CoreError::Io(format!("failed to update index metadata: {err}")))?;
         }
 
         Ok(out)
@@ -394,6 +393,11 @@ impl Repo {
         if let Some(parent_id) = parent_id {
             command.arg("-p").arg(parent_id.to_string());
         }
+        // Ensure GPG_TTY is set so gpg-agent/pinentry can find the terminal
+        // for passphrase prompts without requiring manual shell configuration.
+        if std::env::var("GPG_TTY").is_err() {
+            command.env("GPG_TTY", "/dev/tty");
+        }
         command
             .args(["-F", "-"])
             .current_dir(&repo_root)
@@ -418,7 +422,7 @@ impl Repo {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             if signing_tool_missing(&stderr) {
                 return Err(CoreError::Io(
-                    "git commit signing requires `gpg`, but it is not available. Install `gpg` or disable signing with `autocommit-cli commit --configure-commit-policy`".to_string(),
+                    "git commit signing requires `gpg`, but it is not available. Install `gpg` or disable signing with `autocommit commit --configure-commit-policy`".to_string(),
                 ));
             }
             if signing_secret_key_missing(&stderr) {
@@ -568,12 +572,11 @@ impl Repo {
             apply_index_worktree_change(&mut pipeline, index_state, &mut editor, item)?;
         }
 
-        if let Some(mut outcome) = iter.into_outcome() {
-            if let Some(result) = outcome.write_changes() {
-                result.map_err(|err| {
-                    CoreError::Io(format!("failed to update index metadata: {err}"))
-                })?;
-            }
+        if let Some(mut outcome) = iter.into_outcome()
+            && let Some(result) = outcome.write_changes()
+        {
+            result
+                .map_err(|err| CoreError::Io(format!("failed to update index metadata: {err}")))?;
         }
 
         editor
@@ -785,22 +788,21 @@ fn append_index_worktree_patch(
             ..
         } => {
             let dst_path = dirwalk_entry.rela_path.as_bstr();
-            if !copy {
-                if let gix::status::index_worktree::RewriteSource::RewriteFromIndex {
+            if !copy
+                && let gix::status::index_worktree::RewriteSource::RewriteFromIndex {
                     source_rela_path,
                     source_entry,
                     ..
                 } = source
-                {
-                    append_patch(
-                        repo,
-                        out,
-                        Some(source_rela_path.as_ref()),
-                        None,
-                        Some(source_entry.id),
-                        None,
-                    )?;
-                }
+            {
+                append_patch(
+                    repo,
+                    out,
+                    Some(source_rela_path.as_ref()),
+                    None,
+                    Some(source_entry.id),
+                    None,
+                )?;
             }
 
             if let Some((new_id, _, _)) = pipeline
@@ -862,16 +864,15 @@ fn apply_index_worktree_change(
             copy,
             ..
         } => {
-            if !copy {
-                if let gix::status::index_worktree::RewriteSource::RewriteFromIndex {
+            if !copy
+                && let gix::status::index_worktree::RewriteSource::RewriteFromIndex {
                     source_rela_path,
                     ..
                 } = source
-                {
-                    editor.remove(source_rela_path.as_bstr()).map_err(|err| {
-                        CoreError::Io(format!("failed to remove tree entry: {err}"))
-                    })?;
-                }
+            {
+                editor
+                    .remove(source_rela_path.as_bstr())
+                    .map_err(|err| CoreError::Io(format!("failed to remove tree entry: {err}")))?;
             }
             upsert_worktree_path(pipeline, index, editor, dirwalk_entry.rela_path.as_bstr())?;
         }

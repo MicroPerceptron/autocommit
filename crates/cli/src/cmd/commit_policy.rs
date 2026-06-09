@@ -1,7 +1,7 @@
 use std::io::Write;
 
 use dialoguer::console::Term;
-use dialoguer::{theme::ColorfulTheme, Confirm, Select};
+use dialoguer::{Confirm, Select, theme::ColorfulTheme};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -309,10 +309,10 @@ fn is_conventional_subject(subject: &str) -> bool {
     if !is_valid_type(type_part) {
         return false;
     }
-    if let Some(scope) = scope_part {
-        if !is_valid_scope(scope) {
-            return false;
-        }
+    if let Some(scope) = scope_part
+        && !is_valid_scope(scope)
+    {
+        return false;
     }
     true
 }

@@ -5,10 +5,19 @@ use crate::types::{DispatchDecision, DispatchRoute};
 pub fn decide(features: &DiffFeatures, embedding_hint: Option<EmbeddingHint>) -> DispatchDecision {
     let mut reasons = Vec::new();
 
+    let ws_ratio = if features.lines_changed > 0 {
+        features.whitespace_only_lines as f32 / features.lines_changed as f32
+    } else {
+        0.0
+    };
+
     let route = if features.files_changed == 0 {
         reasons.push("empty_diff".to_string());
         DispatchRoute::DraftOnly
-    } else if features.lines_changed <= 150 && features.risky_paths == 0 {
+    } else if ws_ratio >= 0.95 {
+        reasons.push("format_only".to_string());
+        DispatchRoute::FormatOnly
+    } else if features.lines_changed <= 50 && features.risky_paths == 0 {
         reasons.push("small_diff".to_string());
         DispatchRoute::DraftOnly
     } else if features.lines_changed > 900 || features.risky_paths > 1 {
@@ -30,7 +39,7 @@ pub fn decide(features: &DiffFeatures, embedding_hint: Option<EmbeddingHint>) ->
                 ));
                 DispatchRoute::DraftOnly
             }
-            DispatchRoute::DraftThenReduce => {
+            _ => {
                 reasons.push(format!("embedding_margin:{:.3}", hint.margin()));
                 DispatchRoute::DraftThenReduce
             }
@@ -61,6 +70,7 @@ mod tests {
             hunks: 6,
             binary_files: 0,
             risky_paths: 0,
+            whitespace_only_lines: 0,
         }
     }
 
@@ -98,5 +108,63 @@ mod tests {
                 .iter()
                 .any(|v| v.contains("embedding_full"))
         );
+    }
+
+    #[test]
+    fn format_only_route_for_whitespace_dominated_diff() {
+        let features = DiffFeatures {
+            files_changed: 10,
+            lines_changed: 200,
+            hunks: 15,
+            binary_files: 0,
+            risky_paths: 0,
+            whitespace_only_lines: 195, // 97.5% whitespace
+        };
+        let decision = decide(&features, None);
+        assert_eq!(decision.route, DispatchRoute::FormatOnly);
+        assert!(decision.reason_codes.contains(&"format_only".to_string()));
+    }
+
+    #[test]
+    fn no_format_only_below_threshold() {
+        let features = DiffFeatures {
+            files_changed: 5,
+            lines_changed: 100,
+            hunks: 8,
+            binary_files: 0,
+            risky_paths: 0,
+            whitespace_only_lines: 90, // 90% — below 95% threshold
+        };
+        let decision = decide(&features, None);
+        assert_ne!(decision.route, DispatchRoute::FormatOnly);
+    }
+
+    #[test]
+    fn draft_only_threshold_lowered_to_50() {
+        let features = DiffFeatures {
+            files_changed: 3,
+            lines_changed: 80,
+            hunks: 4,
+            binary_files: 0,
+            risky_paths: 0,
+            whitespace_only_lines: 0,
+        };
+        // 80 lines > 50: should NOT be DraftOnly
+        let decision = decide(&features, None);
+        assert_ne!(decision.route, DispatchRoute::DraftOnly);
+    }
+
+    #[test]
+    fn draft_only_for_tiny_diffs() {
+        let features = DiffFeatures {
+            files_changed: 1,
+            lines_changed: 30,
+            hunks: 2,
+            binary_files: 0,
+            risky_paths: 0,
+            whitespace_only_lines: 0,
+        };
+        let decision = decide(&features, None);
+        assert_eq!(decision.route, DispatchRoute::DraftOnly);
     }
 }

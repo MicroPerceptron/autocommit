@@ -917,7 +917,12 @@ fn build_reduce_prompt_plan(
 
     // Append key symbols extracted from the diff.
     if !stats.key_symbols.is_empty() {
-        let symbols: Vec<&str> = stats.key_symbols.iter().take(10).map(|s| s.as_str()).collect();
+        let symbols: Vec<&str> = stats
+            .key_symbols
+            .iter()
+            .take(10)
+            .map(|s| s.as_str())
+            .collect();
         prompt.push_str(&format!("Key symbols added: {}\n", symbols.join(", ")));
     }
 
@@ -1247,16 +1252,17 @@ fn aggregate_partials_by_scope(partials: &[PartialReport], indices: &[usize]) ->
 
 /// Classify all partials by importance, using heuristics for obvious paths
 /// and embedding-based classification for ambiguous ones (e.g., manifests).
-fn classify_partials_importance(engine: &Engine, partials: &[PartialReport]) -> Vec<ImportanceTier> {
+fn classify_partials_importance(
+    engine: &Engine,
+    partials: &[PartialReport],
+) -> Vec<ImportanceTier> {
     if partials.is_empty() {
         return Vec::new();
     }
 
     // First pass: try pure heuristics for all partials.
-    let mut results: Vec<Option<ImportanceTier>> = partials
-        .iter()
-        .map(|p| classify_partial_by_path(p))
-        .collect();
+    let mut results: Vec<Option<ImportanceTier>> =
+        partials.iter().map(classify_partial_by_path).collect();
 
     // Check if any partials are ambiguous (need embedding).
     let ambiguous_indices: Vec<usize> = results

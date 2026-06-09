@@ -535,7 +535,10 @@ fn prompt_model_selection() -> Result<ModelSelection, String> {
                 ("Gemma 3n E2B IT", "ggml-org/gemma-3n-E2B-it-GGUF"),
                 ("LFM 2.5 1.2B", "LiquidAI/LFM2.5-1.2B-Instruct-GGUF"),
                 ("BitNet b1.58 2B", "microsoft/bitnet-b1.58-2B-4T-gguf"),
-                ("Ministral 3B", "mistralai/Ministral-3-3B-Instruct-2512-GGUF"),
+                (
+                    "Ministral 3B",
+                    "mistralai/Ministral-3-3B-Instruct-2512-GGUF",
+                ),
                 ("Custom HF repo", ""),
             ];
             let repo_labels = repo_options
@@ -565,23 +568,20 @@ fn prompt_model_selection() -> Result<ModelSelection, String> {
                 // BitNet is natively 1-bit quantized — no additional quant tag
                 base_repo
             } else {
-                let (labels, quants): (Vec<&str>, Vec<&str>) =
-                    if base_repo.contains("gemma-3n-E2B") {
-                        (
-                            vec!["Q8_0 (recommended)", "F16"],
-                            vec!["Q8_0", "F16"],
-                        )
-                    } else if base_repo.contains("Ministral") {
-                        (
-                            vec!["Q8_0 (recommended)", "Q4_K_M", "BF16"],
-                            vec!["Q8_0", "Q4_K_M", "BF16"],
-                        )
-                    } else {
-                        (
-                            vec!["Q4_K_M (recommended)", "Q8_0", "F16"],
-                            vec!["Q4_K_M", "Q8_0", "F16"],
-                        )
-                    };
+                let (labels, quants): (Vec<&str>, Vec<&str>) = if base_repo.contains("gemma-3n-E2B")
+                {
+                    (vec!["Q8_0 (recommended)", "F16"], vec!["Q8_0", "F16"])
+                } else if base_repo.contains("Ministral") {
+                    (
+                        vec!["Q8_0 (recommended)", "Q4_K_M", "BF16"],
+                        vec!["Q8_0", "Q4_K_M", "BF16"],
+                    )
+                } else {
+                    (
+                        vec!["Q4_K_M (recommended)", "Q8_0", "F16"],
+                        vec!["Q4_K_M", "Q8_0", "F16"],
+                    )
+                };
                 let quant_selection = Select::with_theme(&theme)
                     .with_prompt("Quantization")
                     .items(&labels)

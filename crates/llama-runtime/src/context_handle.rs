@@ -150,8 +150,7 @@ impl ContextHandle {
             if needs_fa_downgrade {
                 cparams.type_k = ffi::ggml_type_GGML_TYPE_F16;
                 cparams.type_v = ffi::ggml_type_GGML_TYPE_F16;
-                cparams.flash_attn_type =
-                    ffi::llama_flash_attn_type_LLAMA_FLASH_ATTN_TYPE_DISABLED;
+                cparams.flash_attn_type = ffi::llama_flash_attn_type_LLAMA_FLASH_ATTN_TYPE_DISABLED;
 
                 let ctx = ffi::llama_init_from_model(model.as_ptr(), cparams);
                 if !ctx.is_null() {

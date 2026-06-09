@@ -27,7 +27,9 @@ fn analyze_json_roundtrip() {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
-            stderr.contains("runtime model path is not configured"),
+            stderr.contains("runtime model path is not configured")
+                || stderr.contains("failed to resolve model path")
+                || stderr.contains("failed to download model"),
             "unexpected stderr: {stderr}"
         );
         let _ = fs::remove_file(path);

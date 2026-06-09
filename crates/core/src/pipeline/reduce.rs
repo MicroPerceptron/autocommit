@@ -124,11 +124,7 @@ fn synthesize_summary(items: &[ChangeItem], stats: &DiffStats) -> String {
 /// Importance-based confidence adjustment for the draft path.
 /// Boosts primary code items, penalizes config/infrastructure items.
 fn importance_boost(item: &ChangeItem) -> f32 {
-    let path = item
-        .files
-        .first()
-        .map(|f| f.path.as_str())
-        .unwrap_or("");
+    let path = item.files.first().map(|f| f.path.as_str()).unwrap_or("");
     match importance::classify_path(path) {
         Some(ImportanceTier::Primary) => 0.1,
         Some(ImportanceTier::Secondary) => -0.1,
@@ -280,7 +276,12 @@ mod tests {
         assert!(report.commit_message.starts_with("style:"));
         assert!(report.commit_message.contains("5 files"));
         assert_eq!(report.risk.level, "low");
-        assert!(report.risk.notes.contains(&"commit_source:format_only".to_string()));
+        assert!(
+            report
+                .risk
+                .notes
+                .contains(&"commit_source:format_only".to_string())
+        );
     }
 
     #[test]

@@ -115,3 +115,5 @@ Useful checks:
   - Configure commit policy with `autocommit-cli commit --configure-commit-policy`, or set up `gpg` and `user.signingkey`.
 - PR creation errors from `gh`
   - Ensure `gh auth status` succeeds and the selected base/head actually differ.
+
+> noop

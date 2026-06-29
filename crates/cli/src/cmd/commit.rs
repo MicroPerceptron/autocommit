@@ -97,8 +97,14 @@ pub fn run(args: &[String]) -> Result<String, String> {
                 .map_err(|err| err.to_string())?;
         ensure_signing_tool_ready(&repo, &mut commit_policy_config, false, false, false)
             .map_err(|err| err.to_string())?;
-        commit_with_message(&repo, &final_message, staged_only, no_verify, &commit_policy_config)
-            .map_err(|err| err.to_string())?;
+        commit_with_message(
+            &repo,
+            &final_message,
+            staged_only,
+            no_verify,
+            &commit_policy_config,
+        )
+        .map_err(|err| err.to_string())?;
         let mut out = String::new();
         out.push_str("created commit with message:\n");
         out.push_str(&final_message);

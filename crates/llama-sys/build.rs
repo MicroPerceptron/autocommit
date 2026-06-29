@@ -517,7 +517,7 @@ fn build_from_source(source_dir: &Path, out_dir: &Path, manifest_dir: &Path) {
     let mut configure = Command::new("cmake");
     configure
         .arg("-S")
-        .arg(&source_dir)
+        .arg(source_dir)
         .arg("-B")
         .arg(&build_dir)
         .arg(format!("-DCMAKE_BUILD_TYPE={profile}"))

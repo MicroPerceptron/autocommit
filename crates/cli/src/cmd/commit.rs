@@ -2692,6 +2692,30 @@ mod tests {
     }
 
     #[test]
+    fn compose_commit_message_uses_llm_body_when_present() {
+        let mut report = sample_report();
+        report.body = Some("- `crates/foo.rs`: handle edge case by adding validation\n- `crates/bar.rs`: bump dep to 2.0 for compat".to_string());
+
+        let message = compose_commit_message(&report, &[]);
+        assert!(message.starts_with("feat(core): add detailed commit composition\n\n"));
+        assert!(message.contains("- `crates/foo.rs`: handle edge case by adding validation"));
+        assert!(message.contains("- `crates/bar.rs`: bump dep to 2.0 for compat"));
+        assert!(!message.contains("### Changes"), "LLM body should replace changes section");
+        assert!(!message.contains("Compose commit output"), "LLM body should replace summary");
+        assert!(message.contains("### Risk"));
+    }
+
+    #[test]
+    fn compose_commit_message_falls_back_when_llm_body_is_empty() {
+        let mut report = sample_report();
+        report.body = Some(String::new());
+
+        let message = compose_commit_message(&report, &[]);
+        assert!(message.contains("Compose commit output from chunk-level analyses."));
+        assert!(message.contains("### Changes"));
+    }
+
+    #[test]
     fn format_change_item_collapses_boilerplate_and_redundant_intent() {
         let item = ChangeItem {
             id: "c".to_string(),

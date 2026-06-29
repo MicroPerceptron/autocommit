@@ -6,4 +6,5 @@ target/
 
 tmp/
 
-.vscode/
+.claude/
+.vscode/.claude/

@@ -18,10 +18,13 @@
 // common.h defines a global `build_info` string derived from these variables.
 // In this integration path libcommon.a is linked directly from the build tree
 // (where build_info object may not be installed), so provide safe fallbacks.
+// When using prebuilt binary releases, libllama-common already provides these.
+#ifndef LLAMA_CPP_PREBUILT
 int LLAMA_BUILD_NUMBER = 0;
 const char * LLAMA_COMMIT = "unknown";
 const char * LLAMA_COMPILER = "unknown";
 const char * LLAMA_BUILD_TARGET = "unknown";
+#endif
 
 struct autocommit_common_config {
     common_params params;
@@ -54,169 +57,6 @@ void write_out(char * out, const size_t out_len, const std::string & msg) {
     out[write_len] = '\0';
 }
 
-std::string ensure_trailing_sep(const std::string & dir) {
-    if (dir.empty()) {
-        return dir;
-    }
-    const char last = dir.back();
-    if (last == '/' || last == '\\') {
-        return dir;
-    }
-    return dir + DIRECTORY_SEPARATOR;
-}
-
-bool is_ascii_alnum(const unsigned char ch) {
-    return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9');
-}
-
-std::string sanitize_cache_filename(const std::string & value) {
-    std::string out;
-    out.reserve(value.size());
-    for (unsigned char ch : value) {
-        if (is_ascii_alnum(ch) || ch == '.' || ch == '-' || ch == '_') {
-            out.push_back(static_cast<char>(ch));
-        } else {
-            out.push_back('_');
-        }
-    }
-    if (out.empty()) {
-        out = "model.gguf";
-    }
-    return out;
-}
-
-std::string cache_file_for(const autocommit_common_config & cfg, const std::string & filename) {
-    if (cfg.cache_dir_override.empty()) {
-        return fs_get_cache_file(filename);
-    }
-
-    const std::string cache_dir = ensure_trailing_sep(cfg.cache_dir_override);
-    if (!fs_create_directory_with_parents(cache_dir)) {
-        throw std::runtime_error("failed to create cache directory: " + cache_dir);
-    }
-    return cache_dir + filename;
-}
-
-std::string basename_from_url(std::string url) {
-    if (const auto hash = url.find('#'); hash != std::string::npos) {
-        url = url.substr(0, hash);
-    }
-    if (const auto query = url.find('?'); query != std::string::npos) {
-        url = url.substr(0, query);
-    }
-    if (const auto slash = url.find_last_of("/\\"); slash != std::string::npos) {
-        return url.substr(slash + 1);
-    }
-    return url;
-}
-
-std::vector<common_cached_model_info> list_cached_models_in_dir(const std::string & cache_dir) {
-    std::vector<common_cached_model_info> models;
-    const std::vector<common_file_info> files = fs_list(cache_dir, false);
-    for (const auto & file : files) {
-        if (string_starts_with(file.name, "manifest=") && string_ends_with(file.name, ".json")) {
-            common_cached_model_info model_info;
-            model_info.manifest_path = file.path;
-            std::string fname = file.name;
-            string_replace_all(fname, ".json", "");
-            auto parts = string_split<std::string>(fname, '=');
-            if (parts.size() != 4) {
-                continue;
-            }
-            model_info.user = parts[1];
-            model_info.model = parts[2];
-            model_info.tag = parts[3];
-            model_info.size = 0;
-            models.push_back(model_info);
-        }
-    }
-    return models;
-}
-
-std::string resolve_model_path(autocommit_common_config & cfg) {
-    auto & model = cfg.params.model;
-
-    if (!model.path.empty()) {
-        return model.path;
-    }
-
-    if (!model.docker_repo.empty()) {
-        model.path = common_docker_resolve_model(model.docker_repo);
-        model.name = model.docker_repo;
-        return model.path;
-    }
-
-    if (!model.hf_repo.empty()) {
-        if (model.hf_file.empty()) {
-            auto auto_detected = common_get_hf_file(
-                model.hf_repo,
-                cfg.params.hf_token,
-                cfg.params.offline);
-            if (auto_detected.repo.empty() || auto_detected.ggufFile.empty()) {
-                throw std::runtime_error("failed to auto-detect GGUF file from Hugging Face repo");
-            }
-            model.name = model.hf_repo;
-            model.hf_repo = auto_detected.repo;
-            model.hf_file = auto_detected.ggufFile;
-        }
-
-        const std::string model_endpoint = get_model_endpoint();
-        model.url = model_endpoint + model.hf_repo + "/resolve/main/" + model.hf_file;
-        if (model.path.empty()) {
-            const std::string filename = sanitize_cache_filename(model.hf_repo + "_" + model.hf_file);
-            model.path = cache_file_for(cfg, filename);
-        }
-    } else if (!model.url.empty()) {
-        if (model.path.empty()) {
-            const std::string filename = sanitize_cache_filename(basename_from_url(model.url));
-            model.path = cache_file_for(cfg, filename);
-        }
-    }
-
-    if (!model.url.empty()) {
-        const bool ok = common_download_model(model, cfg.params.hf_token, cfg.params.offline);
-        if (!ok) {
-            throw std::runtime_error("failed to download model from " + model.url);
-        }
-    }
-
-    if (model.path.empty()) {
-        throw std::runtime_error("model path is not configured");
-    }
-
-    return model.path;
-}
-
-bool parse_bool_or_throw(const std::string & value) {
-    if (common_arg_utils::is_truthy(value)) {
-        return true;
-    }
-    if (common_arg_utils::is_falsey(value)) {
-        return false;
-    }
-    throw std::invalid_argument("invalid boolean value");
-}
-
-void finalize_env_only_params(common_params & params) {
-    postprocess_cpu_params(params.cpuparams, nullptr);
-    postprocess_cpu_params(params.cpuparams_batch, &params.cpuparams);
-    postprocess_cpu_params(params.speculative.cpuparams, &params.cpuparams);
-    postprocess_cpu_params(params.speculative.cpuparams_batch, &params.cpuparams_batch);
-
-    if (!params.kv_overrides.empty()) {
-        params.kv_overrides.emplace_back();
-        params.kv_overrides.back().key[0] = 0;
-    }
-    if (!params.tensor_buft_overrides.empty() &&
-        params.tensor_buft_overrides.back().pattern != nullptr) {
-        params.tensor_buft_overrides.push_back(
-            llama_model_tensor_buft_override {
-                /* pattern = */ nullptr,
-                /* buft    = */ nullptr,
-            });
-    }
-}
-
 } // namespace
 
 extern "C" {
@@ -227,10 +67,6 @@ autocommit_common_config * autocommit_common_config_new(void) {
         return nullptr;
     }
 
-    // Startup-focused defaults for autocommit:
-    // - avoid full-train context allocations by default
-    // - keep batch memory moderate for short analysis prompts
-    // - leave room for UI responsiveness on desktop systems
     cfg->params.n_gpu_layers = -1;
     cfg->params.n_ctx        = 8192;
     cfg->params.n_parallel   = 1;
@@ -238,8 +74,8 @@ autocommit_common_config * autocommit_common_config_new(void) {
     cfg->params.n_ubatch     = 256;
     cfg->params.cache_type_k = GGML_TYPE_Q8_0;
     cfg->params.cache_type_v = GGML_TYPE_Q8_0;
-    cfg->params.speculative.cache_type_k = GGML_TYPE_Q8_0;
-    cfg->params.speculative.cache_type_v = GGML_TYPE_Q8_0;
+    cfg->params.speculative.draft.cache_type_k = GGML_TYPE_Q8_0;
+    cfg->params.speculative.draft.cache_type_v = GGML_TYPE_Q8_0;
     cfg->params.sampling.top_p = 0.90f;
     cfg->params.sampling.temp = 0.20f;
     cfg->params.sampling.min_p = 0.0f;
@@ -300,6 +136,72 @@ void autocommit_common_config_set_n_parallel(autocommit_common_config * cfg, con
     cfg->params.n_parallel = n_parallel;
 }
 
+static bool is_hf_repo(const std::string & s) {
+    return s.find('/') != std::string::npos;
+}
+
+static std::string resolve_hf_model(autocommit_common_config & cfg) {
+    auto & model = cfg.params.model;
+
+    common_download_opts opts;
+    opts.bearer_token = cfg.params.hf_token;
+    opts.offline  = cfg.params.offline;
+
+    auto plan = common_download_get_hf_plan(model, opts);
+    if (plan.primary.path.empty()) {
+        throw std::runtime_error("failed to auto-detect GGUF file from Hugging Face repo");
+    }
+
+    if (model.hf_file.empty()) {
+        model.hf_file = plan.primary.path;
+    }
+
+    common_download_task task(plan.primary, opts);
+    common_download_run_tasks({ task });
+
+    // After download, the final cached path is available
+    model.path = plan.primary.final_path.empty() ? plan.primary.local_path : plan.primary.final_path;
+    return model.path;
+}
+
+static std::string resolve_model_path(autocommit_common_config & cfg) {
+    auto & model = cfg.params.model;
+
+    if (!model.path.empty()) {
+        return model.path;
+    }
+
+    if (!model.docker_repo.empty()) {
+        model.path = common_docker_resolve_model(model.docker_repo);
+        return model.path;
+    }
+
+    if (!model.hf_repo.empty()) {
+        return resolve_hf_model(cfg);
+    }
+
+    if (!model.url.empty()) {
+        if (model.path.empty()) {
+            auto pos = model.url.find_last_of("/\\");
+            model.path = pos != std::string::npos ? model.url.substr(pos + 1) : model.url;
+        }
+
+        common_download_opts opts;
+        opts.bearer_token = cfg.params.hf_token;
+        opts.offline  = cfg.params.offline;
+
+        if (common_download_file_single(model.url, model.path, opts) < 0) {
+            throw std::runtime_error("failed to download model from " + model.url);
+        }
+    }
+
+    if (model.path.empty()) {
+        throw std::runtime_error("model path is not configured");
+    }
+
+    return model.path;
+}
+
 int autocommit_common_config_resolve_model_path(
         autocommit_common_config * cfg,
         char * out_path,
@@ -335,16 +237,7 @@ int autocommit_common_config_list_cached_models(
     }
 
     try {
-        std::string cache_dir = cfg->cache_dir_override.empty()
-            ? fs_get_cache_directory()
-            : ensure_trailing_sep(cfg->cache_dir_override);
-        if (!cfg->cache_dir_override.empty()) {
-            fs_create_directory_with_parents(cache_dir);
-        }
-
-        std::vector<common_cached_model_info> models = cfg->cache_dir_override.empty()
-            ? common_list_cached_models()
-            : list_cached_models_in_dir(cache_dir);
+        std::vector<common_cached_model_info> models = common_list_cached_models();
         std::sort(models.begin(), models.end(), [](const auto & a, const auto & b) {
             return a.to_string() < b.to_string();
         });
@@ -356,6 +249,10 @@ int autocommit_common_config_list_cached_models(
             }
             joined += models[i].to_string();
         }
+
+        std::string cache_dir = cfg->cache_dir_override.empty()
+            ? fs_get_cache_directory()
+            : cfg->cache_dir_override;
 
         write_out(out_models, out_models_len, joined);
         write_out(out_cache_dir, out_cache_dir_len, cache_dir);
@@ -379,7 +276,6 @@ int autocommit_common_config_apply_env(
         const int32_t n_parallel_seed = cfg->params.n_parallel > 0 ? cfg->params.n_parallel : 1;
         auto ctx = common_params_parser_init(cfg->params, LLAMA_EXAMPLE_SERVER, nullptr);
 
-        // Apply only environment-bound options to avoid CLI/remote-preset side effects.
         for (auto & opt : ctx.options) {
             std::string value;
             if (!opt.get_value_from_env(value)) {
@@ -393,20 +289,34 @@ int autocommit_common_config_apply_env(
                 opt.handler_int(cfg->params, std::stoi(value));
             }
             if (opt.handler_bool) {
-                opt.handler_bool(cfg->params, parse_bool_or_throw(value));
+                opt.handler_bool(cfg->params, common_arg_utils::is_truthy(value));
             }
             if (opt.handler_string) {
                 opt.handler_string(cfg->params, value);
             }
         }
 
-        // LLAMA_EXAMPLE_SERVER sets n_parallel to -1 (auto) by default.
-        // For this runtime we keep explicit positive values only.
         if (cfg->params.n_parallel <= 0) {
             cfg->params.n_parallel = n_parallel_seed;
         }
 
-        finalize_env_only_params(cfg->params);
+        postprocess_cpu_params(cfg->params.cpuparams, nullptr);
+        postprocess_cpu_params(cfg->params.cpuparams_batch, &cfg->params.cpuparams);
+        postprocess_cpu_params(cfg->params.speculative.draft.cpuparams, &cfg->params.cpuparams);
+        postprocess_cpu_params(cfg->params.speculative.draft.cpuparams_batch, &cfg->params.cpuparams_batch);
+
+        if (!cfg->params.kv_overrides.empty()) {
+            cfg->params.kv_overrides.emplace_back();
+            cfg->params.kv_overrides.back().key[0] = 0;
+        }
+        if (!cfg->params.tensor_buft_overrides.empty() &&
+            cfg->params.tensor_buft_overrides.back().pattern != nullptr) {
+            cfg->params.tensor_buft_overrides.push_back(
+                llama_model_tensor_buft_override {
+                    /* pattern = */ nullptr,
+                    /* buft    = */ nullptr,
+                });
+        }
         return 1;
     } catch (const std::exception & ex) {
         write_error(err, err_len, ex.what());
@@ -483,7 +393,6 @@ int autocommit_common_config_fill_fit_buffers(
         tensor_buft_overrides[i] = cfg->params.tensor_buft_overrides[i];
     }
 
-    // Ensure terminator when buffer is filled.
     if (tensor_buft_overrides_len > 0 && copy_count == tensor_buft_overrides_len) {
         tensor_buft_overrides[tensor_buft_overrides_len - 1] = llama_model_tensor_buft_override {
             /* pattern = */ nullptr,
@@ -519,10 +428,10 @@ autocommit_common_sampler * autocommit_common_sampler_new(
 
     common_params_sampling params = cfg->params.sampling;
     if (grammar != nullptr) {
-        params.grammar = grammar;
+        params.grammar = common_grammar(COMMON_GRAMMAR_TYPE_USER, grammar);
         params.grammar_lazy = grammar_lazy != 0;
     } else {
-        params.grammar.clear();
+        params.grammar = common_grammar();
         params.grammar_lazy = false;
     }
 
@@ -603,6 +512,164 @@ void autocommit_common_log_set_verbosity(int verbosity) {
     common_log_set_verbosity_thold(verbosity);
 }
 
+struct autocommit_init_result {
+    llama_model * model;
+    llama_context_params cparams;
+};
+
+static int fit_llama_params(
+        const std::string & model_path,
+        struct llama_model_params * mparams,
+        struct llama_context_params * cparams,
+        const common_params & params) {
+    const size_t nd = std::max<size_t>(llama_max_devices(), 1);
+    const size_t no = std::max<size_t>(llama_max_tensor_buft_overrides(), 1);
+
+    std::vector<float> tensor_split(nd, 0.0f);
+    std::vector<size_t> margins(nd, 1024ull * 1024 * 1024);
+    std::vector<llama_model_tensor_buft_override> overrides(
+        no, llama_model_tensor_buft_override{nullptr, nullptr});
+
+    const size_t ts_cap = sizeof(params.tensor_split) / sizeof(params.tensor_split[0]);
+    for (size_t i = 0; i < nd && i < ts_cap; ++i) {
+        tensor_split[i] = params.tensor_split[i];
+    }
+    for (size_t i = 0; i < nd && i < params.fit_params_target.size(); ++i) {
+        margins[i] = params.fit_params_target[i];
+    }
+    const size_t copy_count = std::min(no, params.tensor_buft_overrides.size());
+    for (size_t i = 0; i < copy_count; ++i) {
+        overrides[i] = params.tensor_buft_overrides[i];
+    }
+
+    mparams->tensor_split = tensor_split.data();
+    mparams->tensor_buft_overrides = overrides.data();
+
+    return autocommit_llama_params_fit(
+        model_path.c_str(),
+        mparams, cparams,
+        tensor_split.data(),
+        overrides.data(),
+        margins.data(),
+        4096,
+        4); // GGML_LOG_LEVEL_ERROR
+}
+
+autocommit_init_result * autocommit_init(
+        autocommit_common_config * cfg,
+        int embedding,
+        int cpu_only,
+        char * err,
+        size_t err_len) {
+    if (cfg == nullptr) {
+        write_error(err, err_len, "common config is null");
+        return nullptr;
+    }
+
+    try {
+        auto & params = cfg->params;
+
+        // Override for model type and CPU-only
+        if (embedding) {
+            params.embedding = true;
+        }
+        if (cpu_only) {
+            params.n_gpu_layers = 0;
+            params.split_mode = LLAMA_SPLIT_MODE_NONE;
+            params.main_gpu = -1;
+            params.no_kv_offload = true;
+            params.no_op_offload = true;
+            params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+        }
+
+        // Resolve model path (download if needed)
+        std::string model_path = resolve_model_path(*cfg);
+
+        // Create llama C API params from common_params
+        llama_model_params mparams = common_model_params_to_llama(params);
+        llama_context_params cparams = common_context_params_to_llama(params);
+
+        // Apply embedding override directly on C params
+        if (embedding) {
+            mparams.embedding = true;
+            cparams.embeddings = true;
+            cparams.pooling_type = LLAMA_POOLING_TYPE_MEAN;
+        }
+
+        // Fit params to available device memory
+        fit_llama_params(model_path, &mparams, &cparams, params);
+
+        // Load model
+        llama_model * model = llama_model_load_from_file(model_path.c_str(), mparams);
+        if (model == nullptr) {
+            write_error(err, err_len, "failed to load model");
+            return nullptr;
+        }
+
+        auto * result = new (std::nothrow) autocommit_init_result{model, cparams};
+        if (result == nullptr) {
+            llama_model_free(model);
+            write_error(err, err_len, "allocation failed");
+            return nullptr;
+        }
+        return result;
+    } catch (const std::exception & ex) {
+        write_error(err, err_len, ex.what());
+        return nullptr;
+    }
+}
+
+struct llama_model * autocommit_init_get_model(autocommit_init_result * result) {
+    return result ? result->model : nullptr;
+}
+
+void autocommit_init_get_context_params(
+        autocommit_init_result * result,
+        struct llama_context_params * out) {
+    if (result && out) {
+        *out = result->cparams;
+    }
+}
+
+void autocommit_init_free(autocommit_init_result * result) {
+    delete result;
+}
+
+int autocommit_llama_params_fit(
+        const char * path_model,
+        struct llama_model_params * mparams,
+        struct llama_context_params * cparams,
+        float * tensor_split,
+        struct llama_model_tensor_buft_override * tensor_buft_overrides,
+        size_t * margins,
+        uint32_t n_ctx_min,
+        int log_level) {
+#ifdef LLAMA_CPP_PREBUILT
+    // llama_params_fit is not available in the b9837 binary release.
+    // Skip fitting and return success — the caller will load the model
+    // with whatever params were configured.
+    (void)path_model;
+    (void)mparams;
+    (void)cparams;
+    (void)tensor_split;
+    (void)tensor_buft_overrides;
+    (void)margins;
+    (void)n_ctx_min;
+    (void)log_level;
+    return 0;
+#else
+    return llama_params_fit(
+        path_model,
+        mparams,
+        cparams,
+        tensor_split,
+        tensor_buft_overrides,
+        margins,
+        n_ctx_min,
+        static_cast<enum ggml_log_level>(log_level));
+#endif
+}
+
 } // extern "C"
 
 // --- Hardware-accelerated cosine similarity ---
@@ -624,7 +691,6 @@ extern "C" float autocommit_cosine_similarity(const float * a, const float * b, 
 
 #ifdef __APPLE__
     const vDSP_Length len = static_cast<vDSP_Length>(n);
-    // Use vDSP (Accelerate): SIMD-optimized on Apple Silicon.
     vDSP_dotpr(a, 1, b, 1, &dot, len);
     vDSP_dotpr(a, 1, a, 1, &norm_a, len);
     vDSP_dotpr(b, 1, b, 1, &norm_b, len);

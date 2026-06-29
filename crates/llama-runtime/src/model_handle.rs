@@ -111,7 +111,7 @@ impl ModelHandle {
 
         let fit_status = unsafe {
             // SAFETY: pointers refer to valid writable buffers for the duration of this call.
-            ffi::llama_params_fit(
+            bridge::autocommit_llama_params_fit(
                 path_cstr.as_ptr(),
                 &mut mparams,
                 &mut cparams,
@@ -119,10 +119,10 @@ impl ModelHandle {
                 tensor_buft_overrides.as_mut_ptr(),
                 margins.as_mut_ptr(),
                 4096,
-                ffi::ggml_log_level_GGML_LOG_LEVEL_ERROR,
+                4, // GGML_LOG_LEVEL_ERROR
             )
         };
-        if fit_status != ffi::llama_params_fit_status_LLAMA_PARAMS_FIT_STATUS_SUCCESS
+        if fit_status != 0
             && std::env::var("AUTOCOMMIT_LLAMA_LOG")
                 .ok()
                 .as_deref()

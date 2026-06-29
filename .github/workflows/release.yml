@@ -22,10 +22,12 @@ jobs:
             os: macos-14
             target: aarch64-apple-darwin
             suffix: ""
+            prebuilt: llama-b9837-bin-macos-arm64.tar.gz
           - name: Linux-x86_64
             os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             suffix: ""
+            prebuilt: llama-b9837-bin-ubuntu-x64.tar.gz
           - name: Linux-x86_64-cuda
             os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
@@ -36,6 +38,7 @@ jobs:
             target: x86_64-unknown-linux-gnu
             suffix: -vulkan
             vulkan: true
+            prebuilt: llama-b9837-bin-ubuntu-vulkan-x64.tar.gz
           - name: Linux-x86_64-sycl
             os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
@@ -44,15 +47,31 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: recursive
+          submodules: true
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
+      # Prebuilt binary release — download shared libraries instead of building from source
+      - name: Download prebuilt llama.cpp
+        if: matrix.prebuilt
+        run: |
+          curl -sSL --fail -o /tmp/llama.tar.gz \
+            "https://github.com/ggml-org/llama.cpp/releases/download/b9837/${{ matrix.prebuilt }}"
+          mkdir -p /tmp/llama-prebuilt
+          tar xzf /tmp/llama.tar.gz -C /tmp/llama-prebuilt
+          echo "LLAMA_CPP_PREBUILT_DIR=/tmp/llama-prebuilt/llama-b9837" >> "$GITHUB_ENV"
+          echo "LLAMA_PREBUILT_SRC=/tmp/llama-prebuilt/llama-b9837" >> "$GITHUB_ENV"
+
+      # Source build dependencies (only needed when no prebuilt archive is used)
       - name: Install deps (Linux)
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && !matrix.prebuilt
         run: sudo apt-get update && sudo apt-get install -y cmake libclang-dev pkg-config libssl-dev libopenblas-dev
+
+      - name: Install deps (Linux, prebuilt)
+        if: runner.os == 'Linux' && matrix.prebuilt
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev libssl-dev
 
       - name: Install CUDA toolkit
         if: matrix.cuda
@@ -64,7 +83,7 @@ jobs:
           non-cuda-sub-packages: '["libcublas", "libcublas-dev"]'
 
       - name: Install Vulkan SDK
-        if: matrix.vulkan
+        if: matrix.vulkan && !matrix.prebuilt
         run: sudo apt-get update && sudo apt-get install -y glslc libvulkan-dev
 
       - name: Add Intel oneAPI repository
@@ -82,7 +101,7 @@ jobs:
 
       - name: Install deps (macOS)
         if: runner.os == 'macOS'
-        run: brew install cmake openssl@3
+        run: brew install openssl@3
 
       - uses: actions/cache@v4
         with:
@@ -113,7 +132,17 @@ jobs:
 
           mkdir staging
           cp "target/${{ matrix.target }}/release/autocommit" staging/
-          tar czf "${ARCHIVE}" -C staging autocommit
+
+          # Bundle prebuilt shared libraries alongside the binary
+          if [ -n "$LLAMA_PREBUILT_SRC" ]; then
+            echo "Bundling prebuilt shared libraries from $LLAMA_PREBUILT_SRC"
+            cp -a "$LLAMA_PREBUILT_SRC"/libllama*.dylib staging/ 2>/dev/null || true
+            cp -a "$LLAMA_PREBUILT_SRC"/libggml*.dylib staging/ 2>/dev/null || true
+            cp -a "$LLAMA_PREBUILT_SRC"/libllama*.so* staging/ 2>/dev/null || true
+            cp -a "$LLAMA_PREBUILT_SRC"/libggml*.so* staging/ 2>/dev/null || true
+          fi
+
+          tar czf "${ARCHIVE}" -C staging .
           shasum -a 256 "${ARCHIVE}" > "${ARCHIVE}.sha256"
 
           echo "ARCHIVE=${ARCHIVE}" >> "$GITHUB_ENV"

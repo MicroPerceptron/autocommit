@@ -38,6 +38,7 @@ pub fn run(args: &[String]) -> Result<String, String> {
     let dry_run = parsed.dry_run;
     let json = parsed.json;
     let no_verify = parsed.no_verify;
+    let no_bump = parsed.no_bump;
     let configure_commit_policy = parsed.configure_commit_policy;
     let interactive_override = if parsed.interactive {
         Some(true)
@@ -262,9 +263,16 @@ pub fn run(args: &[String]) -> Result<String, String> {
         let _ = report_cache::write_cached_report(&cache_path, &cache_key, &report);
         report
     };
-    let embedding_bump_level = infer_embedding_bump_level(&engine, &diff_text, &report);
-    let version_recommendations =
-        version_bump::recommend(&repo, &diff_text, &report, embedding_bump_level);
+    let embedding_bump_level = if no_bump {
+        None
+    } else {
+        infer_embedding_bump_level(&engine, &diff_text, &report)
+    };
+    let version_recommendations = if no_bump {
+        Vec::new()
+    } else {
+        version_bump::recommend(&repo, &diff_text, &report, embedding_bump_level)
+    };
     let approved_version_recommendations = resolve_version_bump_recommendations(
         &version_recommendations,
         interactive,
@@ -472,6 +480,9 @@ struct CommitArgs {
     /// Assume yes for confirmations
     #[arg(long, short = 'y')]
     yes: bool,
+    /// Skip version bump detection and application
+    #[arg(long = "no-bump")]
+    no_bump: bool,
     /// Explicit local model path (`.gguf`)
     #[arg(long = "model-path", value_name = "PATH")]
     model_path: Option<String>,
@@ -1989,13 +2000,28 @@ fn format_version_recommendation(rec: &version_bump::VersionRecommendation) -> S
 
 fn compose_risk_section(report: &AnalysisReport) -> String {
     let level = report.risk.level.trim();
-    let notes = report
+    let notes: Vec<&str> = report
         .risk
         .notes
         .iter()
         .map(|note| note.trim())
-        .filter(|note| !note.is_empty() && !looks_like_internal_risk_tag(note))
-        .collect::<Vec<_>>();
+        .filter(|note| {
+            if note.is_empty() {
+                return false;
+            }
+            if looks_like_internal_risk_tag(note) {
+                return false;
+            }
+            if looks_like_boilerplate_risk_note(note) {
+                return false;
+            }
+            true
+        })
+        .collect();
+
+    if level == "low" && notes.is_empty() {
+        return String::new();
+    }
 
     if level.is_empty() && notes.is_empty() {
         return String::new();
@@ -2015,6 +2041,42 @@ fn compose_risk_section(report: &AnalysisReport) -> String {
     }
 
     out.trim_end().to_string()
+}
+
+fn looks_like_boilerplate_risk_note(note: &str) -> bool {
+    let lower = note.to_ascii_lowercase();
+    let boilerplate = [
+        "no security risks",
+        "no data loss",
+        "no data loss or corruption",
+        "no security implications",
+        "no immediate risk",
+        "no new security risks",
+        "no new security risks introduced",
+        "no security risks are introduced",
+        "no data loss or corruption is expected",
+        "no known security impact",
+        "no breaking changes",
+        "no breaking change",
+        "no backwards incompatible",
+        "no backward incompatible",
+        "no api changes",
+        "no api change",
+        "no user-facing changes",
+        "no user facing changes",
+        "no functional changes",
+        "low risk",
+        "changes are low risk",
+        "change is low risk",
+        "formatting changes are for code consistency",
+        "formatting changes for code consistency",
+    ];
+    if boilerplate.iter().any(|p| lower.contains(p)) {
+        return true;
+    }
+
+    let trimmed = lower.trim_end_matches('.');
+    boilerplate.iter().any(|p| trimmed.contains(p))
 }
 
 fn format_change_item(item: &autocommit_core::types::ChangeItem) -> String {

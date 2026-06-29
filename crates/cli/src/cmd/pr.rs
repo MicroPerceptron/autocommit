@@ -11,6 +11,7 @@ use dialoguer::console::{Term, style};
 use dialoguer::{Confirm, Editor, Select, theme::ColorfulTheme};
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 
 #[cfg(feature = "llama-native")]
 use crate::cmd::repo_cache;
@@ -23,6 +24,62 @@ use autocommit_core::types::{
     AnalysisReport, ChangeBucket, ChangeItem, DiffChunk, DiffStats, DispatchDecision, FileRef,
     FileStatus, PartialReport, RiskReport, TypeTag,
 };
+
+struct GhHelper;
+
+impl GhHelper {
+    fn run(args: &[&str]) -> Result<String, String> {
+        let output = Command::new("gh")
+            .args(args)
+            .output()
+            .map_err(|err| format!("failed to run gh: {err}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(if stderr.is_empty() {
+                "gh command failed with no output".to_string()
+            } else {
+                stderr
+            });
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    fn run_json<T: DeserializeOwned>(args: &[&str]) -> Result<T, String> {
+        let stdout = Self::run(args)?;
+        serde_json::from_str(&stdout).map_err(|err| format!("failed to parse gh output: {err}"))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct IssueRef {
+    number: u64,
+    title: String,
+    #[allow(dead_code)]
+    url: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClosingKeyword {
+    Refs,
+    Closes,
+    Fixes,
+    Resolves,
+}
+
+impl ClosingKeyword {
+    fn all() -> &'static [Self] {
+        &[Self::Refs, Self::Closes, Self::Fixes, Self::Resolves]
+    }
+
+    fn label(&self) -> &str {
+        match self {
+            Self::Refs => "Refs",
+            Self::Closes => "Closes",
+            Self::Fixes => "Fixes",
+            Self::Resolves => "Resolves",
+        }
+    }
+}
 
 pub fn run(args: &[String]) -> Result<String, String> {
     let parsed = match PrArgs::parse_from(args)? {
@@ -70,6 +127,23 @@ pub fn run(args: &[String]) -> Result<String, String> {
             let _ = profile;
         }
     }
+
+    let issue_ids = parsed.issue.clone();
+    let closing_keyword = if parsed.closes {
+        ClosingKeyword::Closes
+    } else if parsed.fixes {
+        ClosingKeyword::Fixes
+    } else if parsed.resolves {
+        ClosingKeyword::Resolves
+    } else {
+        ClosingKeyword::Refs
+    };
+    let no_verify_issue = parsed.no_verify_issue;
+    let reviewers = parsed.reviewer.clone();
+    let assignees = parsed.assignee.clone();
+    let labels = parsed.label.clone();
+    let milestone = parsed.milestone.clone();
+    let web = parsed.web;
 
     if model_path.is_some() && model_hf_repo.is_some() {
         return Err("use either `--model-path` or `--hf-repo`, not both".to_string());
@@ -207,24 +281,40 @@ pub fn run(args: &[String]) -> Result<String, String> {
         false
     };
 
+    let (resolved_issues, resolved_keyword) = if interactive && !assume_yes {
+        prompt_issue_linking(rich_interactive)?
+    } else {
+        resolve_issue_ids(&issue_ids, closing_keyword, no_verify_issue)?
+    };
+
+    let issue_block = render_linked_issues_block(&resolved_issues, resolved_keyword);
+    let final_body_with_issues = append_or_replace_issue_block(&generated_body, &issue_block);
+
     if dry_run {
         return Ok(render_dry_run(
             &generated_title,
-            &generated_body,
+            &final_body_with_issues,
             draft,
             base.as_deref(),
             head.as_deref(),
             push,
+            &resolved_issues,
+            resolved_keyword,
+            &reviewers,
+            &assignees,
+            &labels,
+            milestone.as_deref(),
+            web,
         ));
     }
 
     let (final_title, final_body) = if interactive && !assume_yes {
-        match prompt_for_pr_content(&generated_title, &generated_body, rich_interactive)? {
+        match prompt_for_pr_content(&generated_title, &final_body_with_issues, rich_interactive)? {
             Some(value) => value,
             None => return Ok("pull request canceled by user\n".to_string()),
         }
     } else {
-        (generated_title, generated_body)
+        (generated_title, final_body_with_issues)
     };
 
     let gh_base = base
@@ -279,7 +369,15 @@ pub fn run(args: &[String]) -> Result<String, String> {
         match policy {
             ExistingPrPolicy::Update => {
                 let output = run_step(rich_interactive, "Updating pull request", || {
-                    update_pr(existing.number, &final_title, &final_body)
+                    update_pr(
+                        existing.number,
+                        &final_title,
+                        &final_body,
+                        &reviewers,
+                        &assignees,
+                        &labels,
+                        milestone.as_deref(),
+                    )
                 })
                 .map_err(|err| err.to_string())?;
                 return Ok(output);
@@ -298,6 +396,11 @@ pub fn run(args: &[String]) -> Result<String, String> {
             draft,
             gh_base.as_deref(),
             gh_head.as_deref(),
+            &reviewers,
+            &assignees,
+            &labels,
+            milestone.as_deref(),
+            web,
         )
     })
     .map_err(|err| err.to_string())?;
@@ -400,17 +503,38 @@ fn prompt_existing_pr_policy(pr: &ExistingPr, rich: bool) -> Result<ExistingPrPo
     }
 }
 
-fn update_pr(number: u64, title: &str, body: &str) -> Result<String, String> {
-    let output = Command::new("gh")
-        .args([
-            "pr",
-            "edit",
-            &number.to_string(),
-            "--title",
-            title,
-            "--body",
-            body,
-        ])
+fn update_pr(
+    number: u64,
+    title: &str,
+    body: &str,
+    reviewers: &[String],
+    assignees: &[String],
+    labels: &[String],
+    milestone: Option<&str>,
+) -> Result<String, String> {
+    let mut cmd = Command::new("gh");
+    cmd.args([
+        "pr",
+        "edit",
+        &number.to_string(),
+        "--title",
+        title,
+        "--body",
+        body,
+    ]);
+    for reviewer in reviewers {
+        cmd.arg("--add-reviewer").arg(reviewer);
+    }
+    for assignee in assignees {
+        cmd.arg("--add-assignee").arg(assignee);
+    }
+    for label in labels {
+        cmd.arg("--add-label").arg(label);
+    }
+    if let Some(milestone) = milestone {
+        cmd.arg("--milestone").arg(milestone);
+    }
+    let output = cmd
         .output()
         .map_err(|err| format!("failed to run gh pr edit: {err}"))?;
 
@@ -525,6 +649,40 @@ struct PrArgs {
     /// Runtime profile (`auto`, etc.)
     #[arg(long = "profile", value_name = "PROFILE")]
     profile: Option<String>,
+
+    // --- Issue linking ---
+    /// Link an issue (number or URL); repeatable
+    #[arg(long = "issue", value_name = "ISSUE", action = clap::ArgAction::Append)]
+    issue: Vec<String>,
+    /// Use "Closes #..." instead of "Refs #..." for linked issues
+    #[arg(long, conflicts_with_all = &["fixes", "resolves"])]
+    closes: bool,
+    /// Use "Fixes #..." instead of "Refs #..." for linked issues
+    #[arg(long, conflicts_with_all = &["closes", "resolves"])]
+    fixes: bool,
+    /// Use "Resolves #..." instead of "Refs #..." for linked issues
+    #[arg(long, conflicts_with_all = &["closes", "fixes"])]
+    resolves: bool,
+    /// Skip issue verification before PR creation
+    #[arg(long = "no-verify-issue")]
+    no_verify_issue: bool,
+
+    // --- PR metadata ---
+    /// Request reviewers (repeatable)
+    #[arg(long = "reviewer", value_name = "USER", action = clap::ArgAction::Append)]
+    reviewer: Vec<String>,
+    /// Assign users (repeatable)
+    #[arg(long = "assignee", value_name = "USER", action = clap::ArgAction::Append)]
+    assignee: Vec<String>,
+    /// Add labels (repeatable)
+    #[arg(long = "label", value_name = "LABEL", action = clap::ArgAction::Append)]
+    label: Vec<String>,
+    /// Add milestone
+    #[arg(long = "milestone", value_name = "MILESTONE")]
+    milestone: Option<String>,
+    /// Open PR in browser after creation
+    #[arg(long)]
+    web: bool,
 }
 
 impl PrArgs {
@@ -584,6 +742,13 @@ fn render_dry_run(
     base: Option<&str>,
     head: Option<&str>,
     push: bool,
+    issues: &[IssueRef],
+    _keyword: ClosingKeyword,
+    reviewers: &[String],
+    assignees: &[String],
+    labels: &[String],
+    milestone: Option<&str>,
+    web: bool,
 ) -> String {
     let mut out = String::new();
     out.push_str("dry-run: pull request was not created\n");
@@ -593,6 +758,35 @@ fn render_dry_run(
     out.push_str("body:\n");
     out.push_str(body);
     out.push('\n');
+    if !issues.is_empty() {
+        out.push_str("linked issues:\n");
+        for issue in issues {
+            out.push_str(&format!("  #{}: {}\n", issue.number, issue.title));
+        }
+    }
+    if !reviewers.is_empty()
+        || !assignees.is_empty()
+        || !labels.is_empty()
+        || milestone.is_some()
+        || web
+    {
+        out.push_str("metadata:\n");
+        for r in reviewers {
+            out.push_str(&format!("  reviewer: {r}\n"));
+        }
+        for a in assignees {
+            out.push_str(&format!("  assignee: {a}\n"));
+        }
+        for l in labels {
+            out.push_str(&format!("  label: {l}\n"));
+        }
+        if let Some(m) = milestone {
+            out.push_str(&format!("  milestone: {m}\n"));
+        }
+        if web {
+            out.push_str("  web: true\n");
+        }
+    }
     out.push_str("command:\n");
     out.push_str("gh pr create");
     if draft {
@@ -814,6 +1008,241 @@ fn read_line_trimmed() -> Result<String, String> {
         return Err("interactive input was closed".to_string());
     }
     Ok(buffer.trim().to_string())
+}
+
+fn parse_issue_identifier(input: &str) -> Result<u64, String> {
+    let input = input.trim();
+    if let Ok(n) = input.parse::<u64>() {
+        return Ok(n);
+    }
+    if let Some(stripped) = input.strip_prefix('#') {
+        if let Ok(n) = stripped.parse::<u64>() {
+            return Ok(n);
+        }
+    }
+    if let Some(pos) = input.rfind("/issues/") {
+        let remainder = &input[pos + "/issues/".len()..];
+        if let Ok(n) = remainder.parse::<u64>() {
+            return Ok(n);
+        }
+    }
+    Err(format!("could not parse issue identifier from {input:?}"))
+}
+
+fn verify_issue(identifier: &str) -> Result<IssueRef, String> {
+    #[derive(Deserialize)]
+    struct IssueView {
+        number: u64,
+        title: String,
+        url: String,
+    }
+    let view: IssueView =
+        GhHelper::run_json(&["issue", "view", identifier, "--json", "number,title,url"])?;
+    Ok(IssueRef {
+        number: view.number,
+        title: view.title,
+        url: view.url,
+    })
+}
+
+fn render_linked_issues_block(issues: &[IssueRef], keyword: ClosingKeyword) -> String {
+    if issues.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("### Linked issues\n");
+    for issue in issues {
+        out.push_str(&format!(
+            "- {} #{}: {}\n",
+            keyword.label(),
+            issue.number,
+            issue.title
+        ));
+    }
+    out
+}
+
+fn append_or_replace_issue_block(body: &str, block: &str) -> String {
+    if block.is_empty() {
+        return body.to_string();
+    }
+    if let Some(pos) = body.rfind("\n### Linked issues") {
+        let base = body[..pos].trim_end().to_string();
+        return format!("{base}\n\n{block}");
+    }
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return block.to_string();
+    }
+    format!("{body}\n\n{block}")
+}
+
+fn resolve_issue_ids(
+    ids: &[String],
+    keyword: ClosingKeyword,
+    no_verify: bool,
+) -> Result<(Vec<IssueRef>, ClosingKeyword), String> {
+    if ids.is_empty() {
+        return Ok((Vec::new(), keyword));
+    }
+
+    let mut issues = Vec::new();
+    for raw in ids {
+        let num = parse_issue_identifier(raw)?;
+        if issues.iter().any(|i: &IssueRef| i.number == num) {
+            continue;
+        }
+        let issue = if no_verify {
+            IssueRef {
+                number: num,
+                title: format!("#{num}"),
+                url: String::new(),
+            }
+        } else {
+            verify_issue(raw)?
+        };
+        issues.push(issue);
+    }
+    Ok((issues, keyword))
+}
+
+fn prompt_issue_linking(rich: bool) -> Result<(Vec<IssueRef>, ClosingKeyword), String> {
+    let theme = ColorfulTheme::default();
+
+    let link_issues = if rich {
+        Confirm::with_theme(&theme)
+            .with_prompt("Link GitHub issues to this pull request?")
+            .default(false)
+            .interact_on_opt(&Term::stderr())
+            .map_err(|err| format!("failed to read issue linking choice: {err}"))?
+            .unwrap_or(false)
+    } else {
+        loop {
+            print!("Link GitHub issues to this pull request? [y/N]: ");
+            std::io::stdout()
+                .flush()
+                .map_err(|err| format!("failed to flush prompt output: {err}"))?;
+            let value = read_line_trimmed()?;
+            if value.is_empty() {
+                break false;
+            }
+            match value.to_ascii_lowercase().as_str() {
+                "y" | "yes" => break true,
+                "n" | "no" => break false,
+                _ => println!("invalid choice, enter y or n"),
+            }
+        }
+    };
+
+    if !link_issues {
+        return Ok((Vec::new(), ClosingKeyword::Refs));
+    }
+
+    let mut issues = Vec::new();
+
+    loop {
+        let raw = if rich {
+            let input = dialoguer::Input::<String>::with_theme(&theme)
+                .with_prompt("Enter issue number or URL (empty to finish)")
+                .allow_empty(true)
+                .interact_on(&Term::stderr())
+                .map_err(|err| format!("failed to read issue: {err}"))?;
+            input
+        } else {
+            print!("Enter issue number or URL (empty to finish): ");
+            std::io::stdout()
+                .flush()
+                .map_err(|err| format!("failed to flush prompt output: {err}"))?;
+            let value = read_line_trimmed()?;
+            value
+        };
+
+        if raw.trim().is_empty() {
+            break;
+        }
+
+        match verify_issue(raw.trim()) {
+            Ok(issue) => {
+                if issues.iter().any(|i: &IssueRef| i.number == issue.number) {
+                    println!("Issue #{} is already linked", issue.number);
+                } else {
+                    println!("Linked #{}: {}", issue.number, issue.title);
+                    issues.push(issue);
+                }
+            }
+            Err(err) => {
+                println!("Could not verify issue: {err}");
+                let retry = if rich {
+                    Confirm::with_theme(&theme)
+                        .with_prompt("Try again?")
+                        .default(true)
+                        .interact_on_opt(&Term::stderr())
+                        .map_err(|err| format!("failed to read retry choice: {err}"))?
+                        .unwrap_or(false)
+                } else {
+                    loop {
+                        print!("Try again? [Y/n]: ");
+                        std::io::stdout()
+                            .flush()
+                            .map_err(|err| format!("failed to flush prompt output: {err}"))?;
+                        let value = read_line_trimmed()?;
+                        if value.is_empty() {
+                            break true;
+                        }
+                        match value.to_ascii_lowercase().as_str() {
+                            "y" | "yes" => break true,
+                            "n" | "no" => break false,
+                            _ => println!("invalid choice, enter y or n"),
+                        }
+                    }
+                };
+                if !retry {
+                    break;
+                }
+            }
+        }
+    }
+
+    if issues.is_empty() {
+        return Ok((Vec::new(), ClosingKeyword::Refs));
+    }
+
+    let keyword = if rich {
+        let options: Vec<&str> = ClosingKeyword::all().iter().map(|k| k.label()).collect();
+        let selection = Select::with_theme(&theme)
+            .with_prompt("How should linked issues be referenced?")
+            .items(&options)
+            .default(0)
+            .interact_on_opt(&Term::stderr())
+            .map_err(|err| format!("failed to read closing keyword: {err}"))?;
+        match selection {
+            Some(0) => ClosingKeyword::Refs,
+            Some(1) => ClosingKeyword::Closes,
+            Some(2) => ClosingKeyword::Fixes,
+            Some(_) => ClosingKeyword::Resolves,
+            None => ClosingKeyword::Refs,
+        }
+    } else {
+        loop {
+            println!("How should linked issues be referenced?");
+            for (i, k) in ClosingKeyword::all().iter().enumerate() {
+                println!("  [{}] {}", i + 1, k.label());
+            }
+            print!("Select [1-4]: ");
+            std::io::stdout()
+                .flush()
+                .map_err(|err| format!("failed to flush prompt output: {err}"))?;
+            let value = read_line_trimmed()?;
+            match value.as_str() {
+                "1" => break ClosingKeyword::Refs,
+                "2" => break ClosingKeyword::Closes,
+                "3" => break ClosingKeyword::Fixes,
+                "4" => break ClosingKeyword::Resolves,
+                _ => println!("invalid choice, enter 1-4"),
+            }
+        }
+    };
+
+    Ok((issues, keyword))
 }
 
 fn resolve_pr_branches(
@@ -1385,6 +1814,11 @@ fn create_pr(
     draft: bool,
     base: Option<&str>,
     head: Option<&str>,
+    reviewers: &[String],
+    assignees: &[String],
+    labels: &[String],
+    milestone: Option<&str>,
+    web: bool,
 ) -> Result<String, CoreError> {
     let mut cmd = Command::new("gh");
     cmd.arg("pr")
@@ -1401,6 +1835,21 @@ fn create_pr(
     }
     if let Some(head) = head {
         cmd.arg("--head").arg(head);
+    }
+    for reviewer in reviewers {
+        cmd.arg("--reviewer").arg(reviewer);
+    }
+    for assignee in assignees {
+        cmd.arg("--assignee").arg(assignee);
+    }
+    for label in labels {
+        cmd.arg("--label").arg(label);
+    }
+    if let Some(milestone) = milestone {
+        cmd.arg("--milestone").arg(milestone);
+    }
+    if web {
+        cmd.arg("--web");
     }
 
     let output = cmd
@@ -1426,6 +1875,158 @@ fn create_pr(
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_issue_identifier_accepts_numeric() {
+        assert_eq!(parse_issue_identifier("123").unwrap(), 123);
+    }
+
+    #[test]
+    fn parse_issue_identifier_accepts_hash_prefix() {
+        assert_eq!(parse_issue_identifier("#456").unwrap(), 456);
+    }
+
+    #[test]
+    fn parse_issue_identifier_accepts_url() {
+        assert_eq!(
+            parse_issue_identifier("https://github.com/owner/repo/issues/789").unwrap(),
+            789
+        );
+    }
+
+    #[test]
+    fn parse_issue_identifier_rejects_garbage() {
+        assert!(parse_issue_identifier("abc").is_err());
+        assert!(parse_issue_identifier("").is_err());
+    }
+
+    #[test]
+    fn render_linked_issues_block_empty() {
+        let block = render_linked_issues_block(&[], ClosingKeyword::Refs);
+        assert_eq!(block, "");
+    }
+
+    #[test]
+    fn render_linked_issues_block_single() {
+        let issues = vec![IssueRef {
+            number: 42,
+            title: "Fix the thing".to_string(),
+            url: String::new(),
+        }];
+        let block = render_linked_issues_block(&issues, ClosingKeyword::Closes);
+        assert_eq!(block, "### Linked issues\n- Closes #42: Fix the thing\n");
+    }
+
+    #[test]
+    fn render_linked_issues_block_multiple() {
+        let issues = vec![
+            IssueRef {
+                number: 1,
+                title: "First".to_string(),
+                url: String::new(),
+            },
+            IssueRef {
+                number: 2,
+                title: "Second".to_string(),
+                url: String::new(),
+            },
+        ];
+        let block = render_linked_issues_block(&issues, ClosingKeyword::Fixes);
+        assert!(block.contains("Fixes #1: First"));
+        assert!(block.contains("Fixes #2: Second"));
+    }
+
+    #[test]
+    fn append_or_replace_issue_block_appends_to_empty() {
+        let result = append_or_replace_issue_block("", "### Linked issues\n- Refs #1\n");
+        assert_eq!(result, "### Linked issues\n- Refs #1\n");
+    }
+
+    #[test]
+    fn append_or_replace_issue_block_appends_to_existing_body() {
+        let body = "### Summary\nSome change";
+        let result = append_or_replace_issue_block(body, "### Linked issues\n- Refs #1\n");
+        assert!(result.contains("### Summary\nSome change"));
+        assert!(result.contains("### Linked issues\n- Refs #1"));
+    }
+
+    #[test]
+    fn append_or_replace_issue_block_replaces_existing_block() {
+        let body = "### Summary\nSome change\n\n### Linked issues\n- Refs #1\n";
+        let result =
+            append_or_replace_issue_block(body, "### Linked issues\n- Closes #1\n- Fixes #2\n");
+        assert!(result.contains("### Summary\nSome change"));
+        assert!(result.contains("Closes #1"));
+        assert!(result.contains("Fixes #2"));
+        assert!(!result.contains("Refs #1"));
+    }
+
+    #[test]
+    fn resolve_issue_ids_deduplicates() {
+        let ids = vec!["42".to_string(), "42".to_string()];
+        let (issues, _) = resolve_issue_ids(&ids, ClosingKeyword::Refs, true).unwrap();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].number, 42);
+    }
+
+    #[test]
+    fn resolve_issue_ids_no_verify_creates_placeholder() {
+        let ids = vec!["99".to_string()];
+        let (issues, _) = resolve_issue_ids(&ids, ClosingKeyword::Fixes, true).unwrap();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].number, 99);
+        assert_eq!(issues[0].title, "#99");
+    }
+
+    #[test]
+    fn resolve_issue_ids_empty_input() {
+        let (issues, kw) = resolve_issue_ids(&[], ClosingKeyword::Closes, false).unwrap();
+        assert!(issues.is_empty());
+        assert_eq!(kw, ClosingKeyword::Closes);
+    }
+
+    #[test]
+    fn closing_keyword_labels() {
+        assert_eq!(ClosingKeyword::Refs.label(), "Refs");
+        assert_eq!(ClosingKeyword::Closes.label(), "Closes");
+        assert_eq!(ClosingKeyword::Fixes.label(), "Fixes");
+        assert_eq!(ClosingKeyword::Resolves.label(), "Resolves");
+    }
+
+    #[test]
+    fn render_dry_run_includes_issues_and_metadata() {
+        let issues = vec![IssueRef {
+            number: 1,
+            title: "Bug".to_string(),
+            url: String::new(),
+        }];
+        let output = render_dry_run(
+            "feat: test",
+            "body text",
+            false,
+            None,
+            None,
+            false,
+            &issues,
+            ClosingKeyword::Refs,
+            &["reviewer1".to_string()],
+            &[],
+            &["bug".to_string()],
+            None,
+            false,
+        );
+        assert!(output.contains("dry-run:"));
+        assert!(output.contains("feat: test"));
+        assert!(output.contains("body text"));
+        assert!(output.contains("#1: Bug"));
+        assert!(output.contains("reviewer: reviewer1"));
+        assert!(output.contains("label: bug"));
+    }
 }
 
 #[cfg(not(feature = "llama-native"))]

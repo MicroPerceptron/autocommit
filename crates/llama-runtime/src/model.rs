@@ -729,12 +729,14 @@ impl LlmEngine for Engine {
         }
         risk_notes.push(format!("dispatch:{:?}", decision.route));
 
-        let body = generated
-            .as_ref()
-            .and_then(|g| {
-                let b = g.body.trim();
-                if b.is_empty() { None } else { Some(b.to_string()) }
-            });
+        let body = generated.as_ref().and_then(|g| {
+            let b = g.body.trim();
+            if b.is_empty() {
+                None
+            } else {
+                Some(b.to_string())
+            }
+        });
 
         let report = AnalysisReport {
             schema_version: "1.0".to_string(),
@@ -3784,6 +3786,7 @@ Summary: Preserve valid commit text when reduce JSON is partially malformed.
         let generated = ReduceModelOutput {
             commit_message: "extract/simplify/reorganize model reduction logic".to_string(),
             summary: String::new(),
+            body: String::new(),
             risk_level: "low".to_string(),
             risk_notes: Vec::new(),
         };
@@ -3805,6 +3808,7 @@ Summary: Preserve valid commit text when reduce JSON is partially malformed.
         let generated = ReduceModelOutput {
             commit_message: "feat(scope): add cache key with no version".to_string(),
             summary: String::new(),
+            body: String::new(),
             risk_level: "low".to_string(),
             risk_notes: Vec::new(),
         };
@@ -3826,6 +3830,7 @@ Summary: Preserve valid commit text when reduce JSON is partially malformed.
         let generated = ReduceModelOutput {
             commit_message: "feat(cli): improve model reduction stability".to_string(),
             summary: String::new(),
+            body: String::new(),
             risk_level: "low".to_string(),
             risk_notes: Vec::new(),
         };
@@ -3856,6 +3861,7 @@ Summary: Preserve valid commit text when reduce JSON is partially malformed.
         let generated = ReduceModelOutput {
             commit_message: "refactor(llama-runtime): model reduction logic".to_string(),
             summary: "Consolidate partial analyses into one report".to_string(),
+            body: String::new(),
             risk_level: "medium".to_string(),
             risk_notes: Vec::new(),
         };

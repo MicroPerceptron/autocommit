@@ -2700,8 +2700,14 @@ mod tests {
         assert!(message.starts_with("feat(core): add detailed commit composition\n\n"));
         assert!(message.contains("- `crates/foo.rs`: handle edge case by adding validation"));
         assert!(message.contains("- `crates/bar.rs`: bump dep to 2.0 for compat"));
-        assert!(!message.contains("### Changes"), "LLM body should replace changes section");
-        assert!(!message.contains("Compose commit output"), "LLM body should replace summary");
+        assert!(
+            !message.contains("### Changes"),
+            "LLM body should replace changes section"
+        );
+        assert!(
+            !message.contains("Compose commit output"),
+            "LLM body should replace summary"
+        );
         assert!(message.contains("### Risk"));
     }
 

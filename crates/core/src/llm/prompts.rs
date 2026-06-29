@@ -29,7 +29,7 @@ Type classification rules (CRITICAL - get these right):
 - test: test additions or modifications only.
 - perf: performance optimization without API change.
 
-For small diffs (under 10 lines): describe what was literally changed. Avoid inferring grand intent from minimal changes. If the change is trivial, say so directly.
+For small diffs (under 15 lines): describe what was literally changed. Avoid inferring grand intent from minimal changes. If the change is trivial, say so directly.
 "#;
 
 pub const DISPATCH_DRAFT_ANCHOR: &str = "Small, low-risk diff limited to a few files with straightforward behavior updates, docs, or tests and no high-impact migration or workflow changes.";

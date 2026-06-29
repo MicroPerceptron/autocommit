@@ -11,7 +11,7 @@ use clap::{CommandFactory, Parser, ValueEnum};
     about = "AI-assisted commit and pull request generation for local git repositories",
     disable_help_flag = true,
     disable_version_flag = true,
-    after_help = "Use `autocommit <command> --help` for command-specific options.\nGlobal flags supported: `--help`, `-h`, `--version`, `-V`."
+    after_help = "Use `autocommit <command> --help` for command-specific options.\nShort aliases: `autocommit c` runs `autocommit commit`.\nGlobal flags supported: `--help`, `-h`, `--version`, `-V`."
 )]
 struct Cli {
     #[arg(value_name = "COMMAND", value_enum)]
@@ -30,6 +30,8 @@ enum CommandName {
     Analyze,
     /// Generate and create a commit message from local changes
     Commit,
+    /// Alias for `commit`
+    C,
     /// Remove persisted per-repo KV generation cache
     Clean,
     /// View and edit per-repo runtime and policy config
@@ -98,7 +100,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             print!("{output}");
             Ok(())
         }
-        Some(CommandName::Commit) => {
+        Some(CommandName::Commit | CommandName::C) => {
             let output = cmd::commit::run(&cli.args)?;
             print!("{output}");
             Ok(())

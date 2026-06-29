@@ -130,8 +130,8 @@ pub fn literal_report(
             bucket: ChangeBucket::Patch,
             type_tag: TypeTag::Fix,
             title: format!(
-                "Update {} across {} file(s)",
-                features.files_changed, features.lines_changed
+                "Update {} line(s) across {} file(s)",
+                features.lines_changed, features.files_changed
             ),
             intent: "Apply diff changes".to_string(),
             files: Vec::new(),

@@ -94,11 +94,13 @@ pub fn literal_report(
     for chunk in chunks {
         let (add_count, del_count) = count_diff_lines(&chunk.text);
         let (added_syms, removed_syms) = extract_diff_declarations(&chunk.text);
-        let all_syms: Vec<&str> = added_syms
-            .iter()
-            .chain(removed_syms.iter())
-            .map(|s| s.as_str())
-            .collect();
+        let mut all_syms: Vec<&str> = Vec::new();
+        if let Some(sym) = added_syms.first() {
+            all_syms.push(sym.as_str());
+        }
+        if let Some(sym) = removed_syms.first() {
+            all_syms.push(sym.as_str());
+        }
         let type_tag = classify_literal_change(&chunk.path, add_count, del_count, &all_syms);
         let title = build_literal_title(
             &chunk.path,

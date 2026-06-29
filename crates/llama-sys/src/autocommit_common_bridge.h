@@ -12,6 +12,7 @@ extern "C" {
 
 typedef struct autocommit_common_config autocommit_common_config;
 typedef struct autocommit_common_sampler autocommit_common_sampler;
+typedef struct autocommit_init_result autocommit_init_result;
 
 autocommit_common_config * autocommit_common_config_new(void);
 void autocommit_common_config_free(autocommit_common_config * cfg);
@@ -63,6 +64,31 @@ int autocommit_common_config_fill_fit_buffers(
 int autocommit_common_config_ctx_shift_enabled(const autocommit_common_config * cfg);
 int32_t autocommit_common_config_n_keep(const autocommit_common_config * cfg);
 
+/// Load model and create context from the given config.
+/// Returns an opaque result containing both model and context pointers,
+/// or NULL on failure (err is populated with a message).
+/// The caller takes ownership of model and context; free the result
+/// handle with autocommit_init_free (which does NOT free model/context).
+autocommit_init_result * autocommit_init(
+        autocommit_common_config * cfg,
+        int embedding,
+        int cpu_only,
+        char * err,
+        size_t err_len);
+
+/// Extract model pointer from an init result.
+/// The caller takes ownership of the model and must free it with llama_model_free.
+struct llama_model * autocommit_init_get_model(autocommit_init_result * result);
+
+/// Copy the fitted context params from an init result.
+void autocommit_init_get_context_params(
+        autocommit_init_result * result,
+        struct llama_context_params * out);
+
+/// Free the init result handle.
+/// Does NOT free the model pointer — ownership transfers to the caller.
+void autocommit_init_free(autocommit_init_result * result);
+
 autocommit_common_sampler * autocommit_common_sampler_new(
         const autocommit_common_config * cfg,
         struct llama_model * model,
@@ -91,6 +117,22 @@ float autocommit_cosine_similarity(const float * a, const float * b, int n);
 /// 0 = errors only, 1 = +warnings, 2 = +info, 3 = +debug.
 /// Set to 0 to suppress the "using cached file" INFO messages from download.cpp.
 void autocommit_common_log_set_verbosity(int verbosity);
+
+/// Fit model/context params to available device memory.
+/// Returns 0 on success, non-zero on failure.
+/// This is exposed through the bridge because the underlying llama.cpp
+/// release (b9837) does not export llama_params_fit from the public
+/// headers; the bridge provides a uniform entry point regardless of
+/// whether the real function exists at link time.
+int autocommit_llama_params_fit(
+        const char * path_model,
+        struct llama_model_params * mparams,
+        struct llama_context_params * cparams,
+        float * tensor_split,
+        struct llama_model_tensor_buft_override * tensor_buft_overrides,
+        size_t * margins,
+        uint32_t n_ctx_min,
+        int log_level);
 
 #ifdef __cplusplus
 }

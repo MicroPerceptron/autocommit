@@ -41,14 +41,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: recursive
+          submodules: true
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
 
       - name: Install deps (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y cmake libclang-dev pkg-config libssl-dev libopenblas-dev
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev pkg-config libssl-dev
+
+      - name: Install cmake (source builds only)
+        if: matrix.vulkan
+        run: sudo apt-get install -y cmake libopenblas-dev
 
       - name: Install Vulkan SDK
         if: matrix.vulkan
@@ -56,7 +60,7 @@ jobs:
 
       - name: Install deps (macOS)
         if: runner.os == 'macOS'
-        run: brew install cmake openssl@3
+        run: brew install openssl@3
 
       - uses: actions/cache@v4
         with:
@@ -82,16 +86,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: recursive
+          submodules: true
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Install deps (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y cmake libclang-dev pkg-config libssl-dev libopenblas-dev
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev libssl-dev
 
       - name: Install deps (macOS)
         if: runner.os == 'macOS'
-        run: brew install cmake openssl@3
+        run: brew install openssl@3
 
       - uses: actions/cache@v4
         with:

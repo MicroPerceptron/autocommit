@@ -18,6 +18,18 @@ Guidelines:
 - For diagnostics/debugging: "fix/chore: add diagnostic for X"
 - Multiple related changes: summarize the theme, then list key parts
 - Unrelated changes: indicate mixed scope clearly
+
+Type classification rules (CRITICAL - get these right):
+- style: ONLY for formatting/whitespace-only changes that do NOT modify behavior, logic, types, or APIs. Never use style for any change that touches executable code.
+- refactor: code restructuring without behavior change (renames, extract function, change signature).
+- feat: new capability, new API, new parameter, new export for downstream consumers.
+- fix: behavior correction, bug fix, edge-case handling.
+- chore: build config, CI, dependency updates, manifest changes, internal tooling.
+- docs: comments, documentation, README changes only.
+- test: test additions or modifications only.
+- perf: performance optimization without API change.
+
+For small diffs (under 10 lines): describe what was literally changed. Avoid inferring grand intent from minimal changes. If the change is trivial, say so directly.
 "#;
 
 pub const DISPATCH_DRAFT_ANCHOR: &str = "Small, low-risk diff limited to a few files with straightforward behavior updates, docs, or tests and no high-impact migration or workflow changes.";
@@ -27,6 +39,14 @@ pub const IMPORTANCE_PRIMARY_ANCHOR: &str = "Primary code change that defines th
 pub const IMPORTANCE_SUPPORTING_ANCHOR: &str = "Supporting infrastructure or configuration change. Updates manifests, build scripts, CI workflows, dependency versions, or project settings without introducing new behavior.";
 
 pub fn build_analyze_prompt(chunk: &DiffChunk) -> String {
+    let chunk_line_count = chunk.text.lines().count();
+
+    let small_diff_warning = if chunk_line_count < 15 {
+        " NOTE: This is a small diff. Describe what was literally changed. Do NOT infer or invent intent that is not directly visible in the diff.\n"
+    } else {
+        ""
+    };
+
     format!(
         "/no_think\n\
 Task: Analyze one diff chunk.\n\
@@ -39,6 +59,7 @@ intent: <= 16 words, concise rationale phrase (not a long sentence).\n\
 Do not end `summary`, `title`, or `intent` with dangling filler words.\n\
 Use backticks for file paths, variable names, CLI flags, and config keys in summary/title/intent.\n\
 No markdown, no prose outside JSON.\n\
+{small_diff_warning}\
 Path: {}\n\
 Diff:\n```diff\n{}\n```",
         chunk.path, chunk.text
@@ -63,9 +84,10 @@ Rules:\n\
 - commit_message and summary must describe the overall intent and outcome, not enumerate individual files or list per-file changes\n\
 - summary must be one sentence about the code change outcome\n\
 - risk_level must be low, medium, or high\n\
-- risk_notes should be concise and concrete\n\
+- risk_notes should be concise and concrete. Never use generic phrases like \"no security risks\" or \"no data loss\" - describe actual risk if any, or omit.\n\
 - use backticks for file paths, variable names, CLI flags, and config keys in summary and risk_notes\n\
-- absolutely no explanations, no markdown, no <think> tags"
+- absolutely no explanations, no markdown, no <think> tags\n\
+- ONLY use \"style:\" prefix for formatting-only changes that do NOT touch any executable code"
     )
 }
 

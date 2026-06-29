@@ -50,7 +50,7 @@ pub fn build_reduce_prompt(partial_count: usize) -> String {
         "/no_think\n\
 Task: Produce final commit metadata from {partial_count} chunk summaries.\n\
 Return ONLY JSON with this exact shape:\n\
-{{\"commit_message\":\"...\",\"summary\":\"...\",\"risk_level\":\"low|medium|high\",\"risk_notes\":[\"...\"]}}\n\
+{{\"commit_message\":\"...\",\"summary\":\"...\",\"body\":\"...\",\"risk_level\":\"low|medium|high\",\"risk_notes\":[\"...\"]}}\n\
 Rules:\n\
 - commit_message must be a single conventional commit header that describes concrete code changes\n\
 - commit_message must not mention analysis process words like: reduce, reducer, analysis, analyses, report, chunk, or partial\n\
@@ -62,6 +62,12 @@ Rules:\n\
 - do not use backticks in commit_message\n\
 - commit_message and summary must describe the overall intent and outcome, not enumerate individual files or list per-file changes\n\
 - summary must be one sentence about the code change outcome\n\
+- body: 1-3 bullet points with concrete details about WHAT changed. Use backticks for paths and names.\n\
+  Prefer \"why\" context over \"how\": describe the capability or fix, not the implementation steps.\n\
+  Examples:\n\
+    - \"`src/parser.rs`: handle malformed header by falling back to default timeout\"\n\
+    - \"`Cargo.toml`: bump `tokio` to 1.30 for `timeout` feature support\"\n\
+  Omit the body if the change is trivial (typo, formatting, single-line docs).\n\
 - risk_level must be low, medium, or high\n\
 - risk_notes should be concise and concrete\n\
 - use backticks for file paths, variable names, CLI flags, and config keys in summary and risk_notes\n\

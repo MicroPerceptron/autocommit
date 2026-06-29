@@ -590,8 +590,9 @@ autocommit_init_result * autocommit_init(
         llama_context_params cparams = common_context_params_to_llama(params);
 
         // Apply embedding override directly on C params
+        // Note: llama_model_params no longer has an embedding field in b9837;
+        // embedding is controlled via context_params.embeddings and llama_set_embeddings.
         if (embedding) {
-            mparams.embedding = true;
             cparams.embeddings = true;
             cparams.pooling_type = LLAMA_POOLING_TYPE_MEAN;
         }

@@ -81,7 +81,7 @@ fn run_inner(
     // Feature extraction uses the original per-file chunks for accuracy.
     let features = features::extract(&raw_chunks);
     let key_symbols = signals::extract_key_symbols(&raw_chunks);
-    let stats = to_stats(&features, key_symbols);
+    let stats = to_stats(&features, key_symbols.clone());
 
     let heuristic = heuristics::score(&features);
     let embedding_hint = if embedding_gate::should_run_embedding(heuristic) {
@@ -159,6 +159,17 @@ fn run_inner(
 
     // DraftOnly fast path: skip the reduce inference call.
     if decision.route == DispatchRoute::DraftOnly {
+        // For very small diffs, bypass the model entirely and generate a
+        // literal commit message from the diff structure. This avoids
+        // hallucination on tiny changes where the model has too little
+        // signal to infer meaningful intent.
+        if features.lines_changed <= 20 && features.files_changed <= 2 {
+            let report =
+                reduce::literal_report(&chunks, &features, &key_symbols, &decision, &stats);
+            progress::emit(cb, ProgressStage::DraftSynthesis);
+            validate::validate(&report)?;
+            return Ok(report);
+        }
         let partials = fanout::analyze_chunks(engine, &chunks)?;
         let report = reduce::synthesize_draft_report(&partials, &decision, &stats);
         progress::emit(cb, ProgressStage::DraftSynthesis);

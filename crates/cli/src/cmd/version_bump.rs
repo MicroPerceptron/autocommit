@@ -200,9 +200,6 @@ fn recommend_inner(
         .join(VERSION_CONTEXT_FILE);
 
     let changed_paths = parse_changed_paths(diff_text);
-    let source_changed = changed_paths
-        .iter()
-        .any(|path| !is_manifest_path(path) && !is_lockfile_path(path));
     let heuristic_level = suggested_level(report);
     let recommended_level = combine_recommended_level(heuristic_level, embedding_level);
 
@@ -228,7 +225,7 @@ fn recommend_inner(
             .get(&manifest_path)
             .and_then(|snapshot| snapshot.version.clone());
         let manifest_changed = changed_paths.contains(&manifest_path);
-        let should_evaluate = source_changed || manifest_changed;
+        let should_evaluate = manifest_changed;
 
         if should_evaluate {
             if kind == ManifestKind::GoMod {

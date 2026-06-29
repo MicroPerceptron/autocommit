@@ -2,8 +2,10 @@ use crate::CoreError;
 use crate::diff::features::DiffFeatures;
 use crate::diff::importance::{self, ImportanceTier};
 use crate::llm::traits::LlmEngine;
+use crate::types::diff::{DiffChunk, FileStatus};
 use crate::types::{
-    AnalysisReport, ChangeItem, DiffStats, DispatchDecision, PartialReport, RiskReport, TypeTag,
+    AnalysisReport, ChangeBucket, ChangeItem, DiffStats, DispatchDecision, FileRef, PartialReport,
+    RiskReport, TypeTag,
 };
 
 pub fn reduce(
@@ -77,6 +79,267 @@ pub fn format_only_report(
         body: None,
         stats: stats.clone(),
         dispatch: decision.clone(),
+    }
+}
+
+/// Generate a report directly from diff structure, bypassing the LLM entirely.
+/// Used for very small diffs where hallucination risk is high and model calls aren't
+/// worth the latency.
+pub fn literal_report(
+    chunks: &[DiffChunk],
+    features: &DiffFeatures,
+    _key_symbols: &[String],
+    decision: &DispatchDecision,
+    stats: &DiffStats,
+) -> AnalysisReport {
+    let mut items = Vec::new();
+    for chunk in chunks {
+        let (add_count, del_count) = count_diff_lines(&chunk.text);
+        let (added_syms, removed_syms) = extract_diff_declarations(&chunk.text);
+        let mut all_syms: Vec<&str> = Vec::new();
+        if let Some(sym) = added_syms.first() {
+            all_syms.push(sym.as_str());
+        }
+        if let Some(sym) = removed_syms.first() {
+            all_syms.push(sym.as_str());
+        }
+        let type_tag = classify_literal_change(&chunk.path, add_count, del_count, &all_syms);
+        let title = build_literal_title(
+            &chunk.path,
+            add_count,
+            del_count,
+            &added_syms,
+            &removed_syms,
+        );
+        let intent = build_literal_intent(add_count, del_count);
+
+        items.push(ChangeItem {
+            id: format!("lit-{}", sanitize_path(&chunk.path)),
+            bucket: bucket_from_type(&type_tag),
+            type_tag,
+            title,
+            intent,
+            files: vec![FileRef {
+                path: chunk.path.clone(),
+                status: FileStatus::Modified,
+                ranges: chunk.ranges.clone(),
+            }],
+            confidence: 1.0,
+        });
+    }
+
+    if items.is_empty() {
+        items.push(ChangeItem {
+            id: "lit-update".to_string(),
+            bucket: ChangeBucket::Patch,
+            type_tag: TypeTag::Fix,
+            title: format!(
+                "Update {} line(s) across {} file(s)",
+                features.lines_changed, features.files_changed
+            ),
+            intent: "Apply diff changes".to_string(),
+            files: Vec::new(),
+            confidence: 1.0,
+        });
+    }
+
+    let commit_message = synthesize_commit_message(&items);
+    let summary = synthesize_summary(&items, stats);
+
+    AnalysisReport {
+        schema_version: "1.0".to_string(),
+        commit_message,
+        summary,
+        items,
+        risk: RiskReport {
+            level: "low".to_string(),
+            notes: vec![
+                "commit_source:literal".to_string(),
+                format!("dispatch:{:?}", decision.route),
+            ],
+        },
+        stats: stats.clone(),
+        dispatch: decision.clone(),
+    }
+}
+
+fn sanitize_path(path: &str) -> String {
+    path.replace(|c: char| !c.is_alphanumeric() && c != '-' && c != '_', "_")
+}
+
+fn count_diff_lines(diff_text: &str) -> (usize, usize) {
+    let mut additions = 0usize;
+    let mut deletions = 0usize;
+    for line in diff_text.lines() {
+        if line.starts_with("+") && !line.starts_with("+++") {
+            additions += 1;
+        } else if line.starts_with("-") && !line.starts_with("---") {
+            deletions += 1;
+        }
+    }
+    (additions, deletions)
+}
+
+fn extract_diff_declarations(diff_text: &str) -> (Vec<String>, Vec<String>) {
+    let mut added = Vec::new();
+    let mut removed = Vec::new();
+    for line in diff_text.lines() {
+        if let Some(rest) = line.strip_prefix('+') {
+            if rest.starts_with("++") {
+                continue;
+            }
+            if let Some(name) = extract_declaration(rest.trim()) {
+                added.push(name);
+            }
+        } else if let Some(rest) = line.strip_prefix('-') {
+            if rest.starts_with("--") {
+                continue;
+            }
+            if let Some(name) = extract_declaration(rest.trim()) {
+                removed.push(name);
+            }
+        }
+    }
+    (added, removed)
+}
+
+/// Minimal declaration extractor for literal diffs.
+fn extract_declaration(line: &str) -> Option<String> {
+    let name = line
+        .trim_start_matches("pub ")
+        .trim_start_matches("pub(crate) ")
+        .trim_start_matches("async ");
+    if let Some(rest) = name
+        .strip_prefix("fn ")
+        .or_else(|| name.strip_prefix("def "))
+        .or_else(|| name.strip_prefix("function "))
+        .or_else(|| name.strip_prefix("func "))
+    {
+        return rest
+            .split(['(', '<', ' '])
+            .next()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+    }
+    if let Some(rest) = name
+        .strip_prefix("struct ")
+        .or_else(|| name.strip_prefix("class "))
+        .or_else(|| name.strip_prefix("trait "))
+        .or_else(|| name.strip_prefix("enum "))
+        .or_else(|| name.strip_prefix("type "))
+    {
+        return rest
+            .split_whitespace()
+            .next()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+    }
+    None
+}
+
+fn classify_literal_change(
+    path: &str,
+    add_count: usize,
+    del_count: usize,
+    symbols: &[&str],
+) -> TypeTag {
+    let path_lower = path.to_ascii_lowercase();
+    if path_lower.ends_with(".md") || path_lower.ends_with("readme") || path_lower.contains("doc") {
+        return TypeTag::Docs;
+    }
+    if path_lower.ends_with("_test.rs")
+        || path_lower.ends_with("_test.go")
+        || path_lower.ends_with("_test.py")
+        || path_lower.contains("test_")
+        || path_lower.contains("/tests/")
+    {
+        return TypeTag::Test;
+    }
+    if add_count == 0 && del_count > 0 {
+        return TypeTag::Refactor;
+    }
+    if add_count > 0 && del_count == 0 && !symbols.is_empty() {
+        return TypeTag::Feat;
+    }
+    if symbols.len() >= 2 {
+        let first = symbols[0].to_ascii_lowercase();
+        let second = symbols[1].to_ascii_lowercase();
+        if first.chars().take(3).collect::<String>() == second.chars().take(3).collect::<String>() {
+            return TypeTag::Refactor;
+        }
+    }
+    TypeTag::Fix
+}
+
+fn build_literal_title(
+    path: &str,
+    add_count: usize,
+    del_count: usize,
+    added_syms: &[String],
+    removed_syms: &[String],
+) -> String {
+    let path_lower = path.to_ascii_lowercase();
+    if path_lower.ends_with(".md") || path_lower.ends_with("readme") {
+        return capitalize_first(&format!("update documentation in {path}"));
+    }
+    if (path_lower.ends_with("cargo.toml")
+        || path_lower.ends_with("package.json")
+        || path_lower.ends_with("pyproject.toml"))
+        && !added_syms.is_empty()
+    {
+        return capitalize_first(&format!("add {} to {}", added_syms[0], path));
+    }
+
+    if let Some((added, removed)) = added_syms.first().zip(removed_syms.first())
+        && added != removed
+    {
+        return capitalize_first(&format!("rename {} to {}", removed, added));
+    }
+
+    if let Some(sym) = added_syms.first() {
+        if del_count == 0 {
+            return capitalize_first(&format!("add {}", sym));
+        }
+        return capitalize_first(&format!("add {} in {}", sym, path));
+    }
+
+    if let Some(sym) = removed_syms.first() {
+        if add_count == 0 {
+            return capitalize_first(&format!("remove {}", sym));
+        }
+        return capitalize_first(&format!("update {}", sym));
+    }
+
+    if add_count > 0 && del_count == 0 {
+        return format!("Add {} line(s) to {path}", add_count);
+    }
+    if del_count > 0 && add_count == 0 {
+        return format!("Remove {} line(s) from {path}", del_count);
+    }
+
+    format!("Update {} line(s) in {path}", add_count.max(del_count))
+}
+
+fn build_literal_intent(add_count: usize, del_count: usize) -> String {
+    if add_count > 0 && del_count > 0 {
+        format!(
+            "Modify {} addition(s) and {} deletion(s)",
+            add_count, del_count
+        )
+    } else if add_count > 0 {
+        format!("Add {} line(s)", add_count)
+    } else if del_count > 0 {
+        format!("Remove {} line(s)", del_count)
+    } else {
+        "Apply diff changes".to_string()
+    }
+}
+
+fn bucket_from_type(tag: &TypeTag) -> ChangeBucket {
+    match tag {
+        TypeTag::Feat => ChangeBucket::Feature,
+        TypeTag::Test | TypeTag::Docs => ChangeBucket::Addition,
+        _ => ChangeBucket::Patch,
     }
 }
 
@@ -203,7 +466,8 @@ fn capitalize_first(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ChangeBucket, DispatchRoute, FileRef, FileStatus};
+    use crate::diff::features::DiffFeatures;
+    use crate::types::{ChangeBucket, DispatchRoute, FileRef, FileStatus, LineRange};
 
     fn sample_partial(title: &str, type_tag: TypeTag, path: &str) -> PartialReport {
         PartialReport {
@@ -313,5 +577,156 @@ mod tests {
         let report = format_only_report(&features, &decision, &stats);
         assert!(report.commit_message.contains("1 file"));
         assert!(!report.commit_message.contains("1 files"));
+    }
+
+    #[test]
+    fn literal_report_adds_new_function() {
+        let chunks = vec![DiffChunk {
+            path: "src/aml/namespace.rs".to_string(),
+            text: "\
+@@ -1,5 +1,8 @@
+ pub fn existing() {}
++pub fn new_helper() -> bool {
++    true
++}
++pub struct NewType {
+"
+            .to_string(),
+            ranges: vec![LineRange {
+                old_start: 1,
+                old_count: 5,
+                new_start: 1,
+                new_count: 8,
+            }],
+            estimated_tokens: 20,
+        }];
+        let features = DiffFeatures {
+            files_changed: 1,
+            lines_changed: 5,
+            hunks: 1,
+            binary_files: 0,
+            risky_paths: 0,
+            whitespace_only_lines: 0,
+        };
+        let decision = DispatchDecision {
+            route: DispatchRoute::DraftOnly,
+            reason_codes: vec!["small_diff".to_string()],
+            estimated_cost_tokens: 0,
+        };
+        let stats = DiffStats {
+            files_changed: 1,
+            lines_changed: 5,
+            hunks: 1,
+            binary_files: 0,
+            whitespace_only_lines: 0,
+            key_symbols: vec!["new_helper".to_string(), "NewType".to_string()],
+        };
+
+        let report = literal_report(
+            &chunks,
+            &features,
+            &["new_helper".to_string()],
+            &decision,
+            &stats,
+        );
+        assert!(
+            report.commit_message.contains("add") || report.commit_message.contains("Add"),
+            "expected commit message to mention 'add', got: {}",
+            report.commit_message
+        );
+        assert!(
+            report.commit_message.contains("new_helper"),
+            "expected commit message to contain function name, got: {}",
+            report.commit_message
+        );
+        assert_eq!(report.risk.level, "low");
+        assert!(report.risk.notes.iter().any(|n| n.contains("literal")));
+    }
+
+    #[test]
+    fn literal_report_renames_function() {
+        let chunks = vec![DiffChunk {
+            path: "src/core/process.rs".to_string(),
+            text: "\
+@@ -10,7 +10,7 @@
+-pub fn old_name() -> i32 {
++pub fn new_name() -> i32 {
+     42
+ }
+"
+            .to_string(),
+            ranges: vec![LineRange {
+                old_start: 10,
+                old_count: 7,
+                new_start: 10,
+                new_count: 7,
+            }],
+            estimated_tokens: 10,
+        }];
+        let features = DiffFeatures {
+            files_changed: 1,
+            lines_changed: 1,
+            hunks: 1,
+            binary_files: 0,
+            risky_paths: 0,
+            whitespace_only_lines: 0,
+        };
+        let decision = DispatchDecision {
+            route: DispatchRoute::DraftOnly,
+            reason_codes: vec!["small_diff".to_string()],
+            estimated_cost_tokens: 0,
+        };
+        let stats = DiffStats {
+            files_changed: 1,
+            lines_changed: 1,
+            hunks: 1,
+            binary_files: 0,
+            whitespace_only_lines: 0,
+            key_symbols: vec!["new_name".to_string()],
+        };
+
+        let report = literal_report(
+            &chunks,
+            &features,
+            &["new_name".to_string()],
+            &decision,
+            &stats,
+        );
+        assert!(
+            report.commit_message.contains("rename"),
+            "expected commit message to mention 'rename', got: {}",
+            report.commit_message
+        );
+        assert!(report.items.len() >= 1);
+    }
+
+    #[test]
+    fn literal_report_count_diff_lines() {
+        let diff = "\
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,3 +1,4 @@
+-// old comment
++// new comment
++// additional line
+";
+        let (add, del) = count_diff_lines(diff);
+        assert_eq!(add, 2);
+        assert_eq!(del, 1);
+    }
+
+    #[test]
+    fn literal_report_extracts_declarations() {
+        let diff = "\
++pub fn validate_input(s: &str) -> bool {
++pub struct McpServer {
+-pub fn old_helper() {
+-pub struct Deprecated {
+";
+        let (added, removed) = extract_diff_declarations(diff);
+        assert!(added.contains(&"validate_input".to_string()));
+        assert!(added.contains(&"McpServer".to_string()));
+        assert!(removed.contains(&"old_helper".to_string()));
+        assert!(removed.contains(&"Deprecated".to_string()));
     }
 }

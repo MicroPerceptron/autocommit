@@ -1,0 +1,115 @@
+{
+  "name": "autocommit-vscode",
+  "displayName": "autocommit",
+  "description": "Review and approve local autocommit analysis, commit, and PR workflows from VS Code.",
+  "version": "0.1.0",
+  "publisher": "microperceptron",
+  "private": true,
+  "engines": {
+    "vscode": "^1.88.0"
+  },
+  "categories": [
+    "SCM Providers",
+    "Other"
+  ],
+  "activationEvents": [
+    "onView:autocommit.review",
+    "onCommand:autocommit.analyze",
+    "onCommand:autocommit.generateCommitMessage",
+    "onCommand:autocommit.commitApproved",
+    "onCommand:autocommit.prPreview",
+    "onCommand:autocommit.prCreate"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "autocommit",
+      "properties": {
+        "autocommit.binaryPath": {
+          "type": "string",
+          "default": "autocommit",
+          "description": "Path to the autocommit CLI binary."
+        },
+        "autocommit.commitStagedOnly": {
+          "type": "boolean",
+          "default": false,
+          "description": "Analyze and commit only staged changes when using the VS Code commit workflow."
+        },
+        "autocommit.extraArgs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Extra arguments appended to autocommit analyze/preview commands, such as --profile or --model-path."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "autocommit.analyze",
+        "title": "autocommit: Analyze Changes (Preview)"
+      },
+      {
+        "command": "autocommit.generateCommitMessage",
+        "title": "autocommit: Generate Commit Message (Preview)"
+      },
+      {
+        "command": "autocommit.commitApproved",
+        "title": "autocommit: Commit Approved Message"
+      },
+      {
+        "command": "autocommit.prPreview",
+        "title": "autocommit: Preview Pull Request (Dry Run)"
+      },
+      {
+        "command": "autocommit.prCreate",
+        "title": "autocommit: Create Pull Request"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "autocommit",
+          "title": "autocommit",
+          "icon": "resources/autocommit.svg"
+        }
+      ]
+    },
+    "views": {
+      "autocommit": [
+        {
+          "id": "autocommit.review",
+          "name": "Review"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "autocommit.analyze",
+          "when": "view == autocommit.review",
+          "group": "navigation"
+        },
+        {
+          "command": "autocommit.generateCommitMessage",
+          "when": "view == autocommit.review",
+          "group": "navigation"
+        }
+      ],
+      "scm/title": [
+        {
+          "command": "autocommit.generateCommitMessage",
+          "group": "navigation@10"
+        },
+        {
+          "command": "autocommit.commitApproved",
+          "group": "navigation@11"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "test": "node ./test/smoke.js"
+  }
+}

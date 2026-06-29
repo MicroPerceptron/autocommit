@@ -99,6 +99,7 @@ mod tests {
                 notes: vec![],
             },
             stats: DiffStats::default(),
+            body: None,
             dispatch: DispatchDecision {
                 route: DispatchRoute::DraftOnly,
                 reason_codes: vec!["test".to_string()],
@@ -121,6 +122,7 @@ mod tests {
                 notes: vec![],
             },
             stats: DiffStats::default(),
+            body: None,
             dispatch: DispatchDecision {
                 route: DispatchRoute::DraftOnly,
                 reason_codes: vec!["test".to_string()],
@@ -143,6 +145,7 @@ mod tests {
                 notes: vec![],
             },
             stats: DiffStats::default(),
+            body: None,
             dispatch: DispatchDecision {
                 route: DispatchRoute::DraftOnly,
                 reason_codes: vec!["test".to_string()],

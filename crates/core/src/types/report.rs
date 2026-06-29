@@ -63,6 +63,8 @@ pub struct AnalysisReport {
     pub schema_version: String,
     pub commit_message: String,
     pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
     pub items: Vec<ChangeItem>,
     pub risk: RiskReport,
     pub stats: DiffStats,
@@ -75,6 +77,7 @@ impl AnalysisReport {
             schema_version: "1.0".to_string(),
             commit_message: "chore: no-op diff".to_string(),
             summary: "No diff chunks were provided.".to_string(),
+            body: None,
             items: Vec::new(),
             risk: RiskReport {
                 level: "low".to_string(),

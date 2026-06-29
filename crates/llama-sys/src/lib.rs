@@ -90,5 +90,33 @@ pub mod bridge {
         pub fn autocommit_cosine_similarity(a: *const f32, b: *const f32, n: c_int) -> f32;
 
         pub fn autocommit_common_log_set_verbosity(verbosity: c_int);
+
+        pub fn autocommit_init(
+            cfg: *mut c_void,
+            embedding: c_int,
+            cpu_only: c_int,
+            err: *mut c_char,
+            err_len: usize,
+        ) -> *mut c_void;
+
+        pub fn autocommit_init_get_model(result: *mut c_void) -> *mut ffi::llama_model;
+
+        pub fn autocommit_init_get_context_params(
+            result: *mut c_void,
+            out: *mut ffi::llama_context_params,
+        );
+
+        pub fn autocommit_init_free(result: *mut c_void);
+
+        pub fn autocommit_llama_params_fit(
+            path_model: *const c_char,
+            mparams: *mut ffi::llama_model_params,
+            cparams: *mut ffi::llama_context_params,
+            tensor_split: *mut f32,
+            tensor_buft_overrides: *mut ffi::llama_model_tensor_buft_override,
+            margins: *mut usize,
+            n_ctx_min: u32,
+            log_level: c_int,
+        ) -> c_int;
     }
 }

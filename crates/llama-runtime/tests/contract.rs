@@ -43,6 +43,7 @@ impl LlmEngine for MockEngine {
                 level: "low".to_string(),
                 notes: vec![],
             },
+            body: None,
             stats: stats.clone(),
             dispatch: decision.clone(),
         })

@@ -12,7 +12,9 @@ ws ::= | " " | "\n" [ \t]{0,20}
 
 pub const REDUCE_GBNF: &str = r#"
 root ::= object ws
-object ::= "{" ws "\"commit_message\"" ws ":" ws string "," ws "\"summary\"" ws ":" ws string "," ws "\"risk_level\"" ws ":" ws risklevel "," ws "\"risk_notes\"" ws ":" ws stringarray "}" ws
+object ::= "{" ws "\"commit_message\"" ws ":" ws string "," ws "\"summary\"" ws ":" ws string "," ws bodyfield "," ws "\"risk_level\"" ws ":" ws risklevel "," ws "\"risk_notes\"" ws ":" ws stringarray "}" ws
+
+bodyfield ::= "\"body\"" ws ":" ws string ws
 
 risklevel ::= "\"low\"" | "\"medium\"" | "\"high\""
 stringarray ::= "[" ws (string (ws "," ws string)*)? ws "]" ws

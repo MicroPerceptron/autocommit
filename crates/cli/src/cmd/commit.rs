@@ -79,6 +79,33 @@ pub fn run(args: &[String]) -> Result<String, String> {
     #[cfg(not(feature = "llama-native"))]
     let _ = &model_cache_dir;
 
+    if let Some(direct_message) = parsed.message {
+        if json {
+            return Err("--message cannot be combined with --json".to_string());
+        }
+        let repo = git::Repo::discover().map_err(|err| err.to_string())?;
+        let mut commit_policy_config = CommitPolicy::default();
+        #[cfg(feature = "llama-native")]
+        if let Some(paths) = repo_cache::maybe_discover_repo_kv_paths()
+            .as_ref()
+            .and_then(repo_cache::read_metadata)
+        {
+            commit_policy_config = paths.commit_policy;
+        }
+        let final_message =
+            prepare_message_for_policy(&repo, &direct_message, &commit_policy_config)
+                .map_err(|err| err.to_string())?;
+        ensure_signing_tool_ready(&repo, &mut commit_policy_config, false, false, false)
+            .map_err(|err| err.to_string())?;
+        commit_with_message(&repo, &final_message, staged_only, no_verify, &commit_policy_config)
+            .map_err(|err| err.to_string())?;
+        let mut out = String::new();
+        out.push_str("created commit with message:\n");
+        out.push_str(&final_message);
+        out.push('\n');
+        return Ok(out);
+    }
+
     let interactive = resolve_interactive_mode(interactive_override, json)?;
     let rich_interactive = interactive && Term::stderr().is_term();
 
@@ -495,6 +522,9 @@ struct CommitArgs {
     /// Runtime profile (`auto`, etc.)
     #[arg(long = "profile", value_name = "PROFILE")]
     profile: Option<String>,
+    /// Commit with the given message, skipping analysis (e.g. from VSCode extension)
+    #[arg(long, short = 'm', value_name = "TEXT", conflicts_with = "dry_run")]
+    message: Option<String>,
 }
 
 impl CommitArgs {

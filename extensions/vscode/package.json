@@ -42,6 +42,32 @@
           },
           "default": [],
           "description": "Extra arguments appended to autocommit analyze/preview commands, such as --profile or --model-path."
+        },
+        "autocommit.prDraft": {
+          "type": "boolean",
+          "default": false,
+          "description": "Always create PR as a draft."
+        },
+        "autocommit.prBase": {
+          "type": "string",
+          "default": "",
+          "description": "Default base branch for PR (e.g. main)."
+        },
+        "autocommit.prReviewers": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Default PR reviewers (GitHub usernames)."
+        },
+        "autocommit.prLabels": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Default PR labels."
         }
       }
     },

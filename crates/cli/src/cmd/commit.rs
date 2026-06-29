@@ -1698,14 +1698,33 @@ fn compose_commit_body(
 ) -> String {
     let mut sections = Vec::new();
 
-    let summary = report.summary.trim();
-    if should_include_summary(summary, subject) {
-        sections.push(summary.to_string());
-    }
+    // Prefer the LLM-generated body when available (more coherent and
+    // contextual than the mechanical item listing).
+    if let Some(llm_body) = &report.body {
+        let trimmed = llm_body.trim();
+        if !trimmed.is_empty() {
+            sections.push(trimmed.to_string());
+        } else {
+            let summary = report.summary.trim();
+            if should_include_summary(summary, subject) {
+                sections.push(summary.to_string());
+            }
 
-    let changes = compose_changes_section(report, recommendations);
-    if !changes.is_empty() {
-        sections.push(changes);
+            let changes = compose_changes_section(report, recommendations);
+            if !changes.is_empty() {
+                sections.push(changes);
+            }
+        }
+    } else {
+        let summary = report.summary.trim();
+        if should_include_summary(summary, subject) {
+            sections.push(summary.to_string());
+        }
+
+        let changes = compose_changes_section(report, recommendations);
+        if !changes.is_empty() {
+            sections.push(changes);
+        }
     }
 
     let versions = compose_version_recommendations_section(recommendations);
@@ -2547,6 +2566,7 @@ impl LlmEngine for MockEngine {
                 level: "low".to_string(),
                 notes: vec!["mock engine".to_string()],
             },
+            body: None,
             stats: stats.clone(),
             dispatch: decision.clone(),
         })
@@ -2626,6 +2646,7 @@ mod tests {
                 reason_codes: vec!["test".to_string()],
                 estimated_cost_tokens: 0,
             },
+            body: None,
         }
     }
 

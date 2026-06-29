@@ -729,10 +729,18 @@ impl LlmEngine for Engine {
         }
         risk_notes.push(format!("dispatch:{:?}", decision.route));
 
+        let body = generated
+            .as_ref()
+            .and_then(|g| {
+                let b = g.body.trim();
+                if b.is_empty() { None } else { Some(b.to_string()) }
+            });
+
         let report = AnalysisReport {
             schema_version: "1.0".to_string(),
             commit_message,
             summary,
+            body,
             items,
             risk: RiskReport {
                 level: risk_level,
@@ -802,6 +810,8 @@ struct ReduceModelOutput {
     commit_message: String,
     #[serde(default, alias = "description")]
     summary: String,
+    #[serde(default)]
+    body: String,
     #[serde(default, alias = "risk")]
     risk_level: String,
     #[serde(default)]
@@ -1574,6 +1584,7 @@ fn salvage_reduce_output(raw: &str) -> Option<ReduceModelOutput> {
     Some(ReduceModelOutput {
         commit_message: commit_message.unwrap_or_default(),
         summary: summary.unwrap_or_default(),
+        body: String::new(),
         risk_level: "medium".to_string(),
         risk_notes: vec!["salvaged_reduce_output".to_string()],
     })

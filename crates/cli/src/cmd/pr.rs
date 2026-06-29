@@ -1472,6 +1472,7 @@ impl LlmEngine for MockEngine {
                 level: "low".to_string(),
                 notes: vec!["mock engine".to_string()],
             },
+            body: None,
             stats: stats.clone(),
             dispatch: decision.clone(),
         })

@@ -55,6 +55,7 @@ impl LlmEngine for BatchedOnlyEngine {
                 level: "low".to_string(),
                 notes: Vec::new(),
             },
+            body: None,
             stats: DiffStats::default(),
             dispatch: DispatchDecision {
                 route: DispatchRoute::DraftOnly,

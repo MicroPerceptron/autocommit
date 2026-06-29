@@ -62,6 +62,7 @@ mod tests {
                 notes: Vec::new(),
             },
             stats: DiffStats::default(),
+            body: None,
             dispatch: DispatchDecision {
                 route: DispatchRoute::DraftThenReduce,
                 reason_codes: vec!["test".to_string()],

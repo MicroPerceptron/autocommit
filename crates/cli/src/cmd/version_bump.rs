@@ -1755,6 +1755,7 @@ diff --git a/Cargo.toml b/Cargo.toml\n";
                 level: "low".to_string(),
                 notes: Vec::new(),
             },
+            body: None,
             stats: autocommit_core::types::DiffStats::default(),
             dispatch: autocommit_core::types::DispatchDecision {
                 route: autocommit_core::types::DispatchRoute::DraftOnly,
@@ -1785,6 +1786,7 @@ diff --git a/Cargo.toml b/Cargo.toml\n";
                 level: "low".to_string(),
                 notes: Vec::new(),
             },
+            body: None,
             stats: autocommit_core::types::DiffStats::default(),
             dispatch: autocommit_core::types::DispatchDecision {
                 route: autocommit_core::types::DispatchRoute::DraftOnly,
@@ -1823,6 +1825,7 @@ diff --git a/Cargo.toml b/Cargo.toml\n";
                 whitespace_only_lines: 0,
                 ..Default::default()
             },
+            body: None,
             dispatch: autocommit_core::types::DispatchDecision {
                 route: autocommit_core::types::DispatchRoute::DraftOnly,
                 reason_codes: Vec::new(),
@@ -1871,6 +1874,7 @@ diff --git a/Cargo.toml b/Cargo.toml\n";
                 whitespace_only_lines: 0,
                 ..Default::default()
             },
+            body: None,
             dispatch: autocommit_core::types::DispatchDecision {
                 route: autocommit_core::types::DispatchRoute::DraftOnly,
                 reason_codes: Vec::new(),
@@ -1908,6 +1912,7 @@ diff --git a/Cargo.toml b/Cargo.toml\n";
                 whitespace_only_lines: 0,
                 ..Default::default()
             },
+            body: None,
             dispatch: autocommit_core::types::DispatchDecision {
                 route: autocommit_core::types::DispatchRoute::DraftOnly,
                 reason_codes: Vec::new(),

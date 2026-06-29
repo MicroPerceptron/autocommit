@@ -42,6 +42,7 @@ pub fn synthesize_draft_report(
                 format!("dispatch:{:?}", decision.route),
             ],
         },
+        body: None,
         stats: stats.clone(),
         dispatch: decision.clone(),
     }
@@ -73,6 +74,7 @@ pub fn format_only_report(
             level: "low".to_string(),
             notes: vec!["commit_source:format_only".to_string()],
         },
+        body: None,
         stats: stats.clone(),
         dispatch: decision.clone(),
     }

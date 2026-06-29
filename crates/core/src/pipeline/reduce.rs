@@ -158,6 +158,7 @@ pub fn literal_report(
                 format!("dispatch:{:?}", decision.route),
             ],
         },
+        body: None,
         stats: stats.clone(),
         dispatch: decision.clone(),
     }

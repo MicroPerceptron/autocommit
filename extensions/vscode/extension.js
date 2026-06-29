@@ -14,7 +14,9 @@ const state = {
   report: null,
   message: '',
   output: '',
-  error: ''
+  error: '',
+  prOutput: '',
+  prError: '',
 };
 
 function activate(context) {
@@ -26,7 +28,7 @@ function activate(context) {
     vscode.commands.registerCommand('autocommit.generateCommitMessage', generateCommitMessage),
     vscode.commands.registerCommand('autocommit.commitApproved', commitApproved),
     vscode.commands.registerCommand('autocommit.prPreview', prPreview),
-    vscode.commands.registerCommand('autocommit.prCreate', prCreate)
+    vscode.commands.registerCommand('autocommit.prCreate', prCreate),
   );
 }
 
@@ -58,28 +60,50 @@ async function generateCommitMessage() {
 
 async function prPreview() {
   await runAutocommitPreview('PR dry run', ['pr', '--dry-run', '--no-interactive'], (stdout) => {
-    state.output = stdout.trim();
+    state.prOutput = stdout.trim();
+    state.prError = '';
     state.status = 'PR dry run complete. No pull request was created.';
   });
 }
 
 async function prCreate() {
-  ensureVscode();
-  const choice = await vscode.window.showWarningMessage(
-    'This will run `autocommit pr` and may push or create/update a pull request after CLI confirmation. Continue?',
-    { modal: true },
-    'Open Terminal'
-  );
-  if (choice !== 'Open Terminal') return;
-  const terminal = vscode.window.createTerminal({ name: 'autocommit PR' });
+  const workspace = workspaceFolder();
+  if (!workspace) return;
+
+  const base = config().get('prBase') || '';
+  const draft = config().get('prDraft');
+  const reviewers = config().get('prReviewers') || [];
+  const labels = config().get('prLabels') || [];
+  const extraArgs = config().get('extraArgs') || [];
+
+  const args = ['pr', '--interactive'];
+  if (draft) args.push('--draft');
+  if (base) args.push('--base', base);
+  for (const r of reviewers) args.push('--reviewer', r);
+  for (const l of labels) args.push('--label', l);
+  args.push(...extraArgs);
+
+  const terminal = vscode.window.createTerminal({
+    name: 'autocommit PR',
+    message: 'Creating PR with autocommit...',
+  });
   terminal.show();
-  terminal.sendText(`${shellQuote(config().get('binaryPath'))} pr`);
+  terminal.sendText(`${shellQuote(config().get('binaryPath'))} ${args.join(' ')}`);
+}
+
+async function prUpdate() {
+  ensureVscode();
+  vscode.window.showInformationMessage(
+    'Run `autocommit pr` in the terminal to update an existing PR with new issue links and metadata.',
+  );
 }
 
 async function commitApproved(messageFromView) {
   const message = (messageFromView || state.message || '').trim();
   if (!message) {
-    vscode.window.showErrorMessage('No approved autocommit message is available. Generate a commit message preview first.');
+    vscode.window.showErrorMessage(
+      'No approved autocommit message is available. Generate a commit message preview first.',
+    );
     return;
   }
 
@@ -92,7 +116,7 @@ async function commitApproved(messageFromView) {
       'Commit Approved Message mutates Git. Stage all current changes before committing?',
       { modal: true },
       'Stage All and Commit',
-      'Commit Staged Only'
+      'Commit Staged Only',
     );
     if (!stage) return;
     if (stage === 'Stage All and Commit') await runGit(['add', '-A'], workspace.uri.fsPath);
@@ -104,14 +128,24 @@ async function commitApproved(messageFromView) {
     return;
   }
 
+  const binaryPath = config().get('binaryPath');
+  const cliArgs = ['commit', '-m', message, '--no-interactive', '--yes', '--staged'];
+
   update({ mode: 'running', status: 'Creating commit with the approved message...', error: '' });
   try {
-    const args = buildGitCommitArgs(message);
-    const result = await runGit(args, workspace.uri.fsPath);
-    update({ mode: 'idle', status: 'Commit created from approved message.', output: result.trim() });
+    const stdout = await runProcess(binaryPath, cliArgs, workspace.uri.fsPath);
+    update({
+      mode: 'idle',
+      status: 'Commit created from approved message.',
+      output: stdout.trim(),
+    });
     vscode.window.showInformationMessage('autocommit: commit created from approved message.');
   } catch (err) {
-    update({ mode: 'error', status: 'Commit failed.', error: String(err.message || err) });
+    update({
+      mode: 'error',
+      status: 'Commit failed.',
+      error: String(err.message || err),
+    });
     vscode.window.showErrorMessage(`autocommit commit failed: ${err.message || err}`);
   }
 }
@@ -120,15 +154,30 @@ async function runAutocommitPreview(label, baseArgs, onSuccess) {
   const workspace = workspaceFolder();
   if (!workspace) return;
   cancelCurrentProcess();
-  update({ mode: 'running', status: `Running autocommit ${label}...`, output: '', error: '' });
+  update({
+    mode: 'running',
+    status: `Running autocommit ${label}...`,
+    output: '',
+    error: '',
+  });
   const args = baseArgs.concat(config().get('extraArgs') || []);
   try {
     const stdout = await runProcess(config().get('binaryPath'), args, workspace.uri.fsPath);
     onSuccess(stdout);
     update({ mode: 'idle' });
   } catch (err) {
-    update({ mode: 'error', status: `autocommit ${label} failed.`, error: String(err.message || err) });
-    vscode.window.showErrorMessage(`autocommit ${label} failed: ${err.message || err}`);
+    const isBinaryMissing =
+      String(err.message || err).includes('ENOENT') ||
+      String(err.message || err).includes('not found');
+    const hint = isBinaryMissing
+      ? ' Is autocommit installed? Set autocommit.binaryPath in settings.'
+      : '';
+    update({
+      mode: 'error',
+      status: `autocommit ${label} failed.${hint}`,
+      error: String(err.message || err),
+    });
+    vscode.window.showErrorMessage(`autocommit ${label} failed:${hint}`);
   }
 }
 
@@ -166,7 +215,10 @@ function runProcess(command, args, cwd) {
       currentProcess = undefined;
       if (signal) reject(new Error(`process canceled with signal ${signal}`));
       else if (code === 0) resolve(stdout);
-      else reject(new Error(stderr.trim() || `process exited with code ${code}`));
+      else {
+        const msg = stderr.trim() || stdout.trim() || `process exited with code ${code}`;
+        reject(new Error(msg));
+      }
     });
   });
 }
@@ -198,12 +250,14 @@ function parseJson(stdout) {
 
 function composeCommitMessage(report) {
   if (!report) return '';
+  const body = report.body ? `\n\n${report.body}` : '';
   const lines = [report.commit_message || 'chore: update changes', ''];
   if (report.summary) lines.push(report.summary, '');
   if (Array.isArray(report.items) && report.items.length) {
     lines.push('### Changes');
     for (const item of report.items) {
-      const path = item.files && item.files[0] && item.files[0].path ? ` [${item.files[0].path}]` : '';
+      const path =
+        item.files && item.files[0] && item.files[0].path ? ` [${item.files[0].path}]` : '';
       lines.push(`- ${item.title || item.intent || 'Update'}${path}`);
     }
     lines.push('');
@@ -212,7 +266,9 @@ function composeCommitMessage(report) {
     lines.push(`### Risk (${report.risk.level || 'unknown'})`);
     for (const note of report.risk.notes) lines.push(`- ${note}`);
   }
-  return lines.join('\n').trim();
+  let result = lines.join('\n').trim();
+  if (body) result += body;
+  return result;
 }
 
 function formatAnalysis(report) {
@@ -226,7 +282,7 @@ function formatAnalysis(report) {
     `Files changed: ${stats.files_changed || 0}`,
     '',
     'Items:',
-    ...(report.items || []).map((item) => `- ${item.title || item.intent || item.id}`)
+    ...(report.items || []).map((item) => `- ${item.title || item.intent || item.id}`),
   ].join('\n');
 }
 
@@ -240,7 +296,9 @@ function buildGitCommitArgs(message) {
 }
 
 function shellQuote(value) {
-  return String(value || '').replace(/'/g, `'\\''`).replace(/^(.+)$/, "'$1'");
+  return String(value || '')
+    .replace(/'/g, `'\\''`)
+    .replace(/^(.+)$/, "'$1'");
 }
 
 function update(patch) {
@@ -262,6 +320,9 @@ class AutocommitReviewProvider {
       if (message.command === 'commit') commitApproved(message.text);
       if (message.command === 'cancel') cancelCurrentProcess();
       if (message.command === 'updateMessage') state.message = message.text || '';
+      if (message.command === 'prPreview') prPreview();
+      if (message.command === 'prCreate') prCreate();
+      if (message.command === 'prUpdate') prUpdate();
     });
     this.refresh();
   }
@@ -287,6 +348,7 @@ pre { white-space: pre-wrap; border: 1px solid var(--vscode-panel-border); paddi
 .status { margin: 8px 0; }
 .danger { color: var(--vscode-errorForeground); font-weight: 600; }
 .small { opacity: 0.8; font-size: 0.9em; }
+.section { margin-top: 16px; border-top: 1px solid var(--vscode-panel-border); padding-top: 8px; }
 </style>
 </head>
 <body>
@@ -302,6 +364,15 @@ pre { white-space: pre-wrap; border: 1px solid var(--vscode-panel-border); paddi
 <h3>Generated output</h3>
 <pre>${escapeHtml(state.output || 'No output yet.')}</pre>
 ${state.error ? `<h3 class="danger">Errors</h3><pre>${escapeHtml(state.error)}</pre>` : ''}
+<div class="section">
+<h3>Pull Request</h3>
+<button ${busy ? 'disabled' : ''} id="prPreview">PR Preview (Dry Run)</button>
+<button ${busy ? 'disabled' : ''} id="prCreate">Create PR...</button>
+<button ${busy ? 'disabled' : ''} id="prUpdate">Update PR</button>
+<p class="small">PR commands open a terminal for interactive input (issue linking, reviewers, etc.).</p>
+${state.prOutput ? `<pre>${escapeHtml(state.prOutput)}</pre>` : ''}
+${state.prError ? `<h3 class="danger">PR Errors</h3><pre>${escapeHtml(state.prError)}</pre>` : ''}
+</div>
 <script nonce="${nonce}">
 const vscode = acquireVsCodeApi();
 document.getElementById('analyze').addEventListener('click', () => vscode.postMessage({ command: 'analyze' }));
@@ -309,6 +380,9 @@ document.getElementById('generate').addEventListener('click', () => vscode.postM
 document.getElementById('cancel').addEventListener('click', () => vscode.postMessage({ command: 'cancel' }));
 document.getElementById('commit').addEventListener('click', () => vscode.postMessage({ command: 'commit', text: document.getElementById('message').value }));
 document.getElementById('message').addEventListener('input', (event) => vscode.postMessage({ command: 'updateMessage', text: event.target.value }));
+document.getElementById('prPreview').addEventListener('click', () => vscode.postMessage({ command: 'prPreview' }));
+document.getElementById('prCreate').addEventListener('click', () => vscode.postMessage({ command: 'prCreate' }));
+document.getElementById('prUpdate').addEventListener('click', () => vscode.postMessage({ command: 'prUpdate' }));
 </script>
 </body>
 </html>`;
@@ -323,4 +397,10 @@ function escapeHtml(value) {
     .replace(/'/g, '&#39;');
 }
 
-module.exports = { activate, deactivate, composeCommitMessage, formatAnalysis, buildGitCommitArgs };
+module.exports = {
+  activate,
+  deactivate,
+  composeCommitMessage,
+  formatAnalysis,
+  buildGitCommitArgs,
+};

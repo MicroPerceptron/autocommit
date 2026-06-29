@@ -1,29 +1,41 @@
 # autocommit VS Code extension
 
-This extension is a lightweight UI wrapper around the local `autocommit` CLI. It focuses on the primary review loop from issue #32: generate output quickly, let the user inspect and edit it, and only mutate Git after explicit approval.
+Review and approve local [autocommit](https://github.com/MicroPerceptron/autocommit) analysis, commit, and PR workflows from VS Code.
 
 ## Commands
 
-- `autocommit: Analyze Changes (Preview)` runs `autocommit analyze --json` and displays summaries, risk notes, dispatch status, and model/runtime errors in the side panel.
-- `autocommit: Generate Commit Message (Preview)` generates an editable commit message from analysis output without mutating Git.
-- `autocommit: Commit Approved Message` creates a Git commit from the edited message after confirmation.
-- `autocommit: Preview Pull Request (Dry Run)` runs `autocommit pr --dry-run --no-interactive`.
-- `autocommit: Create Pull Request` opens a terminal for the existing interactive `autocommit pr` flow.
-
-Preview commands are intentionally labeled as previews or dry runs. Commands that create commits or pull requests are labeled as mutations and require explicit confirmation.
+| Command | Description |
+|---------|-------------|
+| `autocommit: Analyze Changes (Preview)` | Run `autocommit analyze --json`, display structured report |
+| `autocommit: Generate Commit Message (Preview)` | Run `autocommit commit --dry-run --json`, editable message |
+| `autocommit: Commit Approved Message` | Stage + commit using the approved message (via `autocommit commit -m`) |
+| `autocommit: Preview Pull Request (Dry Run)` | Run `autocommit pr --dry-run --no-interactive` |
+| `autocommit: Create Pull Request` | Run `autocommit pr --interactive` in a terminal with configured flags |
 
 ## Settings
 
-- `autocommit.binaryPath`: CLI executable path. Defaults to `autocommit`.
-- `autocommit.commitStagedOnly`: when true, the commit workflow only analyzes and commits staged changes.
-- `autocommit.extraArgs`: extra CLI arguments for analysis/preview commands, such as model or profile overrides.
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `autocommit.binaryPath` | `"autocommit"` | Path to the CLI binary |
+| `autocommit.commitStagedOnly` | `false` | Stage-only mode |
+| `autocommit.extraArgs` | `[]` | Extra CLI args (e.g. `--profile`, `--model-path`) |
+| `autocommit.prDraft` | `false` | Always create PR as draft |
+| `autocommit.prBase` | `""` | Default base branch |
+| `autocommit.prReviewers` | `[]` | Default PR reviewers |
+| `autocommit.prLabels` | `[]` | Default PR labels |
+
+## Workflow
+
+1. **Analyze** or **Generate Commit Message** (preview only, no Git mutation)
+2. Inspect the output and edit the commit message if needed
+3. **Commit Approved Message** — stages changes and commits via `autocommit commit -m`
+4. **PR Preview** — dry-run pull request creation
+5. **Create PR** — opens a terminal with `autocommit pr --interactive` for issue linking
 
 ## Manual QA
 
-1. Open a Git repository in VS Code with the `autocommit` CLI available on `PATH`.
-2. Make a small source change.
-3. Open the autocommit activity-bar view and run **Generate Commit Message (Preview)**.
-4. Confirm that the side panel shows progress, generated output, an editable commit message, and no Git mutation has happened.
-5. Edit the commit message and click **Commit Approved Message**.
-6. Confirm the warning dialog distinguishes the Git mutation from preview actions, approve it, and verify that `git log -1 --pretty=%B` matches the edited message.
-7. Run **Preview Pull Request (Dry Run)** and verify that no PR is created.
+- Verify the webview panel appears in the activity bar ("autocommit" icon)
+- Run Analyze/Generate on a repo with changes — output should appear
+- Edit the commit message, then commit — should create a real Git commit
+- Run PR Preview — should show dry-run output
+- Run Create PR — should open a terminal

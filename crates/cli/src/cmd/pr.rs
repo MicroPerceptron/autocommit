@@ -735,6 +735,7 @@ fn spinner_style() -> ProgressStyle {
         .tick_strings(&["-", "\\", "|", "/"])
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_dry_run(
     title: &str,
     body: &str,
@@ -1015,10 +1016,8 @@ fn parse_issue_identifier(input: &str) -> Result<u64, String> {
     if let Ok(n) = input.parse::<u64>() {
         return Ok(n);
     }
-    if let Some(stripped) = input.strip_prefix('#') {
-        if let Ok(n) = stripped.parse::<u64>() {
-            return Ok(n);
-        }
+    if let Some(Ok(n)) = input.strip_prefix('#').map(|s| s.parse::<u64>()) {
+        return Ok(n);
     }
     if let Some(pos) = input.rfind("/issues/") {
         let remainder = &input[pos + "/issues/".len()..];
@@ -1141,19 +1140,17 @@ fn prompt_issue_linking(rich: bool) -> Result<(Vec<IssueRef>, ClosingKeyword), S
 
     loop {
         let raw = if rich {
-            let input = dialoguer::Input::<String>::with_theme(&theme)
+            dialoguer::Input::<String>::with_theme(&theme)
                 .with_prompt("Enter issue number or URL (empty to finish)")
                 .allow_empty(true)
                 .interact_on(&Term::stderr())
-                .map_err(|err| format!("failed to read issue: {err}"))?;
-            input
+                .map_err(|err| format!("failed to read issue: {err}"))?
         } else {
             print!("Enter issue number or URL (empty to finish): ");
             std::io::stdout()
                 .flush()
                 .map_err(|err| format!("failed to flush prompt output: {err}"))?;
-            let value = read_line_trimmed()?;
-            value
+            read_line_trimmed()?
         };
 
         if raw.trim().is_empty() {
@@ -1808,6 +1805,7 @@ fn looks_like_internal_risk_tag(note: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, ':' | '_' | '-' | '/'))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_pr(
     title: &str,
     body: &str,

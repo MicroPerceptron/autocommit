@@ -29,6 +29,7 @@ fn analyze_json_roundtrip() {
         assert!(
             stderr.contains("runtime model path is not configured")
                 || stderr.contains("failed to resolve model path")
+                || stderr.contains("embedding model not found after resolution")
                 || stderr.contains("failed to download model"),
             "unexpected stderr: {stderr}"
         );

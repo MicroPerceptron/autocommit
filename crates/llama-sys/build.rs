@@ -6,6 +6,32 @@ use std::process::Command;
 /// The llama.cpp release tag to use for prebuilt binary downloads.
 const LLAMA_CPP_RELEASE_TAG: &str = "b9837";
 
+/// Returns the macOS major version (e.g. 14 for macOS 14.x Sonoma), or 0
+/// if not running on macOS or the version could not be determined.
+fn macos_version_major(target: &str) -> u32 {
+    if !target.ends_with("-apple-darwin") {
+        return 0;
+    }
+    Command::new("sw_vers")
+        .arg("-productVersion")
+        .output()
+        .ok()
+        .and_then(|o| {
+            if o.status.success() {
+                String::from_utf8(o.stdout).ok()
+            } else {
+                None
+            }
+        })
+        .and_then(|v| {
+            v.trim()
+                .split('.')
+                .next()
+                .and_then(|s| s.parse::<u32>().ok())
+        })
+        .unwrap_or(0)
+}
+
 fn run(command: &mut Command, step: &str) {
     let status = command
         .status()
@@ -235,7 +261,12 @@ fn prebuilt_link_libs(target: &str) -> Vec<&'static str> {
     ];
     if target.ends_with("-apple-darwin") {
         libs.push("ggml-blas");
-        libs.push("ggml-metal");
+        // The prebuilt ggml-metal.dylib requires macOS 15+ (references
+        // MTLResidencySetDescriptor).  Skip it on older macOS so the
+        // CPU / BLAS backend is used instead.
+        if macos_version_major(target) >= 15 {
+            libs.push("ggml-metal");
+        }
     }
     // When Vulkan is enabled, the prebuilt archive includes the Vulkan backend.
     if is_explicitly_set("GGML_VULKAN") {
@@ -369,8 +400,10 @@ fn emit_prebuilt_link_deps(lib_dir: &Path, target: &str) {
         println!("cargo:rustc-link-lib=dylib=c++");
         println!("cargo:rustc-link-lib=framework=Accelerate");
         println!("cargo:rustc-link-lib=framework=Foundation");
-        println!("cargo:rustc-link-lib=framework=Metal");
-        println!("cargo:rustc-link-lib=framework=QuartzCore");
+        if macos_version_major(target) >= 15 {
+            println!("cargo:rustc-link-lib=framework=Metal");
+            println!("cargo:rustc-link-lib=framework=QuartzCore");
+        }
         println!("cargo:rustc-link-lib=framework=Security");
         println!("cargo:rustc-link-lib=framework=CoreFoundation");
 

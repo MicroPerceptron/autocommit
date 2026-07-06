@@ -315,22 +315,76 @@ fn extract_tar_gz(archive: &Path, dest: &Path) {
     );
 }
 
+fn has_llama_source(path: &Path) -> bool {
+    path.join("CMakeLists.txt").is_file()
+        && path.join("include").join("llama.h").is_file()
+        && path.join("common").is_dir()
+}
+
+/// Download and extract the source archive matching `LLAMA_CPP_RELEASE_TAG`.
+/// The bridge must be compiled against headers from the same release as the
+/// prebuilt shared libraries; newer submodule headers can drift across
+/// llama.cpp's internal `common` APIs.
+fn download_prebuilt_source(out_dir: &Path) -> PathBuf {
+    let cache_dir = out_dir.join("llama-prebuilt");
+    let src_marker = cache_dir.join(".extracted-src");
+    let src_dir = cache_dir.join("source");
+
+    if src_marker.is_file() && has_llama_source(&src_dir) {
+        println!(
+            "cargo:warning=using cached llama.cpp source from {}",
+            src_dir.display()
+        );
+        return src_dir;
+    }
+
+    fs::create_dir_all(&cache_dir).expect("failed to create prebuilt cache dir");
+
+    let src_url = format!(
+        "https://github.com/ggml-org/llama.cpp/archive/refs/tags/{}.tar.gz",
+        LLAMA_CPP_RELEASE_TAG
+    );
+    let src_archive = out_dir.join(format!("llama-{}.tar.gz", LLAMA_CPP_RELEASE_TAG));
+    println!("cargo:warning=downloading llama.cpp source for headers from {src_url}");
+    download_file(&src_url, &src_archive);
+    extract_tar_gz(&src_archive, &cache_dir);
+
+    // The source tarball extracts to llama.cpp-<tag>. Normalize to a stable
+    // path under OUT_DIR so subsequent Cargo invocations can reuse it.
+    let raw_src = cache_dir.join(format!("llama.cpp-{}", LLAMA_CPP_RELEASE_TAG));
+    if raw_src.is_dir() && src_dir.exists() && !has_llama_source(&src_dir) {
+        fs::remove_dir_all(&src_dir).ok();
+    }
+    if raw_src.is_dir() && !src_dir.exists() {
+        fs::rename(&raw_src, &src_dir).ok();
+    }
+    fs::remove_file(&src_archive).ok();
+    fs::write(&src_marker, "extracted").ok();
+
+    assert!(
+        has_llama_source(&src_dir),
+        "downloaded llama.cpp source for {} is incomplete at {}",
+        LLAMA_CPP_RELEASE_TAG,
+        src_dir.display()
+    );
+
+    src_dir
+}
+
 /// Download and extract prebuilt llama.cpp shared libraries AND the matching
 /// source archive for the current target. Returns `(lib_dir, source_dir)`.
 fn download_prebuilt(out_dir: &Path, archive_name: &str) -> (PathBuf, PathBuf) {
     let cache_dir = out_dir.join("llama-prebuilt");
     let bin_marker = cache_dir.join(".extracted-bin");
-    let src_marker = cache_dir.join(".extracted-src");
 
     let lib_dir = cache_dir.join("llama-b9837");
-    let src_dir = cache_dir.join("source");
 
-    if bin_marker.is_file() && src_marker.is_file() {
+    if bin_marker.is_file() && lib_dir.is_dir() && has_llama_source(&cache_dir.join("source")) {
         println!(
             "cargo:warning=using cached prebuilt llama.cpp from {}",
             cache_dir.display()
         );
-        return (lib_dir, src_dir);
+        return (lib_dir, cache_dir.join("source"));
     }
 
     fs::create_dir_all(&cache_dir).expect("failed to create prebuilt cache dir");
@@ -346,26 +400,7 @@ fn download_prebuilt(out_dir: &Path, archive_name: &str) -> (PathBuf, PathBuf) {
         fs::write(&bin_marker, "extracted").ok();
     }
 
-    // Download and extract matching source archive for headers
-    if !src_marker.is_file() {
-        let src_url = format!(
-            "https://github.com/ggml-org/llama.cpp/archive/refs/tags/{}.tar.gz",
-            LLAMA_CPP_RELEASE_TAG
-        );
-        let src_archive = out_dir.join(format!("llama-{}.tar.gz", LLAMA_CPP_RELEASE_TAG));
-        println!("cargo:warning=downloading llama.cpp source for headers from {src_url}");
-        download_file(&src_url, &src_archive);
-        extract_tar_gz(&src_archive, &cache_dir);
-        // The source tarball extracts to llama.cpp-<tag>
-        let raw_src = cache_dir.join(format!("llama.cpp-{}", LLAMA_CPP_RELEASE_TAG));
-        if raw_src.is_dir() {
-            // Rename to a predictable path
-            fs::rename(&raw_src, &src_dir).ok();
-        }
-        fs::remove_file(&src_archive).ok();
-        fs::write(&src_marker, "extracted").ok();
-    }
-
+    let src_dir = download_prebuilt_source(out_dir);
     (lib_dir, src_dir)
 }
 
@@ -478,16 +513,23 @@ fn resolve_prebuilt(out_dir: &Path, archive_name: &str) -> (PathBuf, PathBuf) {
             path.display()
         );
 
-        // When LLAMA_CPP_PREBUILT_DIR is set, look for a matching source dir
-        // alongside, or fall back to the third_party submodule.
-        let src_alongside = prebuilt_dir_str.replace("llama-b9837-bin", "llama.cpp-b9837");
-        let src_candidate = PathBuf::from(&src_alongside);
-        let source_dir = if src_candidate.join("CMakeLists.txt").is_file() {
-            src_candidate
-        } else {
-            // Will use submodule fallback in main()
-            PathBuf::new()
-        };
+        let mut candidates = Vec::new();
+        if let Some(source_dir) = env::var_os("LLAMA_CPP_PREBUILT_SOURCE_DIR") {
+            candidates.push(PathBuf::from(source_dir));
+        }
+        if let Some(source_dir) = env::var_os("LLAMA_CPP_DIR") {
+            candidates.push(PathBuf::from(source_dir));
+        }
+        if let Some(parent) = path.parent() {
+            candidates.push(parent.join("source"));
+            candidates.push(parent.join(format!("llama.cpp-{}", LLAMA_CPP_RELEASE_TAG)));
+        }
+
+        let source_dir = candidates
+            .into_iter()
+            .find(|candidate| has_llama_source(candidate))
+            .unwrap_or_else(|| download_prebuilt_source(out_dir));
+
         (path, source_dir)
     } else {
         download_prebuilt(out_dir, archive_name)
@@ -941,6 +983,7 @@ fn emit_common_link_deps(build_dir: &Path) {
 fn main() {
     println!("cargo:rerun-if-env-changed=LLAMA_CPP_DIR");
     println!("cargo:rerun-if-env-changed=LLAMA_CPP_PREBUILT_DIR");
+    println!("cargo:rerun-if-env-changed=LLAMA_CPP_PREBUILT_SOURCE_DIR");
     println!("cargo:rerun-if-env-changed=TARGET");
     println!("cargo:rerun-if-changed=src/autocommit_common_bridge.cpp");
     println!("cargo:rerun-if-changed=src/autocommit_common_bridge.h");

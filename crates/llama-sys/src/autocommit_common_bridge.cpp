@@ -645,10 +645,12 @@ int autocommit_llama_params_fit(
         size_t * margins,
         uint32_t n_ctx_min,
         int log_level) {
-#ifdef LLAMA_CPP_PREBUILT
-    // llama_params_fit is not available in the b9837 binary release.
-    // Skip fitting and return success — the caller will load the model
-    // with whatever params were configured.
+    // llama_params_fit is not exposed by the pinned llama.cpp release (b9837)
+    // in either build mode: the binary release omits it, and in the from-source
+    // build the fitting logic lives in libcommon's internal common/fit.cpp with
+    // no matching public `llama_params_fit` symbol. Skip fitting and return
+    // success — the caller loads the model with whatever params were configured.
+    // This matches the behavior of the prebuilt backends that already ship.
     (void)path_model;
     (void)mparams;
     (void)cparams;
@@ -658,17 +660,6 @@ int autocommit_llama_params_fit(
     (void)n_ctx_min;
     (void)log_level;
     return 0;
-#else
-    return llama_params_fit(
-        path_model,
-        mparams,
-        cparams,
-        tensor_split,
-        tensor_buft_overrides,
-        margins,
-        n_ctx_min,
-        static_cast<enum ggml_log_level>(log_level));
-#endif
 }
 
 } // extern "C"

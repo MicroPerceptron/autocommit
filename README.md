@@ -15,7 +15,7 @@ No API keys. No cloud. Fully local inference powered by [llama.cpp](https://gith
 - **Commit generation** — analyzes staged/worktree diffs, generates conventional commit messages with interactive approve/edit/cancel flow
 - **PR generation** — generates PR title and body, creates or updates pull requests via `gh`, with branch selection and optional push
 - **Version bump recommendations** — detects manifest files (Cargo.toml, package.json, go.mod, etc.), suggests semver bumps, syncs lockfiles after applying
-- **Local inference** — ships with llama.cpp compiled in, supports Metal (macOS), CUDA (NVIDIA), Vulkan (cross-vendor), and SYCL (Intel) GPU acceleration
+- **Local inference** — ships with llama.cpp compiled in. Pre-built binaries cover CPU, Metal (macOS), and Vulkan (cross-vendor GPU); CUDA (NVIDIA) and SYCL (Intel) are supported when building from source
 - **Per-repo config** — caches model state and runtime settings under `.git/autocommit/` for fast subsequent runs
 
 ## Installation
@@ -37,16 +37,8 @@ sudo mv autocommit /usr/local/bin/
 curl -L https://github.com/MicroPerceptron/autocommit/releases/latest/download/autocommit-x86_64-unknown-linux-gnu.tar.gz | tar xz
 sudo mv autocommit /usr/local/bin/
 
-# Linux (CUDA — NVIDIA GPUs)
-curl -L https://github.com/MicroPerceptron/autocommit/releases/latest/download/autocommit-x86_64-unknown-linux-gnu-cuda.tar.gz | tar xz
-sudo mv autocommit /usr/local/bin/
-
 # Linux (Vulkan — Intel/AMD/NVIDIA GPUs, requires Vulkan drivers)
 curl -L https://github.com/MicroPerceptron/autocommit/releases/latest/download/autocommit-x86_64-unknown-linux-gnu-vulkan.tar.gz | tar xz
-sudo mv autocommit /usr/local/bin/
-
-# Linux (SYCL — Intel GPUs, requires Intel oneAPI runtime)
-curl -L https://github.com/MicroPerceptron/autocommit/releases/latest/download/autocommit-x86_64-unknown-linux-gnu-sycl.tar.gz | tar xz
 sudo mv autocommit /usr/local/bin/
 ```
 
@@ -68,11 +60,14 @@ cargo install --path crates/cli --locked --features llama-native
 
 #### GPU backend selection
 
-By default, Metal is used on macOS and CUDA is auto-detected on Linux. To build with a different GPU backend:
+The default build (and every pre-built binary) uses CPU on Linux, Metal on macOS, and Vulkan when requested. CUDA and SYCL have no pre-built binaries — selecting them requires the matching toolkit and compiles llama.cpp from source:
 
 ```sh
 # Vulkan (requires Vulkan SDK + glslc)
 GGML_VULKAN=ON cargo install --path crates/cli --locked --features llama-native
+
+# CUDA / NVIDIA (requires CUDA Toolkit)
+GGML_CUDA=ON cargo install --path crates/cli --locked --features llama-native
 
 # SYCL / Intel oneAPI (requires oneAPI toolkit)
 source /opt/intel/oneapi/setvars.sh

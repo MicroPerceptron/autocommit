@@ -28,22 +28,12 @@ jobs:
             target: x86_64-unknown-linux-gnu
             suffix: ""
             prebuilt: llama-b9837-bin-ubuntu-x64.tar.gz
-          - name: Linux-x86_64-cuda
-            os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-            suffix: -cuda
-            cuda: true
           - name: Linux-x86_64-vulkan
             os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             suffix: -vulkan
             vulkan: true
             prebuilt: llama-b9837-bin-ubuntu-vulkan-x64.tar.gz
-          - name: Linux-x86_64-sycl
-            os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-            suffix: -sycl
-            sycl: true
     steps:
       - uses: actions/checkout@v4
         with:
@@ -64,23 +54,9 @@ jobs:
           echo "LLAMA_CPP_PREBUILT_DIR=/tmp/llama-prebuilt/llama-b9837" >> "$GITHUB_ENV"
           echo "LLAMA_PREBUILT_SRC=/tmp/llama-prebuilt/llama-b9837" >> "$GITHUB_ENV"
 
-      # Source build dependencies (only needed when no prebuilt archive is used)
-      - name: Install deps (Linux)
-        if: runner.os == 'Linux' && !matrix.prebuilt
-        run: sudo apt-get update && sudo apt-get install -y cmake libclang-dev pkg-config libssl-dev libopenblas-dev
-
       - name: Install deps (Linux, prebuilt)
         if: runner.os == 'Linux' && matrix.prebuilt
         run: sudo apt-get update && sudo apt-get install -y libclang-dev libssl-dev
-
-      - name: Install CUDA toolkit
-        if: matrix.cuda
-        uses: Jimver/cuda-toolkit@v0.2.22
-        with:
-          cuda: "12.6.3"
-          method: network
-          sub-packages: '["nvcc", "cudart"]'
-          non-cuda-sub-packages: '["libcublas", "libcublas-dev"]'
 
       # libvulkan-dev provides the unversioned libvulkan.so the linker needs
       # (-lvulkan). Required even for the prebuilt Vulkan target: its archive
@@ -88,19 +64,6 @@ jobs:
       - name: Install Vulkan SDK
         if: matrix.vulkan
         run: sudo apt-get update && sudo apt-get install -y glslc libvulkan-dev
-
-      - name: Add Intel oneAPI repository
-        if: matrix.sycl
-        run: |
-          cd /tmp
-          wget -qO- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB | sudo gpg --dearmor -o /usr/share/keyrings/intel-oneapi-archive-keyring.gpg
-          echo "deb [signed-by=/usr/share/keyrings/intel-oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" | sudo tee /etc/apt/sources.list.d/intel-oneapi.list
-
-      - name: Install Intel oneAPI
-        if: matrix.sycl
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y intel-oneapi-compiler-dpcpp-cpp intel-oneapi-mkl-devel
 
       - name: Install deps (macOS)
         if: runner.os == 'macOS'
@@ -117,14 +80,8 @@ jobs:
 
       - name: Build release binary
         env:
-          GGML_CUDA: ${{ matrix.cuda && 'ON' || '' }}
-          GGML_SYCL: ${{ matrix.sycl && 'ON' || '' }}
           GGML_VULKAN: ${{ matrix.vulkan && 'ON' || '' }}
-        run: |
-          if [ "${{ matrix.sycl }}" = "true" ]; then
-            source /opt/intel/oneapi/setvars.sh
-          fi
-          cargo build --release --features llama-native -p autocommit-cli --target ${{ matrix.target }}
+        run: cargo build --release --features llama-native -p autocommit-cli --target ${{ matrix.target }}
 
       - name: Package artifact
         run: |

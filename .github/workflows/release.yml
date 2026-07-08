@@ -78,10 +78,20 @@ jobs:
           key: ${{ matrix.target }}${{ matrix.suffix }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ matrix.target }}${{ matrix.suffix }}-cargo-release-
 
+      # Bake an rpath so the binary finds the .so/.dylib files bundled next to it
+      # (see Package artifact below). build.rs can't do this: a dependency's
+      # cargo:rustc-link-arg does not propagate to the final binary. RUSTFLAGS
+      # does. $ORIGIN / @loader_path resolve to the binary's own directory.
       - name: Build release binary
         env:
           GGML_VULKAN: ${{ matrix.vulkan && 'ON' || '' }}
-        run: cargo build --release --features llama-native -p autocommit-cli --target ${{ matrix.target }}
+        run: |
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            export RUSTFLAGS="-C link-arg=-Wl,-rpath,@loader_path"
+          else
+            export RUSTFLAGS="-C link-arg=-Wl,-rpath,\$ORIGIN"
+          fi
+          cargo build --release --features llama-native -p autocommit-cli --target ${{ matrix.target }}
 
       - name: Package artifact
         run: |

@@ -24,22 +24,18 @@ No API keys. No cloud. Fully local inference powered by [llama.cpp](https://gith
 
 Download from [GitHub Releases](https://github.com/MicroPerceptron/autocommit/releases):
 
+Each tarball bundles the binary together with its llama.cpp shared libraries. Extract it to a permanent directory and symlink the binary onto your `PATH` — the `.so`/`.dylib` files must stay next to the binary, which loads them from its own directory.
+
 ```sh
-# macOS (Apple Silicon)
-curl -L https://github.com/MicroPerceptron/autocommit/releases/latest/download/autocommit-aarch64-apple-darwin.tar.gz | tar xz
-sudo mv autocommit /usr/local/bin/
+BASE=https://github.com/MicroPerceptron/autocommit/releases/latest/download
+FILE=autocommit-x86_64-unknown-linux-gnu.tar.gz            # Linux (CPU)
+# FILE=autocommit-x86_64-unknown-linux-gnu-vulkan.tar.gz   # Linux (Vulkan — Intel/AMD/NVIDIA GPUs, needs Vulkan drivers)
+# FILE=autocommit-aarch64-apple-darwin.tar.gz              # macOS (Apple Silicon)
+# FILE=autocommit-x86_64-apple-darwin.tar.gz               # macOS (Intel)
 
-# macOS (Intel)
-curl -L https://github.com/MicroPerceptron/autocommit/releases/latest/download/autocommit-x86_64-apple-darwin.tar.gz | tar xz
-sudo mv autocommit /usr/local/bin/
-
-# Linux (CPU)
-curl -L https://github.com/MicroPerceptron/autocommit/releases/latest/download/autocommit-x86_64-unknown-linux-gnu.tar.gz | tar xz
-sudo mv autocommit /usr/local/bin/
-
-# Linux (Vulkan — Intel/AMD/NVIDIA GPUs, requires Vulkan drivers)
-curl -L https://github.com/MicroPerceptron/autocommit/releases/latest/download/autocommit-x86_64-unknown-linux-gnu-vulkan.tar.gz | tar xz
-sudo mv autocommit /usr/local/bin/
+sudo install -d /opt/autocommit
+curl -L "$BASE/$FILE" | sudo tar xz -C /opt/autocommit
+sudo ln -sf /opt/autocommit/autocommit /usr/local/bin/autocommit
 ```
 
 ### cargo binstall

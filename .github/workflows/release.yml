@@ -82,8 +82,11 @@ jobs:
           sub-packages: '["nvcc", "cudart"]'
           non-cuda-sub-packages: '["libcublas", "libcublas-dev"]'
 
+      # libvulkan-dev provides the unversioned libvulkan.so the linker needs
+      # (-lvulkan). Required even for the prebuilt Vulkan target: its archive
+      # ships libggml-vulkan but links against the system Vulkan loader.
       - name: Install Vulkan SDK
-        if: matrix.vulkan && !matrix.prebuilt
+        if: matrix.vulkan
         run: sudo apt-get update && sudo apt-get install -y glslc libvulkan-dev
 
       - name: Add Intel oneAPI repository

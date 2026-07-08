@@ -89,9 +89,15 @@ fn add_lib_dir_from_pkg_config(package: &str) {
     }
 }
 
-/// Check whether `GGML_<backend>` is explicitly set (to any value).
+/// Check whether `GGML_<backend>` is explicitly set to a non-empty value.
+///
+/// CI passes backend flags as `GGML_VULKAN: ${{ matrix.vulkan && 'ON' || '' }}`,
+/// which exports the variable as an empty string on targets that don't use that
+/// backend. An empty value must count as "not set" — otherwise a plain CPU or
+/// macOS build would try to link the Vulkan libraries that aren't present in its
+/// (non-Vulkan) prebuilt archive.
 fn is_explicitly_set(var: &str) -> bool {
-    env::var(var).is_ok()
+    env::var(var).is_ok_and(|v| !v.trim().is_empty())
 }
 
 /// Returns true if *any other* GPU backend was explicitly requested via env var.

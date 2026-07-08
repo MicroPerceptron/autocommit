@@ -612,7 +612,15 @@ fn build_from_source(source_dir: &Path, out_dir: &Path, manifest_dir: &Path) {
         .arg("-DLLAMA_BUILD_TESTS=OFF")
         .arg("-DLLAMA_BUILD_EXAMPLES=OFF")
         .arg("-DLLAMA_BUILD_TOOLS=OFF")
-        .arg("-DLLAMA_BUILD_SERVER=OFF");
+        .arg("-DLLAMA_BUILD_SERVER=OFF")
+        // b9837+ introduced these targets, both defaulting ON for a standalone
+        // (top-level) build. We only need the libraries for FFI, so disable
+        // them. LLAMA_BUILD_APP (the "unified binary") compiles app/llama.cpp,
+        // which needs a generated build-info.h and breaks the source build;
+        // LLAMA_BUILD_UI would fetch a prebuilt web UI. Both are unknown to
+        // older releases, where CMake harmlessly ignores the unused flags.
+        .arg("-DLLAMA_BUILD_APP=OFF")
+        .arg("-DLLAMA_BUILD_UI=OFF");
     if use_cuda {
         configure.arg("-DGGML_CUDA=ON");
     }

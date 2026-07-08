@@ -12,6 +12,7 @@
 #include "arg.h"
 #include "common.h"
 #include "download.h"
+#include "hf-cache.h"
 #include "log.h"
 #include "sampling.h"
 
@@ -154,8 +155,12 @@ static std::string resolve_hf_model(autocommit_common_config & cfg) {
     common_download_task task(plan.primary, opts);
     common_download_run_tasks({ task });
 
-    // After download, the final cached path is available
-    model.path = plan.primary.final_path.empty() ? plan.primary.local_path : plan.primary.final_path;
+    // finalize_file creates the HF-cache snapshot symlink
+    // (snapshots/<rev>/<file> -> ../../blobs/<sha>) and returns the path to use:
+    // the snapshot symlink, or the blob path itself if symlink creation fails.
+    // Without it the blob downloads but the resolved final_path dangles. Mirrors
+    // how llama.cpp's own common/arg.cpp finalizes downloaded models.
+    model.path = hf_cache::finalize_file(plan.primary);
     return model.path;
 }
 

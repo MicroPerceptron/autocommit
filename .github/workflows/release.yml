@@ -161,9 +161,12 @@ jobs:
     name: Create Release
     needs: build
     # Run even if some build targets failed, so the binaries that *did* build
-    # still get published. `!cancelled()` still skips on a manual cancellation.
-    # Failed matrix legs upload no artifact, so they are simply absent from the
-    # release; the overall run stays red to keep the failures visible.
+    # still get published. Including a status function overrides Actions'
+    # implicit success() gate, so `!cancelled()` runs even when a `needs` leg
+    # failed — while still skipping a manually cancelled run (unlike always(),
+    # which would cut a release from a cancelled build). Failed matrix legs
+    # upload no artifact, so they're simply absent from the release; the overall
+    # run stays red to keep the failures visible.
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:

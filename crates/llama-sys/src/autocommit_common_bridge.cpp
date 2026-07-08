@@ -15,16 +15,11 @@
 #include "log.h"
 #include "sampling.h"
 
-// common.h defines a global `build_info` string derived from these variables.
-// In this integration path libcommon.a is linked directly from the build tree
-// (where build_info object may not be installed), so provide safe fallbacks.
-// When using prebuilt binary releases, libllama-common already provides these.
-#ifndef LLAMA_CPP_PREBUILT
-int LLAMA_BUILD_NUMBER = 0;
-const char * LLAMA_COMMIT = "unknown";
-const char * LLAMA_COMPILER = "unknown";
-const char * LLAMA_BUILD_TARGET = "unknown";
-#endif
+// build-info symbols (llama_build_number(), llama_commit(), the LLAMA_BUILD_*
+// globals, ...) are provided by libllama-common at link time: from the prebuilt
+// libllama-common.so for binary releases, and from the static llama-common-base
+// archive for source builds (linked explicitly in build.rs). Defining fallbacks
+// here would collide with those real definitions, so we don't.
 
 struct autocommit_common_config {
     common_params params;

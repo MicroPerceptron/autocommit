@@ -672,6 +672,12 @@ fn build_from_source(source_dir: &Path, out_dir: &Path, manifest_dir: &Path) {
     build_common_bridge(source_dir, manifest_dir, false);
     emit_common_link_deps(&build_dir);
     emit_install_link_search_paths(&install_dir);
+    // b9837 compiles build-info (llama_build_number(), llama_commit(),
+    // llama_build_info(), and the LLAMA_BUILD_* globals) into a separate
+    // `llama-common-base` archive that libllama-common depends on but that cmake
+    // does not install, so the install-dir scan above misses it. Link it
+    // explicitly — it must come after llama-common, which references the symbols.
+    emit_build_info_link_deps(&build_dir);
     if use_cuda {
         emit_cuda_link_deps();
     }
@@ -948,6 +954,24 @@ fn build_common_bridge(source_dir: &Path, manifest_dir: &Path, prebuilt: bool) {
 
 fn has_static_lib(dir: &Path, name: &str) -> bool {
     dir.join(format!("lib{name}.a")).exists() || dir.join(format!("{name}.lib")).exists()
+}
+
+/// Link the `llama-common-base` static archive, which holds the generated
+/// build-info symbols (`llama_build_number()`, `llama_commit()`,
+/// `llama_build_info()`, and the `LLAMA_BUILD_*` globals). Since b9837 these
+/// live in their own archive that libllama-common depends on but that cmake does
+/// not install, so the install-dir scan misses them. Emitting this after the
+/// install libs keeps it after llama-common on the link line, which is required
+/// because llama-common references these symbols.
+fn emit_build_info_link_deps(build_dir: &Path) {
+    let common_dir = build_dir.join("common");
+    if has_static_lib(&common_dir, "llama-common-base") {
+        println!(
+            "cargo:rustc-link-search=native={}",
+            common_dir.to_string_lossy()
+        );
+        println!("cargo:rustc-link-lib=static=llama-common-base");
+    }
 }
 
 fn emit_common_link_deps(build_dir: &Path) {
